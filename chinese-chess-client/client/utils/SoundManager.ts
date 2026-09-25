@@ -1,18 +1,40 @@
 /**
  * 音效管理器
  *
- * 架构说明：本文件恢复自 9 月 9 日晚（提交 67c8022「音效预加载缓存」）的稳定版本。
- * 该版本在真机上音效播放正常，核心特征：
- * 1. 使用 expo-av（Audio.Sound），而非后续引入问题的 expo-audio
- * 2. Sound 对象缓存复用，避免每次播放重新创建
- * 3. 支持预加载常用音效，消除首次播放延迟
- * 4. Audio.setAudioModeAsync 仅在初始化时调用一次（持久音频会话）
- * 5. 播放采用 setPositionAsync(0) + playAsync() 从头播放
+ * ---------------------------------------------------------------------------
+ * 2026-09 走棋音偶发丢失问题：根因分析与修复（依据 expo-av 16.0.8 原生源码
+ * 逐行核查得出，非主观推断）：
  *
- * 在保留原架构的前提下做了两处兼容性增强（不改变播放机制）：
- * - SOUND_FILES 保留当前全部音效（含 select/goerror/alarm/Woman_jiangjun）
- * - 将军音效指向响度已对齐吃子音效的 .wav 文件（原 .mp3 响度过低）
- * - 补充 playJiangJunSound（含节流），供各对局页面调用
+ * 旧实现 playSound = setPositionAsync(0) + playAsync() 两次独立原生调用，
+ * 且 catch{} 静默吞掉一切错误。真机上存在多条可观测的瞬态失败路径：
+ *
+ * Android（AVManager.java / PlayerData.java / SimpleExoPlayerData.java）：
+ * 1. 每次 setStatus 结束都会执行 abandonAudioFocusIfUnused()——某音效首次播放时
+ *    mShouldPlay=false，setPositionAsync 走暂停分支后无任何播放器占用音频焦点，
+ *    焦点被放弃；紧随的 playAsync 必须重新向系统申请焦点。
+ * 2. playAsync → acquireAudioFocus()：只要 AudioManager.requestAudioFocus(
+ *    GAIN_TRANSIENT_MAY_DUCK) 未返回 GRANTED 即抛 AudioFocusNotAcquiredException，
+ *    Promise 拒绝 → 被 catch{} 静默吞掉 → 无声跳过（对应"首步"概率性失败）。
+ * 3. mAcquiredAudioFocus=false 期间 getVolumeForDuckAndFocus() 恒返回 0——
+ *    焦点恰在播放瞬间丢失时，声音以 0 音量"播放"（听感等于没播）。
+ *
+ * iOS（EXAVPlayerData.m / EXAV.m）：
+ * 1. playAsync → promoteAudioSessionIfNecessary → [AVAudioSession setActive:YES]，
+ *    会话激活瞬态失败即以 E_AV_PLAY 拒绝 Promise → 同样被吞掉。
+ * 2. setPositionAsync 不携带 seek 容差（AV.js PlaybackMixin），
+ *    位置已为 0 时 mustSeek=false、否则使用无限容差，回零不精确。
+ *
+ * 修复策略（保留 Sound 对象缓存复用 + 预加载的整体架构）：
+ * 1. 改用 replayAsync()：单次原生调用原子完成"回零+播放"
+ *    （Android 合并为一次 setStatus，无两次调用间的焦点状态空窗；
+ *    iOS 走专用 replayWithStatus 路径，正确处理 AVQueuePlayer 条目轮换；
+ *    Web 端 replaySound 同样映射为一次 setStatusForMedia）。
+ * 2. 失败重试一次（120ms 退避，覆盖音频焦点/会话的瞬态拒绝）。
+ * 3. 仍失败则卸载重建 Sound 对象后最后尝试一次（恢复原生播放器异常状态）；
+ *    重建前校验会话代号，避免与退出对局时的 unloadAllSounds 竞争。
+ * 4. 同名音效播放串行化，杜绝并发原生调用交错。
+ * 5. 所有失败路径 console.warn 输出（不再静默），便于 adb logcat / Xcode 排查。
+ * ---------------------------------------------------------------------------
  */
 
 import { Audio } from 'expo-av';
@@ -37,8 +59,16 @@ const ESSENTIAL_SOUNDS = ['select', 'go', 'eat', 'Man_jiangjun'];
 const soundCache = new Map<string, Audio.Sound>();
 // 正在加载中的 Promise 缓存（防止重复加载）
 const loadingCache = new Map<string, Promise<Audio.Sound | null>>();
+// 同名音效播放串行链：后到的播放等待先前的完成，避免原生调用交错
+const playQueues = new Map<string, Promise<void>>();
+
+// 会话代号：unloadAllSounds 时自增。用于丢弃"已退出对局"后的过期播放请求，
+// 防止其重建音效对象（那会在退出对局后泄漏一个已加载的原生播放器）。
+let soundSessionId = 0;
 
 let audioModeInitialized = false;
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 async function ensureAudioMode(): Promise<void> {
   if (audioModeInitialized) return;
@@ -49,8 +79,9 @@ async function ensureAudioMode(): Promise<void> {
       shouldDuckAndroid: true,
     });
     audioModeInitialized = true;
-  } catch {
-    // 忽略音频模式设置失败
+  } catch (e) {
+    // 音频模式设置失败不应阻断播放（下次播放时会再次尝试）
+    console.warn('[SoundManager] setAudioModeAsync 失败，将在下次播放时重试:', e);
   }
 }
 
@@ -75,7 +106,8 @@ async function getOrLoadSound(name: string): Promise<Audio.Sound | null> {
       soundCache.set(name, sound);
       loadingCache.delete(name);
       return sound;
-    } catch {
+    } catch (e) {
+      console.warn(`[SoundManager] 加载音效 '${name}' 失败:`, e);
       loadingCache.delete(name);
       return null;
     }
@@ -105,16 +137,68 @@ export async function preloadGameEndSounds(): Promise<void> {
   ]);
 }
 
+/**
+ * 原子重放并带回退恢复（核心播放路径）：
+ * 1. replayAsync 单次原生调用完成"回零+播放"
+ * 2. 失败（音频焦点/音频会话瞬态拒绝等）→ 120ms 后重试一次
+ * 3. 仍失败 → 卸载重建 Sound 对象后最后尝试一次（恢复原生播放器异常状态）
+ * 本函数不抛出异常：任何失败都以 console.warn 记录后放弃本次播放，
+ * 保证绝不影响对局流程（与旧行为一致，但不再"无声无息"）。
+ */
+async function replayWithRecovery(name: string, sessionId: number): Promise<void> {
+  // 对局已切换/退出：丢弃过期播放请求
+  if (sessionId !== soundSessionId) return;
+
+  let sound = await getOrLoadSound(name);
+  if (!sound) return;
+
+  try {
+    await sound.replayAsync();
+    return;
+  } catch (e) {
+    console.warn(`[SoundManager] replay '${name}' 首次失败，120ms 后重试:`, e);
+  }
+
+  if (sessionId !== soundSessionId) return;
+  await sleep(120);
+
+  try {
+    await sound.replayAsync();
+    return;
+  } catch (e) {
+    console.warn(`[SoundManager] replay '${name}' 重试仍失败，重建音效对象:`, e);
+  }
+
+  if (sessionId !== soundSessionId) return;
+  // 重建：清缓存 → 卸载旧对象 → 重新加载 → 最后尝试一次
+  soundCache.delete(name);
+  try {
+    await sound.unloadAsync();
+  } catch {
+    // 忽略卸载失败（对象可能已被原生侧回收）
+  }
+  sound = await getOrLoadSound(name);
+  if (!sound) return;
+  try {
+    await sound.replayAsync();
+  } catch (e) {
+    console.warn(`[SoundManager] replay '${name}' 重建后仍失败，放弃本次播放:`, e);
+  }
+}
+
 export async function playSound(name: string): Promise<void> {
   try {
     await ensureAudioMode();
-    const sound = await getOrLoadSound(name);
-    if (sound) {
-      await sound.setPositionAsync(0);
-      await sound.playAsync();
-    }
-  } catch {
-    // 静默失败，不影响游戏流程
+    const sessionId = soundSessionId;
+    // 串行化同一音效的播放：排队等待上一次播放完成后原子重放
+    const task = (playQueues.get(name) ?? Promise.resolve()).then(() =>
+      replayWithRecovery(name, sessionId),
+    );
+    playQueues.set(name, task);
+    await task;
+  } catch (e) {
+    // 兜底：replayWithRecovery 自身不抛错，此处仅防御意外异常
+    console.warn(`[SoundManager] playSound '${name}' 异常:`, e);
   }
 }
 
@@ -139,6 +223,8 @@ export async function playJiangJunSound(): Promise<void> {
  * 释放所有音效资源（可在退出对局时调用）
  */
 export async function unloadAllSounds(): Promise<void> {
+  // 会话代号自增：使仍在队列中的过期播放请求自行失效（不会重建音效对象）
+  soundSessionId++;
   const promises: Promise<unknown>[] = [];
   for (const [, sound] of soundCache) {
     promises.push(
@@ -146,6 +232,7 @@ export async function unloadAllSounds(): Promise<void> {
     );
   }
   soundCache.clear();
+  playQueues.clear();
   await Promise.all(promises);
 }
 
