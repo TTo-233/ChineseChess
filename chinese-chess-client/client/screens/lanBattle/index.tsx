@@ -1,0 +1,3287 @@
+import React, { useState, useCallback, useEffect, useRef, useMemo } from 'react';
+import {
+  View,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  Modal,
+  StyleSheet,
+  Animated,
+  Easing,
+  Image,
+  Alert,
+  Dimensions,
+  BackHandler,
+  AppState,
+  ScrollView,
+  Platform,
+  TouchableWithoutFeedback,
+} from 'react-native';
+import { Screen } from '@/components/Screen';
+import { useSafeRouter, useSafeSearchParams } from '@/hooks/useSafeRouter';
+import { useFocusEffect } from 'expo-router';
+import { FontAwesome6 } from '@expo/vector-icons';
+import { createInitialState, applyHandicap, cloneGameState, getValidMoves, makeMove, undoMove, getWinnerSideTag, type GameState } from '@/utils/chess/GameEngine';
+import { HandicapBoard } from '@/components/HandicapBoard';
+import { RED_SIDE, BLACK_SIDE } from '@/utils/chess/types';
+import ChessBoard, { CapturedPiecesDrawer } from '@/components/ChessBoard';
+import JueShaOverlay from '@/components/JueShaOverlay';
+import { useMoveEffect } from '@/hooks/useMoveEffect';
+import { useBoardFrame } from '@/hooks/useBoardFrame';
+import { playJiangJunSound, playSound, preloadSounds, unloadAllSounds } from '@/utils/SoundManager';
+import { getOnlineServerUrl } from '@/utils/serverConfig';
+import { BattleSocket } from '@/utils/battleSocket';
+import { saveReplay } from '@/utils/replayStorage';
+import { useBoardLayoutBudget } from '@/utils/chess/capturedDrawerMetrics';
+import {
+  SettingSelect,
+  formStyles,
+  BASE_TIME_OPTIONS,
+  TURN_TIME_OPTIONS,
+  INCREMENT_OPTIONS,
+  BYOYOMI_OPTIONS,
+} from '@/components/RoomSettingsControls';
+
+const COLORS = {
+  background: '#F5F0E8',
+  card: '#FFF8F0',
+  primary: '#8B6914',
+  danger: '#C62828',
+  textPrimary: '#3E2723',
+  textSecondary: '#5D4037',
+  textLight: '#8D6E63',
+  border: 'rgba(139, 105, 20, 0.15)',
+  success: '#2E7D32',
+  borderSolid: '#D7CCC8',   // 浅棕实色边框（与人机对战等其他页面顶栏一致）
+  redPiece: '#B22222',
+  blackPiece: '#2C2C2C',
+};
+
+// 数值屏宽（与人机对战一致：底部操作栏/角标行按屏宽布局，规避部分 Android Yoga 对 stretch 的兼容问题）
+const screenWidth = Dimensions.get('window').width;
+
+function sideStringToTag(side: string): boolean {
+  return side === 'red' ? RED_SIDE : !RED_SIDE;
+}
+
+// 回合剩余秒数 → m:ss（用于棋盘右上角的倒计时角标）
+function formatTurnClock(totalSeconds: number): string {
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}:${seconds.toString().padStart(2, '0')}`;
+}
+
+/** 基本用时/加秒/读秒/步时下拉选项：见共享组件 @/components/RoomSettingsControls */
+
+/** 标准初始局面：棋子 id → 交叉点坐标（让子幽灵标记定位用，模块级只算一次） */
+const INITIAL_PIECE_POS: ReadonlyMap<number, { col: number; row: number }> = (() => {
+  const map = new Map<number, { col: number; row: number }>();
+  for (const p of createInitialState().pieces) {
+    map.set(p.id, { col: p.col, row: p.row });
+  }
+  return map;
+})();
+
+// 对局内可发送的 emoji 表情（涵盖常用情绪与手势）。
+// 以 Unicode 码点（数值）在运行时构造为表情字符，源码中不出现字面 emoji。
+const EMOJI_CODE_POINTS: number[][] = [
+  [0x1f604], // 笑脸
+  [0x1f602], // 笑哭
+  [0x1f923], // 大笑
+  [0x1f60a], // 害羞微笑
+  [0x1f60d], // 喜爱
+  [0x1f60e], // 得意
+  [0x1f914], // 思考
+  [0x1f60f], // 坏笑
+  [0x1f62e], // 惊讶
+  [0x1f622], // 难过
+  [0x1f62d], // 大哭
+  [0x1f621], // 生气
+  [0x1f44d], // 点赞
+  [0x1f44e], // 踩
+  [0x1f44f], // 鼓掌
+  [0x1f64f], // 感谢
+  [0x1f4aa], // 加油
+  [0x1f389], // 庆祝
+  [0x2764, 0xfe0f], // 爱心（含变体选择符）
+  [0x1f525], // 火焰
+];
+const EMOJI_LIST = EMOJI_CODE_POINTS.map(cps => String.fromCodePoint(...cps));
+// 单条表情本地展示时长（毫秒）：弹入 → 停留 → 淡出后移除
+const EMOJI_DISPLAY_MS = 4000;
+
+// 当前正在展示的活跃表情（本地按首次接收时间计时，超时自动移除）
+interface ActiveEmoji {
+  id: string;
+  playerId: string;
+  emoji: string;
+  receivedAt: number;
+}
+
+// 表情气泡：弹入 → 停留 → 淡出缩小，一段自包含的入场/退场动画
+function EmojiBubble({ emoji, lifetime }: { emoji: string; lifetime: number }) {
+  const [anim] = useState(() => new Animated.Value(0));
+  useEffect(() => {
+    Animated.sequence([
+      Animated.timing(anim, {
+        toValue: 1,
+        duration: 240,
+        easing: Easing.out(Easing.back(1.6)),
+        useNativeDriver: true,
+      }),
+      Animated.delay(Math.max(0, lifetime - 640)),
+      Animated.timing(anim, { toValue: 0, duration: 380, useNativeDriver: true }),
+    ]).start();
+  }, [anim, lifetime]);
+  return (
+    <Animated.View
+      pointerEvents="none"
+      style={[styles.emojiBubble, { opacity: anim, transform: [{ scale: anim }] }]}
+    >
+      <Text style={styles.emojiBubbleText}>{emoji}</Text>
+    </Animated.View>
+  );
+}
+
+type GamePhase = 'waiting' | 'reveal' | 'countdown' | 'playing' | 'ended';
+
+export default function LanBattleScreen() {
+  const router = useSafeRouter();
+  // 返回大厅：优先 back 回到栈中已有的大厅页（replace 只是替换栈顶，会在旧大厅之上
+  // 再叠一个新大厅，导致用户在大厅点返回时"又回到了大厅"）；Web 刷新等无栈场景兜底 replace
+  const exitToLobby = useCallback(() => {
+    if (router.canGoBack()) {
+      router.back();
+    } else {
+      router.replace('/lanGame');
+    }
+  }, [router]);
+  const params = useSafeSearchParams<{
+    roomId: string;
+    playerId: string;
+    playerName: string;
+    side: string;
+    isHost: boolean;
+  }>();
+
+  const [gameState, setGameState] = useState<GameState>(createInitialState());
+  // gameState 镜像 ref：供终局结算等异步回调读取最新局面（着法序列）
+  const gameStateRef = useRef(gameState);
+  gameStateRef.current = gameState;
+  // 复盘自动保存守卫：每局仅保存一次（重新对局时重置）
+  const replaySavedRef = useRef(false);
+  const [selectedPieceId, setSelectedPieceId] = useState<number | null>(null);
+  const [validMoves, setValidMoves] = useState<boolean[][] | null>(null);
+  const [lastMove, setLastMove] = useState<{ fromCol: number; fromRow: number; toCol: number; toRow: number } | null>(null);
+  const [phase, setPhase] = useState<GamePhase>('waiting');
+  const phaseRef = useRef<GamePhase>('waiting');
+  phaseRef.current = phase;
+  const [showSurrenderModal, setShowSurrenderModal] = useState(false);
+  const [countdown, setCountdown] = useState(3);
+  const [gameResult, setGameResult] = useState<{
+    winner: string | null;
+    isWin: boolean;
+    duration: number;
+    moveCount: number;
+    surrenderBy: string | null;
+    isDraw?: boolean; // 和棋（双方同意求和）
+  } | null>(null);
+  const [jueShaVisible, setJueShaVisible] = useState(false);
+  // 终局原因：区分「绝杀/困毙」（播绝杀特效）与「认输/和棋/断线判负」（仅普通文字结算）
+  const [gameEndReason, setGameEndReason] = useState<'checkmate' | 'resign' | 'draw' | 'disconnect' | 'timeout' | null>(null);
+  // 引擎终局细分原因（juesha/kunbi/changjiang/changzhuo/repetition/red_win/black_win），用于结算文案与特效开关
+  const [gameOverReason, setGameOverReason] = useState<string>('');
+  // 准备阶段：房间名、选边与准备状态
+  const [roomName, setRoomName] = useState('');
+  const [roomPassword, setRoomPassword] = useState<string | null>(null);
+  const [hostId, setHostId] = useState('');
+  const [sidePickVisible, setSidePickVisible] = useState(false); // 选边弹窗
+  const [readyCountdown, setReadyCountdown] = useState<number | null>(null); // 双方就绪后的 3 秒倒数（null=未倒数）
+  const [sidePickStage, setSidePickStage] = useState(false); // 倒数完成进入选边阶段（准备不可再取消）
+  const [settingsVisible, setSettingsVisible] = useState(false); // 房间信息/设置弹窗
+  // 设置弹窗编辑态（打开时以当前房间值预填；布局与大厅创建房间弹窗一致）
+  const [editName, setEditName] = useState('');
+  const [editPassword, setEditPassword] = useState('');
+  const [editTurn, setEditTurn] = useState(0); // 步时（秒，0=不限时）
+  // 对战设置编辑态（基本用时+加秒制/让子）：局时（秒，0=不限）、加秒（秒）、红方让子 id 列表
+  const [editBaseTime, setEditBaseTime] = useState(0);
+  const [editIncrement, setEditIncrement] = useState(0);
+  const [editByoyomi, setEditByoyomi] = useState(0); // 读秒（秒）编辑态，与 editIncrement 互斥
+  const [editHandicap, setEditHandicap] = useState<number[]>([]);
+  const [openSelect, setOpenSelect] = useState<null | 'base' | 'turn' | 'inc' | 'byo'>(null); // 弹窗内展开中的下拉
+  const [savingSettings, setSavingSettings] = useState(false);
+  const [myPreference, setMyPreference] = useState<'red' | 'black' | null>(null);
+  const [myReady, setMyReady] = useState(false);
+  // 本端准备意向的最新值（避免快速连点时闭包读到旧的 myReady）
+  const myReadyRef = useRef(false);
+  // 进行中的准备请求数：>0 时忽略新的连点，防止并发请求互相覆盖
+  const readyInFlightRef = useRef(0);
+  const rematchInFlightRef = useRef(false); // 重新对局请求在途标记：防止连点并发
+  // 最近一次本地切换准备的时间戳：轮询在此宽限窗口内不用服务端旧数据覆盖本端状态，避免按钮回跳
+  const lastReadyToggleRef = useRef(0);
+  // 最近一次「返回房间」（重赛重置）的时间戳：此后轮询拿到的旧对局状态（phase=playing/旧 gameStartTime）
+  // 不得再把本地拉回对局中，否则会跳过准备阶段；仅当服务端开出新局（gameStartTime 更新）才允许进入对局
+  // 服务端时钟偏移（serverNow - 本地 Date.now()）：凡与服务端时间戳（sideReveal.time/gameStartAt 等）
+  // 比较一律使用校正后的服务端时间，避免双端设备时钟差导致倒数不齐或守卫误判
+  const serverTimeOffsetRef = useRef(0);
+  // 对局纪元：本端已进入对局的 matchId。重赛后轮询可能先拿到上一局旧快照（phase=playing），
+  // 仅当服务端 matchId 大于本端已入局的纪元时才允许再次进入对局（替代跨时钟的时间戳比较）
+  const playedMatchIdRef = useRef(0);
+  const [opponentReady, setOpponentReady] = useState(false);
+  const [opponentPreference, setOpponentPreference] = useState<'red' | 'black' | null>(null);
+  // 公示信息：双方选边相同被随机分配时标注
+  const [sideRandom, setSideRandom] = useState(false);
+  // 选边弹窗切换到"结果公示"视图：选边结束后弹窗保持不动，内容以动画切换为执棋结果
+  const [sidePickResultMode, setSidePickResultMode] = useState(false);
+  // 结果视图的入场动画（淡入 + 上移）
+  const sidePickResultAnim = useRef(new Animated.Value(0)).current;
+  // 公示→倒数序列只启动一次；由 ready 响应（上传方）或轮询发现 sideReveal（非上传方）触发
+  const revealStartedRef = useRef(false);
+  // 是否由本端上传初始局面（双方均准备的那次 ready 响应方）；另一端等待同步，避免重复上传互相覆盖
+  const amUploaderRef = useRef(false);
+  const uploadedRef = useRef(false);
+  const revealTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const countdownTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // 吃子/将军特效（含连续将军节流策略）
+  const { moveEffect, triggerMoveEffect } = useMoveEffect();
+  // 轮询中识别"对手刚走了一步"：记录已见的着法数，结合最后一步的棋子归属避免自己走棋重复触发
+  const seenHistoryLenRef = useRef(0);
+  // 本端走子乐观更新保护：上传在途时轮询可能先拿到走子前的旧局面，直接覆盖会让棋子
+  // "回退"、待上传落地后又"重新移动"。记录本端着法后的着法数与时间，轮询到更旧的局面
+  // 时跳过覆盖，直到服务端追上（着法数 >= 本端）再恢复同步；超时则判定上传失败放弃保护。
+  const pendingSyncRef = useRef<{ historyLen: number; at: number } | null>(null);
+  // 被吃棋子明细抽屉展开的一侧（null=收起），抽屉渲染在顶部标题行正下方
+  const [capturedDrawerSide, setCapturedDrawerSide] = useState<'opponent' | 'mine' | null>(null);
+  // 棋盘可用纵向空间实测（宽屏/纵向空间不足时限制棋盘尺寸，避免挤占标题行与底部按钮）
+  const [boardAreaH, setBoardAreaH] = useState(0);
+  const [bottomBarH, setBottomBarH] = useState(0);
+  // 与人机对战一致：棋盘与底部操作栏的间距随屏宽自适应
+  const dynamicGap = Math.max(Math.round(screenWidth * 0.03), 8);
+  // 表情下拉栏锚点（兼容回退）：我方名称角标行底边在棋盘容器内的 Y 坐标（onLayout 测得）。
+  // 主锚点改为点按瞬间 measureInWindow 实测窗口坐标（见 emojiDropdownTop），onLayout 值仅作回退。
+  const [emojiAnchorY, setEmojiAnchorY] = useState(0);
+  // 下拉栏竖向锚点（根容器坐标系）：点按名称行时实测行底边的窗口坐标并减去根容器窗口 Y。
+  // 动态布局预算（boardPadTop）会在多轮布局中移动名称行，onLayout 相对坐标在部分机型/时序下
+  // 会取到中间态旧值（下拉栏错落到棋盘中），因此以点按瞬间的实测坐标为准。
+  const myNameRowRef = useRef<View>(null);
+  const [emojiDropdownTop, setEmojiDropdownTop] = useState<number | null>(null);
+  // 内容宿主（棋盘容器父级）相对根容器的 Y：配合 onLayout 回退锚点换算到根容器坐标系
+  const [drawerHostY, setDrawerHostY] = useState(0);
+  // 棋盘高度预算 + 垂直定位留白（二分求解，口径与抽屉真实尺寸一致）：
+  // 条件 1 —— 棋盘顶边上方常驻预留「对手名角标行(30) + 摘要条悬浮区(38+30) + 抽屉展开高度」，
+  //           无论抽屉是否点开都预留，保证展开时底边不压棋盘、不与摘要条/角标重叠；
+  // 条件 2 —— 内容（上角标行 + 棋盘 + 下角标行 + 底部栏）在宿主内垂直居中；居中时上方预留
+  //           不足则整体下移贴住预留区（把下方空白让给棋盘），棋盘取到预留允许的最大尺寸。
+  // 上方流内占位 = 对手名角标行(26+4=30)；下方流内占位 = 我方名角标行(26+4=30) + dynamicGap + 底部栏。
+  const { maxBoardHeight, paddingTop: boardPadTop } = useBoardLayoutBudget({
+    hostHeight: boardAreaH,
+    screenWidth,
+    stripOffset: 30,
+    topFlowHeight: 30,
+    bottomFlowHeight: 30 + dynamicGap + bottomBarH,
+  });
+
+  // 棋盘真实几何（相对主容器）：供绝杀特效锁定棋盘中心、把结算文字/按钮排到棋盘正下方
+  const { containerRef, boardRef, boardFrame, measure: measureBoardFrame } = useBoardFrame();
+
+  // 绝杀特效弹出前兜底重测：boardPadTop/maxBoardHeight 变化只挪动棋盘（相对父级布局不变，
+  // 包裹层 onLayout 可能不触发），此处按绝对坐标重新测量，保证特效对齐的是最新棋盘位置
+  useEffect(() => {
+    if (!jueShaVisible) return;
+    measureBoardFrame();
+  }, [jueShaVisible, boardPadTop, maxBoardHeight, measureBoardFrame]);
+
+  // 棋盘本体真实尺寸（外层容器宽=屏宽，onBoardLayout 回报的才是棋盘宽），由 ChessBoard 回报
+  const [boardSize, setBoardSize] = useState<{ width: number; height: number } | null>(null);
+
+  // 绝杀特效对齐用的棋盘框：测量框宽=屏宽（外层容器），按棋盘本体宽度在其中水平居中换算，
+  // 得到棋盘本体的真实 x/宽，保证特效中心与按钮宽度口径都落在棋盘本体上
+  const jueshaBoardFrame = useMemo(() => {
+    if (!boardFrame) return null;
+    const w = boardSize?.width ?? boardFrame.width;
+    const h = boardSize?.height ?? boardFrame.height;
+    return {
+      x: boardFrame.x + (boardFrame.width - w) / 2,
+      y: boardFrame.y,
+      width: w,
+      height: h,
+    };
+  }, [boardFrame, boardSize]);
+
+  // 房间设置
+  const [turnTimeLimit, setTurnTimeLimit] = useState(0); // 秒，0=不限时
+  // 房间对战设置（基本用时+加秒制）：局时/加秒/让子，由房间详情轮询与对局状态负载双向同步
+  const [baseTimeSeconds, setBaseTimeSeconds] = useState(0); // 局时（秒），0=不限时（不显示时钟）
+  const [roomHandicap, setRoomHandicap] = useState<number[]>([]); // 红方让出的棋子 id 列表
+  const roomHandicapRef = useRef<number[]>([]); // 上传初始局面时同步取用，避免闭包陈旧
+  const roomIncrementRef = useRef(0); // 加秒（秒），设置弹窗预填用
+  const roomByoyomiRef = useRef(0); // 读秒（秒），0=关闭；时钟芯片读秒阶段展示与设置弹窗预填用
+  // 局时时钟快照（服务端权威）：钟面余量（ms）+ 锚点 lastMoveTime/serverNow + 当前走棋方 + 协商暂停锚点
+  interface ClockSnap { red: number; black: number; lastMoveTime: number; sideTag: boolean; clockPausedAt: number | null }
+  const clockSnapRef = useRef<ClockSnap | null>(null);
+  // 时钟展示文本（1s 本地插值刷新）：null 表示本房间未启用局时
+  const [clockText, setClockText] = useState<{ mine: string | null; opp: string | null; mineUrgent: boolean; oppUrgent: boolean }>({ mine: null, opp: null, mineUrgent: false, oppUrgent: false });
+  const [turnTimeLeft, setTurnTimeLeft] = useState(0); // 当前回合剩余秒数
+  const lastMoveTimeRef = useRef<number>(0);
+
+  const roomId = params.roomId;
+  const playerId = params.playerId;
+  const mySideRef = useRef(params.side || 'red');
+  const [mySide, setMySide] = useState<string>(params.side || 'red');
+  const [opponentName, setOpponentName] = useState<string>('');
+  // 对局内 emoji 表情：表情栏展开状态、当前活跃表情、已见消息 id 去重
+  const [emojiPickerOpen, setEmojiPickerOpen] = useState(false);
+  const [activeEmojis, setActiveEmojis] = useState<ActiveEmoji[]>([]);
+  const seenEmojiIdsRef = useRef<Set<string>>(new Set());
+  // 去重后把表情加入本地活跃列表（我方乐观展示与轮询回显对方表情均走此入口）
+  // 声明在轮询 effect 之前，供其依赖与调用
+  const addActiveEmoji = useCallback((msg: { id: string; playerId: string; emoji: string }) => {
+    if (seenEmojiIdsRef.current.has(msg.id)) return;
+    seenEmojiIdsRef.current.add(msg.id);
+    setActiveEmojis(prev => [...prev, { id: msg.id, playerId: msg.playerId, emoji: msg.emoji, receivedAt: Date.now() }]);
+  }, []);
+  // 预加载常用音效并预热音频模式（联机对局同样播放走子音效，避免首声漏播）；退出对局时释放全部音效
+  useEffect(() => {
+    preloadSounds();
+    return () => { unloadAllSounds(); };
+  }, []);
+  const gameStartTimeRef = useRef<number>(0);
+  const [gameDuration, setGameDuration] = useState(0);
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const pollInFlightRef = useRef(false); // 轮询并发防护：慢网下避免请求堆叠、旧响应乱序覆盖新状态
+
+  // 断线重连状态
+  const [opponentDisconnected, setOpponentDisconnected] = useState(false);
+  const [disconnectCountdown, setDisconnectCountdown] = useState(60); // 断线等待倒计时（秒）
+  const heartbeatRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // 被移出房间/房间已关闭的提示去重：轮询每 2s 触发，避免重复弹窗
+  const roomGoneAlertedRef = useRef(false);
+  // 主动退出标记：返回按钮/侧滑等本人主动离开房间时置位。
+  // 离开请求会让服务端销毁房间（独住房主）或移出本人，与 2s 轮询存在竞态——
+  // 在途轮询可能拿到 404 或「成员列表无本人」，误报「房间已关闭/你已被移出房间」。
+  // 置位后轮询入口与告警点双重短路。
+  const intentionalExitRef = useRef(false);
+
+  // 在线对局 WebSocket：连接实例、连接状态，以及最新状态处理函数的引用
+  // （用 ref 持有处理函数，避免把大量依赖塞进轮询/WS effect 造成频繁重建）
+  const battleSocketRef = useRef<BattleSocket | null>(null);
+  const [wsConnected, setWsConnected] = useState(false);
+  const applyServerStateRef = useRef<(data: Record<string, unknown>) => void>(() => undefined);
+
+  // 悔棋协商状态
+  const [undoPending, setUndoPending] = useState(false); // 我方已发起，等待对方同意
+  const undoPendingRef = useRef(false);
+  const [undoRequestFromOpponent, setUndoRequestFromOpponent] = useState(false); // 对方发起的悔棋请求
+  // 求和协商状态
+  const [drawPending, setDrawPending] = useState(false); // 我方已发起求和，等待对方同意
+  const drawPendingRef = useRef(false);
+  const [drawRequestFromOpponent, setDrawRequestFromOpponent] = useState(false); // 对方发起的求和请求
+  // 协商封禁：本局悔棋/求和分别被对方连续拒绝 2 次后，禁止再发起对应请求（服务端权威计数，重赛重置）
+  const [undoBlocked, setUndoBlocked] = useState(false);
+  const undoBlockedRef = useRef(false);
+  const [drawBlocked, setDrawBlocked] = useState(false);
+  const drawBlockedRef = useRef(false);
+
+  // 计算被吃掉的棋子
+  const getCapturedPieces = () => {
+    const capturedByRed: number[] = []; // 红方吃掉的（黑方棋子）
+    const capturedByBlack: number[] = []; // 黑方吃掉的（红方棋子）
+    
+    gameState.pieces.forEach(piece => {
+      if (!piece.alive) {
+        // 棋子ID 0-15 是黑方，16-31 是红方
+        if (piece.id < 16) {
+          capturedByRed.push(piece.id); // 黑方棋子被红方吃掉
+        } else {
+          capturedByBlack.push(piece.id); // 红方棋子被黑方吃掉
+        }
+      }
+    });
+    
+    return { capturedByRed, capturedByBlack };
+  };
+
+  const { capturedByRed, capturedByBlack } = getCapturedPieces();
+
+  // ===== 断线重连显式上报 =====
+  // 「重连成功」以玩家真正回到对局页面为准：服务端仅由 POST /reconnect 清除断线等待，
+  // WS/心跳的自动上线仅代表连接层恢复，不代表玩家已回到房间。
+  // 触发时机：页面聚焦、App 回到前台、WS 重连成功、从最新对局状态发现自己被标记断线。
+  const lastReconnectSentAtRef = useRef(0);
+  const sendReconnect = useCallback(async () => {
+    if (AppState.currentState !== 'active') return; // 后台的自动上线不算重连成功
+    const now = Date.now();
+    if (now - lastReconnectSentAtRef.current < 4000) return; // 多触发源节流去重
+    lastReconnectSentAtRef.current = now;
+    try {
+      const base = await getOnlineServerUrl();
+      /**
+       * 服务端文件：server/src/routes/lanGame.ts
+       * 接口：POST /api/v1/lan/rooms/:roomId/reconnect
+       * Body 参数：playerId: string
+       */
+      await fetch(`${base}/api/v1/lan/rooms/${roomId}/reconnect`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ playerId }),
+      });
+    } catch (error) {
+      console.error('重连上报失败:', error);
+    }
+  }, [roomId, playerId]);
+
+  // App 回到前台时显式上报重连（覆盖「切后台被判断线 → 回前台」路径）
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', (state) => {
+      if (state === 'active') sendReconnect();
+    });
+    return () => sub.remove();
+  }, [sendReconnect]);
+
+  // 检查房间状态（等待对手加入/准备）
+  useFocusEffect(
+    useCallback(() => {
+      // 页面聚焦即显式上报重连（覆盖「大厅点击回到对局进入房间」路径）
+      sendReconnect();
+      const checkRoom = async () => {
+        // 已主动退出：离开请求已发出，后续轮询的 404/成员缺失是退出竞态的必然结果，直接短路
+        if (intentionalExitRef.current) return;
+        try {
+          const base = await getOnlineServerUrl();
+          // 携带 playerId：服务端据此刷新成员活跃时间，等待清扫器不会把 HTTP 轮询活跃但 WS 异常的成员误踢
+          const response = await fetch(`${base}/api/v1/lan/rooms/${roomId}?playerId=${encodeURIComponent(playerId)}`);
+          // 房间已被销毁（如本人无活跃连接被服务端清扫、房主离开致房间解散）：提示并退出
+          // （响应返回时可能已主动退出——在途请求与退出动作的竞态，须再次检查退出标记）
+          if (response.status === 404) {
+            if (!roomGoneAlertedRef.current && !intentionalExitRef.current) {
+              roomGoneAlertedRef.current = true;
+              // 经 exitToLobby 回大厅：有栈 back、无栈（Web 刷新）replace 兜底
+              Alert.alert('提示', '房间已关闭', [{ text: '确定', onPress: exitToLobby }]);
+            }
+            return;
+          }
+          const data = await response.json();
+          if (data.room) {
+            const room = data.room;
+            // 服务端时钟校正：后续所有与服务端时间戳的比较统一使用校正时间
+            if (typeof room.serverNow === 'number') {
+              serverTimeOffsetRef.current = room.serverNow - Date.now();
+            }
+            // 等待阶段表情同步（兜底通道）：WS 断开时经 2s 轮询仍可收到对方表情，按 id 去重
+            if (Array.isArray(room.emojiMessages)) {
+              for (const m of room.emojiMessages) {
+                if (m && typeof m.id === 'string' && typeof m.emoji === 'string') {
+                  addActiveEmoji({ id: m.id, playerId: m.playerId, emoji: m.emoji });
+                }
+              }
+            }
+            // 获取房间设置与名称
+            setRoomName(room.name || '');
+            setRoomPassword(room.password ?? null);
+            setHostId(room.hostId || '');
+            // 服务端存储的 turnTimeLimit 单位为秒，直接使用
+            setTurnTimeLimit(room.settings?.turnTimeLimit || 0);
+            // 基本用时+加秒制设置与让子（对局状态负载中亦会同步，双通道兜底）
+            setBaseTimeSeconds(room.settings?.baseTimeSeconds || 0);
+            roomIncrementRef.current = room.settings?.incrementSeconds || 0;
+            roomByoyomiRef.current = room.settings?.byoyomiSeconds || 0;
+            if (Array.isArray(room.settings?.handicap)) {
+              roomHandicapRef.current = room.settings.handicap;
+              setRoomHandicap(room.settings.handicap);
+            }
+            // 获取对手信息（名称/选边/准备状态）
+            const opponent = room.players.find((p: any) => p.id !== playerId);
+            if (opponent) {
+              setOpponentName(opponent.name);
+              setOpponentReady(!!opponent.ready);
+              setOpponentPreference(opponent.sidePreference ?? null);
+            } else {
+              setOpponentName('');
+              setOpponentReady(false);
+              setOpponentPreference(null);
+            }
+            const me = room.players.find((p: any) => p.id === playerId);
+            // 等待阶段本人已不在成员列表：无活跃连接超时被服务端清扫（如切后台过久）→ 提示并退出
+            if (!me && room.phase === 'waiting' && phaseRef.current === 'waiting') {
+              if (!roomGoneAlertedRef.current && !intentionalExitRef.current) {
+                roomGoneAlertedRef.current = true;
+                // 经 exitToLobby 回大厅：有栈 back、无栈（Web 刷新）replace 兜底
+                Alert.alert('提示', '你已被移出房间（连接中断过久）', [{ text: '确定', onPress: exitToLobby }]);
+              }
+              return;
+            }
+            // 等待阶段同步自己的准备/选边状态（对手离开会被服务端重置）
+            if (me && phaseRef.current === 'waiting' && !revealStartedRef.current) {
+              // 本端刚切换准备或有请求在途时，不用轮询的服务端旧数据覆盖本端状态，避免按钮回跳；
+              // 宽限窗口（2.5s > 轮询间隔 2s）后服务端已完成同步，恢复正常对账
+              const recentlyToggled = Date.now() - lastReadyToggleRef.current < 2500;
+              if (readyInFlightRef.current === 0 && !recentlyToggled) {
+                myReadyRef.current = !!me.ready;
+                setMyReady(!!me.ready);
+              }
+              setMyPreference(me.sidePreference ?? null);
+            }
+            // 公示被取消（对方退出/死连被清扫，服务端已清空公示与统一定时）→ 中止倒数回准备阶段；
+            // 已本地进局但服务端未开局（对方在倒数窗口内离开）→ 同样回退，避免单人空局卡死
+            if (
+              room.phase === 'waiting' &&
+              !room.sideReveal &&
+              !uploadedRef.current &&
+              (revealStartedRef.current || phaseRef.current === 'playing')
+            ) {
+              abortRevealSequence();
+            }
+            // 双方已准备且阵营已分配 → 启动公示→倒数序列（只启动一次，倒数锚定服务端统一开局时刻）
+            if (room.sideReveal && me?.side && !revealStartedRef.current) {
+              startRevealSequence(me.side, !!room.sideReveal.random, room.gameStartAt ?? null);
+            }
+            // 对局已开始：同步状态
+            if (room.phase === 'playing') {
+              const roomMatchId = typeof room.matchId === 'number' ? room.matchId : 0;
+              if (me?.side) {
+                mySideRef.current = me.side;
+                setMySide(me.side);
+              }
+              if (phaseRef.current === 'waiting') {
+                // 未经历公示（如刷新重进）→ 直接进入对局。
+                // 重赛重置后可能先收到上一局的旧快照（phase=playing + 旧 matchId），
+                // 仅当服务端开出新局（matchId 大于本端已入局纪元）才进入对局，否则跳过准备阶段
+                if (room.gameStartTime && roomMatchId > playedMatchIdRef.current) {
+                  playedMatchIdRef.current = roomMatchId;
+                  setPhase('playing');
+                  gameStartTimeRef.current = room.gameStartTime;
+                }
+              } else if (phaseRef.current === 'reveal' || phaseRef.current === 'countdown') {
+                // 上传方已开局：提前结束本地公示/倒数序列
+                playedMatchIdRef.current = Math.max(playedMatchIdRef.current, roomMatchId);
+                finishSequenceEarly();
+                if (room.gameStartTime) {
+                  gameStartTimeRef.current = room.gameStartTime;
+                }
+              } else if (phaseRef.current === 'playing') {
+                // 本地倒数到点已先进局（新流程不再等待上传结果）：以服务端纪元校准已入局
+                // 纪元——重赛后识别「上一局旧快照」（matchId 不增即忽略）依赖该值，非上传方
+                // 此前无机会更新它，存在被旧快照误拉回对局的缺口
+                playedMatchIdRef.current = Math.max(playedMatchIdRef.current, roomMatchId);
+                if (room.gameStartTime && gameStartTimeRef.current === 0) {
+                  gameStartTimeRef.current = room.gameStartTime;
+                }
+              }
+            }
+            // 兜底：上传方掉线未上传初始局面（公示超过12秒仍在 waiting）→ 本端接管上传
+            // （sideReveal.time 为服务端时钟，须用校正后的服务端时间比较）
+            if (
+              room.sideReveal &&
+              room.phase === 'waiting' &&
+              !uploadedRef.current &&
+              Date.now() + serverTimeOffsetRef.current - room.sideReveal.time > 12000
+            ) {
+              uploadInitialGame();
+            }
+            // 对方点击重新对局：房间从 ended 回到 waiting，重置本地状态
+            if (room.phase === 'waiting' && phaseRef.current === 'ended') {
+              resetForRematch();
+            }
+          }
+        } catch (error) {
+          console.error('检查房间状态失败:', error);
+        }
+      };
+
+      checkRoom();
+      const interval = setInterval(checkRoom, 2000);
+      return () => clearInterval(interval);
+    }, [roomId, playerId, sendReconnect])
+  );
+
+  // 统一处理服务端对局状态（HTTP 轮询响应与 WebSocket state 推送共用）
+  const applyServerState = (raw: Record<string, unknown>) => {
+    const data = raw as {
+      gameState?: GameState;
+      phase?: string;
+      gameStartTime?: number | null;
+      winner?: string | null;
+      surrenderBy?: string | null;
+      endReason?: 'checkmate' | 'resign' | 'draw' | 'disconnect' | null;
+      lastMoveTime?: number | null;
+      disconnectedPlayerId?: string | null;
+      disconnectTime?: number | null;
+      pendingUndo?: { playerId: string; requestTime: number } | null;
+      undoResult?: { playerId: string; agreed: boolean; reason: string } | null;
+      pendingDraw?: { playerId: string; requestTime: number } | null;
+      drawResult?: { playerId: string; agreed: boolean; reason: string } | null;
+      emojiMessages?: { id: string; playerId: string; emoji: string }[];
+      // 基本用时加秒制：服务端时钟域时间戳、房间设置、双方剩余毫秒
+      serverNow?: number;
+      settings?: { baseTimeSeconds?: number; incrementSeconds?: number; byoyomiSeconds?: number; handicap?: number[] };
+      clocks?: { red: number; black: number } | null;
+      clockPausedAt?: number | null; // 悔棋/求和协商暂停锚点（服务端时钟域）
+      undoRefusals?: Record<string, number>; // 各玩家本局悔棋被对方连续拒绝次数（≥2 封禁悔棋入口）
+      drawRefusals?: Record<string, number>; // 各玩家本局求和被对方连续拒绝次数（≥2 封禁求和入口）
+    };
+
+    // 同步 emoji 表情消息：独立于 gameState 处理，准备阶段（未开局、gameState 为空）同样生效。
+    // 否则进入房间后、正式开局前发送的表情无法被对方接收（对方/多设备回显均走此入口，按 id 去重）。
+    if (Array.isArray(data.emojiMessages)) {
+      for (const m of data.emojiMessages) {
+        if (m && typeof m.id === 'string' && typeof m.emoji === 'string' && !seenEmojiIdsRef.current.has(m.id)) {
+          addActiveEmoji({ id: m.id, playerId: m.playerId, emoji: m.emoji });
+        }
+      }
+    }
+
+    if (data.gameState) {
+      const newState = data.gameState;
+
+      // 乐观更新保护：本端刚走子且上传在途时，服务端可能仍是走子前的旧局面，
+      // 直接覆盖会让棋子回退、待上传落地后又重新移动。服务端未追上本端着法数时跳过本轮覆盖。
+      if (pendingSyncRef.current) {
+        const pending = pendingSyncRef.current;
+        const incomingLen = newState.moveHistory?.length ?? 0;
+        if (incomingLen >= pending.historyLen) {
+          // 服务端已包含本端着法（或更多），解除保护恢复正常同步
+          pendingSyncRef.current = null;
+        } else if (Date.now() - pending.at < 8000) {
+          // 仍是走子前的旧局面（上传未落地）→ 本轮跳过覆盖，下轮重试
+          return;
+        } else {
+          // 长时间未见本端着法，判定上传失败 → 放弃保护，按服务端局面恢复
+          pendingSyncRef.current = null;
+        }
+      }
+
+      setGameState(newState);
+
+      // 同步「最近一步」光环：以服务端着法序列为准，覆盖对方走棋与悔棋回退场景
+      // （自己走棋已在本地 handleMove 乐观设置，服务端追上后此处与之一致；仅在着法数变化时更新，避免无效重渲染）
+      const historyLen = newState.moveHistory.length;
+      if (historyLen !== seenHistoryLenRef.current) {
+        const lastRecord = historyLen > 0 ? newState.moveHistory[historyLen - 1] : null;
+        setLastMove(lastRecord ? {
+          fromCol: lastRecord.fromCol,
+          fromRow: lastRecord.fromRow,
+          toCol: lastRecord.toCol,
+          toRow: lastRecord.toRow,
+        } : null);
+      }
+
+      // 对手走棋检测：着法数增加且最后一步是对手棋子 → 触发吃子/将军特效
+      // （自己走棋已在本地 handleMove 触发，悔棋使着法数减少不满足条件）
+      if (historyLen > seenHistoryLenRef.current) {
+        const last = newState.moveHistory[historyLen - 1];
+        const mySideTag = sideStringToTag(mySideRef.current);
+        // pieceId 16-31 为红方、0-15 为黑方；与本方阵营不同即对手所走
+        const isOpponentMove = mySideTag ? last.pieceId < 16 : last.pieceId >= 16;
+        if (isOpponentMove) {
+          // 终局（对方绝杀/困毙我方）时不播，由绝杀特效接管
+          triggerMoveEffect(last.capturedPieceId, newState.isCheck, data.phase === 'ended');
+          // 对手走子音效：将军时播男声将军语音（内置节流），否则吃子/走子音（终局不播）
+          if (data.phase !== 'ended') {
+            if (newState.isCheck) {
+              playJiangJunSound();
+            } else if (last.capturedPieceId !== -1) {
+              playSound('eat');
+            } else {
+              playSound('go');
+            }
+          }
+        }
+        seenHistoryLenRef.current = historyLen;
+      } else if (historyLen < seenHistoryLenRef.current) {
+        // 悔棋后着法数回退，同步基线避免漏检后续对手走棋
+        seenHistoryLenRef.current = historyLen;
+      }
+
+      // 同步服务端回合计时点（对方走棋/悔棋后重置我方限时倒计时）
+      if (data.lastMoveTime) {
+        lastMoveTimeRef.current = data.lastMoveTime;
+      }
+
+      // 服务端时钟校正（WS 推送通道；轮询通道在 checkRoom 内处理）
+      if (typeof data.serverNow === 'number') {
+        serverTimeOffsetRef.current = data.serverNow - Date.now();
+      }
+
+      // 房间对战设置同步（基本用时+加秒制/让子）：开局后房主不可再改，开局前以最新值为准
+      if (data.settings) {
+        setBaseTimeSeconds(data.settings.baseTimeSeconds || 0);
+        roomIncrementRef.current = data.settings.incrementSeconds || 0;
+        roomByoyomiRef.current = data.settings.byoyomiSeconds || 0;
+        if (Array.isArray(data.settings.handicap)) {
+          roomHandicapRef.current = data.settings.handicap;
+          setRoomHandicap(data.settings.handicap);
+        }
+      }
+
+      // 局时时钟快照同步（服务端权威钟面 + 锚点；本地 1s 插值展示，收到新快照自动校正）
+      if (data.clocks && typeof data.lastMoveTime === 'number' && newState) {
+        clockSnapRef.current = {
+          red: data.clocks.red,
+          black: data.clocks.black,
+          lastMoveTime: data.lastMoveTime,
+          sideTag: newState.sideTag,
+          clockPausedAt: typeof data.clockPausedAt === 'number' ? data.clockPausedAt : null,
+        };
+      } else if (!data.clocks) {
+        clockSnapRef.current = null;
+      }
+
+      // 协商封禁状态同步（先于下方结果提示读取）：本局连续被对方拒绝 2 次后分别禁用悔棋/求和入口
+      if (data.undoRefusals && typeof data.undoRefusals === 'object') {
+        const count = (data.undoRefusals as Record<string, number>)[playerId];
+        const blocked = typeof count === 'number' && count >= 2;
+        undoBlockedRef.current = blocked;
+        setUndoBlocked(blocked);
+      }
+      if (data.drawRefusals && typeof data.drawRefusals === 'object') {
+        const count = (data.drawRefusals as Record<string, number>)[playerId];
+        const blocked = typeof count === 'number' && count >= 2;
+        drawBlockedRef.current = blocked;
+        setDrawBlocked(blocked);
+      }
+
+      // 对方发起的悔棋请求 → 弹出确认框
+      setUndoRequestFromOpponent(!!(data.pendingUndo && data.pendingUndo.playerId !== playerId));
+
+      // 我方发起的悔棋请求有了处理结果
+      if (data.undoResult && data.undoResult.playerId === playerId && undoPendingRef.current) {
+        undoPendingRef.current = false;
+        setUndoPending(false);
+        if (!data.undoResult.agreed) {
+          const refusedMsg = undoBlockedRef.current
+            ? '对方拒绝了悔棋请求，本局不能再发起悔棋'
+            : '对方拒绝了悔棋请求';
+          Alert.alert('提示', data.undoResult.reason === 'timeout' ? '对方未响应，悔棋请求已取消' : refusedMsg);
+        }
+        // 同意时局面已通过上方同步，无需额外操作
+      } else if (!data.pendingUndo && undoPendingRef.current) {
+        // 请求因对方走棋等原因失效且无处理结果 → 静默清除
+        undoPendingRef.current = false;
+        setUndoPending(false);
+      }
+
+      // 对方发起的求和请求 → 弹出确认框
+      setDrawRequestFromOpponent(!!(data.pendingDraw && data.pendingDraw.playerId !== playerId));
+
+      // 我方发起的求和请求有了处理结果
+      if (data.drawResult && data.drawResult.playerId === playerId && drawPendingRef.current) {
+        drawPendingRef.current = false;
+        setDrawPending(false);
+        if (!data.drawResult.agreed) {
+          const refusedMsg = drawBlockedRef.current
+            ? '对方拒绝了求和请求，本局不能再发起求和'
+            : '对方拒绝了求和请求';
+          Alert.alert('提示', data.drawResult.reason === 'timeout' ? '对方未响应，求和请求已取消' : refusedMsg);
+        }
+        // 同意时通过下方 phase === 'ended'（无胜负方）同步和棋结算
+      } else if (!data.pendingDraw && drawPendingRef.current) {
+        // 请求因对方走棋等原因失效且无处理结果 → 静默清除
+        drawPendingRef.current = false;
+        setDrawPending(false);
+      }
+
+      // 检查对方是否断线
+      if (data.disconnectedPlayerId && data.disconnectedPlayerId !== playerId) {
+        setOpponentDisconnected(true);
+        // 计算剩余等待时间
+        if (data.disconnectTime) {
+          const elapsed = Math.floor((Date.now() - data.disconnectTime) / 1000);
+          const remaining = Math.max(0, 60 - elapsed);
+          setDisconnectCountdown(remaining);
+        }
+      } else {
+        setOpponentDisconnected(false);
+        setDisconnectCountdown(60);
+      }
+      // 发现自己被标记断线（如切后台导致心跳超时）：本页面正存活接收状态，立即显式上报重连
+      if (data.disconnectedPlayerId === playerId) {
+        sendReconnect();
+      }
+
+      // 检查对局是否结束（对方认输、断线超时、走棋绝杀或对方同意求和）
+      if (data.phase === 'ended') {
+        const isDraw = !data.winner; // 无胜负方 = 和棋
+        const isWin = !isDraw && data.winner === mySideRef.current;
+        setGameResult({
+          winner: data.winner ?? null,
+          isWin,
+          duration: data.gameStartTime ? Date.now() - data.gameStartTime : 0,
+          moveCount: newState.moveHistory?.length || 0,
+          surrenderBy: data.surrenderBy ?? null,
+          isDraw,
+        });
+        setPhase('ended');
+        // 终局原因：服务端明确下发；缺失时按结果兜底推断（和棋/认输可判，其余有胜负方的按绝杀处理）
+        const endReason = data.endReason ?? (isDraw ? 'draw' : data.surrenderBy ? 'resign' : 'checkmate');
+        setGameEndReason(endReason);
+        // 所有结束方式都展示结算界面；其中仅绝杀/困毙播放「绝/杀」特效，
+        // 认输/和棋/断线判负由 showEffect 控制为普通文字结算
+        setJueShaVisible(true);
+      }
+    }
+  };
+
+  // 保持 ref 指向最新的处理函数（轮询/WS 回调经 ref 调用，避免依赖抖动导致 effect 重建）
+  useEffect(() => {
+    applyServerStateRef.current = applyServerState;
+  });
+
+  // 建立在线对局 WebSocket：实时接收状态推送、发送对局动作；断线自动重连由 BattleSocket 内部处理
+  useEffect(() => {
+    if (!roomId || !playerId) return;
+    const socket = new BattleSocket(roomId, playerId, {
+      onState: data => applyServerStateRef.current(data),
+      onStatusChange: connected => {
+        setWsConnected(connected);
+        // WS 重连成功且 App 在前台：显式上报重连（后台自动重连不算，sendReconnect 内部有前台校验）
+        if (connected) sendReconnect();
+      },
+    });
+    battleSocketRef.current = socket;
+    socket.connect();
+    return () => {
+      battleSocketRef.current = null;
+      socket.close();
+    };
+  }, [roomId, playerId, sendReconnect]);
+
+  // 对局中轮询游戏状态（WebSocket 兜底通道：仅在 WS 未连接时启用）
+  useEffect(() => {
+    if (phase !== 'playing') return;
+    if (wsConnected) return; // WS 已连接时由服务端推送驱动，无需轮询
+
+    const poll = async () => {
+      if (pollInFlightRef.current) return; // 上一次轮询未返回则跳过，防止并发乱序
+      pollInFlightRef.current = true;
+      try {
+        const base = await getOnlineServerUrl();
+        const response = await fetch(`${base}/api/v1/lan/rooms/${roomId}/gameState`);
+        const data = await response.json();
+        applyServerStateRef.current(data);
+      } catch (error) {
+        console.error('获取游戏状态失败:', error);
+      } finally {
+        pollInFlightRef.current = false;
+      }
+    };
+
+    poll();
+    pollRef.current = setInterval(poll, 1000);
+    return () => {
+      if (pollRef.current) clearInterval(pollRef.current);
+    };
+  }, [phase, roomId, wsConnected]);
+
+  // 心跳发送（对局中每5秒发送一次）
+  useEffect(() => {
+    if (phase !== 'playing') return;
+
+    const sendHeartbeat = async () => {
+      const base = await getOnlineServerUrl();
+      fetch(`${base}/api/v1/lan/rooms/${roomId}/heartbeat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ playerId }),
+      }).catch((err: unknown) => console.error('心跳发送失败:', err));
+    };
+
+    sendHeartbeat(); // 立即发送一次
+    heartbeatRef.current = setInterval(sendHeartbeat, 5000);
+    return () => {
+      if (heartbeatRef.current) clearInterval(heartbeatRef.current);
+    };
+  }, [phase, roomId, playerId]);
+
+  // 断线等待倒计时
+  useEffect(() => {
+    if (!opponentDisconnected) return;
+
+    const timer = setInterval(() => {
+      setDisconnectCountdown(prev => {
+        if (prev <= 1) {
+          clearInterval(timer);
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+
+    return () => clearInterval(timer);
+  }, [opponentDisconnected]);
+
+  // 对局中计时器
+  useEffect(() => {
+    if (phase !== 'playing') return;
+
+    const timer = setInterval(() => {
+      if (gameStartTimeRef.current > 0) {
+        setGameDuration(Date.now() - gameStartTimeRef.current);
+      }
+    }, 1000);
+
+    return () => clearInterval(timer);
+  }, [phase]);
+
+  // 进入对局的本地初始化（不触碰服务端）
+  const enterPlayingLocal = () => {
+    setSelectedPieceId(null);
+    setValidMoves(null);
+    setLastMove(null);
+    setPhase('playing');
+    lastMoveTimeRef.current = Date.now();
+    setTurnTimeLeft(turnTimeLimit);
+  };
+
+  // 上传初始局面并开局（仅上传方/接管方执行一次）
+  const uploadInitialGame = async () => {
+    if (uploadedRef.current) return;
+    uploadedRef.current = true;
+    try {
+      const base = await getOnlineServerUrl();
+      /**
+       * 服务端文件：server/src/routes/lanGame.ts
+       * 接口：POST /api/v1/lan/rooms/:roomId/start
+       * Body 参数：playerId: string
+       */
+      const startResp = await fetch(`${base}/api/v1/lan/rooms/${roomId}/start`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ playerId }),
+      });
+      const startData = await startResp.json();
+      if (!startData?.success) {
+        // 开局被服务端拒绝（如对方在倒数期间退出、公示已被清理）→ 不再上传初始局面；
+        // 本端是否留在对局由轮询对账决定（服务端 waiting + 公示清空 → 自动回退准备阶段）
+        uploadedRef.current = false;
+        return;
+      }
+      // 记录本局纪元：重赛后旧快照（旧 matchId）不得再把本端拉回对局
+      if (typeof startData.matchId === 'number') {
+        playedMatchIdRef.current = Math.max(playedMatchIdRef.current, startData.matchId);
+      }
+      // 让子房间：初始局面移除红方让出的棋子（服务端透传设置，双方以房间设置为准）
+      const initialState = applyHandicap(createInitialState(), roomHandicapRef.current);
+      /**
+       * 服务端文件：server/src/routes/lanGame.ts
+       * 接口：POST /api/v1/lan/rooms/:roomId/gameState
+       * Body 参数：playerId: string, gameState: GameState（已应用让子）
+       */
+      await fetch(`${base}/api/v1/lan/rooms/${roomId}/gameState`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ playerId, gameState: initialState }),
+      });
+      gameStartTimeRef.current = Date.now();
+    } catch (error) {
+      console.error('同步初始状态失败:', error);
+      uploadedRef.current = false; // 允许接管/重试
+    }
+  };
+
+  // 开始对局（倒数结束）：立即本地进入对局——服务端统一定时会在开局时刻到点后自动开局
+  // （≤1s 生效），不再依赖上传方 /start 成功；上传方改为后台提交初始局面，
+  // 避免上传请求失败/延迟导致本端永久卡在公示阶段（无法走子、无操作按钮）
+  const startGame = () => {
+    enterPlayingLocal();
+    if (amUploaderRef.current) {
+      uploadInitialGame(); // 后台执行：失败由服务端自动开局 + 轮询对账兜底
+    }
+  };
+
+  // 选边结果视图入场动画：切换到结果公示时淡入 + 上移
+  useEffect(() => {
+    if (sidePickResultMode) {
+      sidePickResultAnim.setValue(0);
+      Animated.timing(sidePickResultAnim, {
+        toValue: 1,
+        duration: 900,
+        easing: Easing.out(Easing.cubic),
+        useNativeDriver: true,
+      }).start();
+    }
+  }, [sidePickResultMode, sidePickResultAnim]);
+
+  // 公示执棋结果：选边弹窗保持不动，内容动画切换为执棋结果，倒数到服务端统一开局时刻后开局（只启动一次）
+  // gameStartAt 由服务端在公示时锚定（sideReveal.time + 3s），双端以校正后的服务端时间倒数，
+  // 保证两台设备读秒一致、同一时刻开局；无锚点（异常兜底）时按本地 3 秒倒数
+  const startRevealSequence = (assignedSide: string, random: boolean, gameStartAt: number | null) => {
+    if (revealStartedRef.current) return;
+    revealStartedRef.current = true;
+    mySideRef.current = assignedSide;
+    setMySide(assignedSide);
+    setSideRandom(random);
+    // 弹窗保持打开，内容切换到结果公示视图（不再使用独立公示/倒数浮层）；
+    // 让子直分跳过选边阶段时弹窗尚未打开，此处兜底开启
+    setSidePickVisible(true);
+    setSidePickResultMode(true);
+    setPhase('reveal');
+    const anchor = gameStartAt ?? (Date.now() + serverTimeOffsetRef.current + 3000);
+    const serverNow = () => Date.now() + serverTimeOffsetRef.current;
+    setCountdown(Math.max(1, Math.ceil((anchor - serverNow()) / 1000)));
+    // 250ms 采样：两端轮询发现公示存在时间差，锚定倒数可自动对齐到同一开局时刻
+    countdownTimerRef.current = setInterval(() => {
+      const remain = Math.ceil((anchor - serverNow()) / 1000);
+      if (remain > 0) {
+        setCountdown(remain);
+      } else {
+        if (countdownTimerRef.current) clearInterval(countdownTimerRef.current);
+        countdownTimerRef.current = null;
+        setSidePickVisible(false); // 开局前关闭选边弹窗
+        setSidePickResultMode(false);
+        startGame();
+      }
+    }, 250);
+  };
+
+  // 公示期间对方退出房间：服务端已清空公示，本端中止倒数、回到准备阶段
+  const abortRevealSequence = () => {
+    if (revealTimerRef.current) { clearTimeout(revealTimerRef.current); revealTimerRef.current = null; }
+    if (countdownTimerRef.current) { clearInterval(countdownTimerRef.current); countdownTimerRef.current = null; }
+    revealStartedRef.current = false;
+    amUploaderRef.current = false;
+    setSidePickVisible(false);
+    setSidePickResultMode(false);
+    setSidePickStage(false);
+    setMyPreference(null);
+    setOpponentPreference(null);
+    setReadyCountdown(null);
+    setPhase('waiting');
+  };
+
+  // 对方已开局时提前结束本地公示/倒数序列（两端轮询存在时间差）
+  const finishSequenceEarly = () => {
+    if (revealTimerRef.current) { clearTimeout(revealTimerRef.current); revealTimerRef.current = null; }
+    if (countdownTimerRef.current) { clearInterval(countdownTimerRef.current); countdownTimerRef.current = null; }
+    setSidePickVisible(false);
+    setSidePickResultMode(false);
+    enterPlayingLocal();
+  };
+
+  // 选边（双方均准备后开启；对方选定前可自由更改，双方选定后自动公示；让子房间跳过选边）
+  const handlePickSide = async (side: 'red' | 'black') => {
+    if (!myReady || !opponentReady || revealStartedRef.current) return;
+    if (roomHandicapRef.current.length > 0) return;
+    const prev = myPreference;
+    setMyPreference(side); // 乐观更新
+    try {
+      const base = await getOnlineServerUrl();
+      /**
+       * 服务端文件：server/src/routes/lanGame.ts
+       * 接口：POST /api/v1/lan/rooms/:roomId/side
+       * Body 参数：playerId: string, side: 'red' | 'black'
+       */
+      const response = await fetch(`${base}/api/v1/lan/rooms/${roomId}/side`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ playerId, side }),
+      });
+      const data = await response.json();
+      if (!data.success) {
+        setMyPreference(prev); // 失败回滚
+        return;
+      }
+      if (typeof data.serverNow === 'number') {
+        serverTimeOffsetRef.current = data.serverNow - Date.now();
+      }
+      if (data.sideAssigned) {
+        // 双方均已选边：本端为上传方，以服务端锚定的统一开局时刻公示倒数
+        amUploaderRef.current = true;
+        const me = data.players?.find((p: any) => p.id === playerId);
+        if (me?.side) {
+          startRevealSequence(me.side, data.sideReveal?.random ?? false, data.gameStartAt ?? null);
+        }
+      }
+    } catch (error) {
+      console.error('选边失败:', error);
+      setMyPreference(prev); // 失败回滚
+    }
+  };
+
+  // 打开房间信息/设置弹窗：以当前房间值预填编辑态
+  const handleOpenSettings = () => {
+    setEditName(roomName);
+    setEditPassword(roomPassword || '');
+    setEditTurn(turnTimeLimit > 0 ? turnTimeLimit : 0); // 秒，0=不限时
+    setEditBaseTime(baseTimeSeconds);
+    setEditIncrement(roomIncrementRef.current);
+    setEditByoyomi(roomByoyomiRef.current);
+    setEditHandicap(roomHandicapRef.current);
+    setOpenSelect(null);
+    setSettingsVisible(true);
+  };
+
+  // 保存房间设置（仅房主、仅等待阶段；成功后在弹窗内给已保存反馈）
+  const handleSaveSettings = async () => {
+    if (savingSettings) return;
+    const trimmedName = editName.trim();
+    if (!trimmedName) return;
+    setSavingSettings(true);
+    try {
+      const base = await getOnlineServerUrl();
+      /**
+       * 服务端文件：server/src/routes/lanGame.ts
+       * 接口：PATCH /api/v1/lan/rooms/:roomId/settings
+       * Body 参数：playerId: string, name: string, password: string,
+       *   turnTimeSeconds: number, baseTimeSeconds: number, incrementSeconds: number,
+       *   byoyomiSeconds: number, handicap: number[]
+       */
+      const response = await fetch(`${base}/api/v1/lan/rooms/${roomId}/settings`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          playerId,
+          name: trimmedName,
+          password: editPassword.trim(),
+          turnTimeSeconds: editTurn,
+          baseTimeSeconds: editBaseTime,
+          // 加秒与读秒互斥（UI 已保证二选一，此处再兜底）；不限时时均不生效
+          incrementSeconds: editBaseTime > 0 && editByoyomi === 0 ? editIncrement : 0,
+          byoyomiSeconds: editBaseTime > 0 && editIncrement === 0 ? editByoyomi : 0,
+          handicap: editHandicap,
+        }),
+      });
+      const data = await response.json();
+      if (data.success && data.room) {
+        // 立即应用新值（轮询也会同步）
+        setRoomName(data.room.name || trimmedName);
+        setRoomPassword(data.room.password ?? null);
+        setTurnTimeLimit(data.room.settings?.turnTimeLimit || 0);
+        setBaseTimeSeconds(data.room.settings?.baseTimeSeconds || 0);
+        roomIncrementRef.current = data.room.settings?.incrementSeconds || 0;
+        roomByoyomiRef.current = data.room.settings?.byoyomiSeconds || 0;
+        if (Array.isArray(data.room.settings?.handicap)) {
+          roomHandicapRef.current = data.room.settings.handicap;
+          setRoomHandicap(data.room.settings.handicap);
+        }
+        setSettingsVisible(false);
+      }
+    } catch (error) {
+      console.error('保存房间设置失败:', error);
+    } finally {
+      setSavingSettings(false);
+    }
+  };
+
+  // 准备/取消准备切换：仅在双方未同时就绪前可取消；双方就绪进入倒数/选边/公示后
+  // 一律锁定不可取消（公示界面也不再提供取消入口），避免与统一定时产生状态分叉
+  const handleReady = async () => {
+    if (sidePickStage || revealStartedRef.current) return; // 选边与公示阶段不可取消
+    if (readyInFlightRef.current > 0) return; // 有准备请求在途：忽略连点，避免并发请求互相覆盖
+    // 用 ref 取最新意向，避免快速连点时闭包读到旧的 myReady 而发送重复请求
+    const next = !myReadyRef.current;
+    myReadyRef.current = next;
+    lastReadyToggleRef.current = Date.now();
+    setMyReady(next); // 乐观更新
+    if (!next && readyCountdown !== null) setReadyCountdown(null); // 取消准备同时中止本地倒数
+    readyInFlightRef.current += 1;
+    // 失败兜底重试一次（间隔 600ms）：覆盖服务端阶段刚切换/网络抖动/服务短暂不可用
+    // 导致的假性失败——两次均失败才回滚，杜绝「已准备」被瞬时弹回「准备」（跳回）
+    let data: {
+      success?: boolean;
+      bothReady?: boolean;
+      autoRevealed?: boolean;
+      sideReveal?: { time: number; random: boolean; handicap?: boolean } | null;
+      gameStartAt?: number | null;
+      players?: { id: string; ready: boolean; side: 'red' | 'black' | null; sidePreference: 'red' | 'black' | null }[];
+      message?: string;
+    } | null = null;
+    try {
+      const base = await getOnlineServerUrl();
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          /**
+           * 服务端文件：server/src/routes/lanGame.ts
+           * 接口：POST /api/v1/lan/rooms/:roomId/ready
+           * Body 参数：playerId: string, ready: boolean（false 表示取消准备）
+           */
+          const response = await fetch(`${base}/api/v1/lan/rooms/${roomId}/ready`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ playerId, ready: next }),
+          });
+          data = await response.json();
+          if (data?.success) break;
+          console.error(`准备被服务端拒绝(第${attempt + 1}次):`, data?.message ?? data);
+        } catch (error) {
+          data = null;
+          console.error(`准备请求失败(第${attempt + 1}次):`, error);
+        }
+        if (attempt === 0) {
+          await new Promise(resolve => setTimeout(resolve, 600));
+        }
+      }
+      if (!data?.success) {
+        myReadyRef.current = !next;
+        setMyReady(!next); // 两次均失败才回滚
+        // 成员身份类拒绝（已被移出房间/房间不存在）：提示并返回大厅，避免卡在页面反复失败
+        const msg = typeof data?.message === 'string' ? data.message : '';
+        if ((msg.includes('不在房间') || msg.includes('房间不存在')) && !roomGoneAlertedRef.current) {
+          roomGoneAlertedRef.current = true;
+          Alert.alert('提示', '你已不在该房间，请重新加入', [{ text: '确定', onPress: exitToLobby }]);
+        }
+        return;
+      }
+      if (next && data.bothReady) {
+        setOpponentReady(true); // 双方均已准备 → 触发 3 秒倒数（让子房间除外：服务端已直分公示）
+      }
+      // 让子直分：本端为触发方 → 担任上传方并即刻开始公示倒数（跳过选边）
+      if (next && data.autoRevealed && data.sideReveal) {
+        const assigned = data.players?.find(p => p.id === playerId)?.side;
+        if (assigned) {
+          amUploaderRef.current = true;
+          startRevealSequence(assigned, false, data.gameStartAt ?? null);
+        }
+      }
+    } catch (error) {
+      console.error('准备流程异常:', error);
+      myReadyRef.current = !next;
+      setMyReady(!next); // 前置调用（如获取服务地址）失败 → 回滚
+    } finally {
+      readyInFlightRef.current -= 1;
+    }
+  };
+
+  // 判断是否是自己的回合
+  const isMyTurn = phase === 'playing' && gameState.sideTag === sideStringToTag(mySide);
+
+  // 双方是否均已准备（均准备后进入选边环节）
+  const bothReady = myReady && opponentReady;
+
+  // 双方就绪 → 启动 3 秒倒数；任意方取消（本地或轮询感知）→ 中止倒数并退出选边阶段
+  // 让子房间跳过选边：不启动倒数，等待服务端直分公示（ready 响应或轮询发现 sideReveal）
+  useEffect(() => {
+    if (phase !== 'waiting') return;
+    if (bothReady) {
+      if (roomHandicapRef.current.length > 0) return;
+      if (readyCountdown === null && !sidePickStage && !revealStartedRef.current) {
+        setReadyCountdown(3);
+      }
+      return;
+    }
+    if (readyCountdown !== null) setReadyCountdown(null);
+    if (sidePickStage && !revealStartedRef.current) {
+      // 对方在选边阶段取消了准备：回退到准备阶段，清空选边意向并关闭弹窗
+      setSidePickStage(false);
+      setSidePickVisible(false);
+      setMyPreference(null);
+      setOpponentPreference(null);
+    }
+  }, [phase, bothReady, readyCountdown, sidePickStage]);
+
+  // 倒数推进：每秒减一，归零后进入选边阶段并自动弹出选边弹窗
+  useEffect(() => {
+    if (readyCountdown === null) return;
+    if (readyCountdown <= 0) {
+      setReadyCountdown(null);
+      setSidePickStage(true);
+      setSidePickVisible(true);
+      return;
+    }
+    const timer = setTimeout(() => {
+      setReadyCountdown(c => (c === null ? null : c - 1));
+    }, 1000);
+    return () => clearTimeout(timer);
+  }, [readyCountdown]);
+
+  // 处理棋子点击
+  const handlePiecePress = (pieceId: number) => {
+    if (!isMyTurn || phase !== 'playing') return;
+
+    const piece = gameState.pieces[pieceId];
+    if (!piece.alive) return;
+
+    // 棋子ID 0-15 是黑方，16-31 是红方
+    const pieceSideTag = pieceId < 16 ? BLACK_SIDE : RED_SIDE;
+
+    // 点击己方棋子：选中并计算合法落点
+    if (pieceSideTag === sideStringToTag(mySide)) {
+      setSelectedPieceId(pieceId);
+      setValidMoves(getValidMoves(gameState, pieceId));
+      return;
+    }
+
+    // 点击对方棋子：已选中己方棋子且目标位置合法时吃子
+    if (selectedPieceId !== null && validMoves && validMoves[piece.col]?.[piece.row]) {
+      handleMove(piece.col, piece.row);
+    }
+  };
+
+  // 处理走棋/空白处点击
+  const handleMove = (toCol: number, toRow: number) => {
+    if (selectedPieceId === null || !isMyTurn || phase !== 'playing') return;
+
+    // 目标位置不在合法落点内：取消选中，恢复默认状态
+    if (!validMoves || !validMoves[toCol]?.[toRow]) {
+      setSelectedPieceId(null);
+      setValidMoves(null);
+      return;
+    }
+
+    const result = makeMove(gameState, selectedPieceId, toCol, toRow);
+
+    // 吃子/将军特效（终局时不播，由绝杀特效接管）
+    triggerMoveEffect(result.captured, result.isCheck, result.isGameOver);
+    // 走子音效：将军时播男声将军语音（替代走子音，避免混音重叠），否则吃子/走子音
+    if (result.isCheck && !result.isGameOver) {
+      playJiangJunSound(); // 男声将军语音（内置节流）
+    } else if (result.captured !== -1) {
+      playSound('eat');
+    } else {
+      playSound('go');
+    }
+
+    const piece = gameState.pieces[selectedPieceId];
+    setGameState(result.newState);
+    // 记录乐观更新：上传落地前轮询不得用旧局面覆盖（防棋子回退重走）
+    pendingSyncRef.current = { historyLen: result.newState.moveHistory.length, at: Date.now() };
+    setSelectedPieceId(null);
+    setValidMoves(null);
+    setLastMove({
+      fromCol: piece.col,
+      fromRow: piece.row,
+      toCol,
+      toRow,
+    });
+
+    // 检查是否绝杀/困毙/重复局面裁决（长将判负/长捉判负/不变作和）/将帅被吃
+    if (result.isGameOver) {
+      const isDraw = result.newState.gameStatus === 'draw';
+      setJueShaVisible(true);
+      setGameOverReason(result.gameOverReason);
+      // 绝杀/困毙 → 播放绝杀特效；长将/长捉判负、和棋等规则终局 → 仅文字结算
+      setGameEndReason(isDraw ? 'draw' : 'checkmate');
+      if (isDraw) {
+        // 双方不变作和：无胜负方，同步 'draw'
+        syncGameState(result.newState, true, 'draw');
+        setGameResult({
+          winner: null,
+          isWin: false,
+          // eslint-disable-next-line react-hooks/purity -- 事件回调中计算对局时长
+          duration: gameStartTimeRef.current ? Date.now() - gameStartTimeRef.current : 0,
+          moveCount: result.newState.moveHistory.length,
+          surrenderBy: null,
+          isDraw: true,
+        });
+      } else {
+        // 引擎判定真实胜方（长将/长捉判负时走棋方可能为败方，不能默认走棋方获胜）
+        const winnerSide: 'red' | 'black' = getWinnerSideTag(result.newState) === RED_SIDE ? 'red' : 'black';
+        const isWin = winnerSide === mySide;
+        // 同步到服务器（含游戏结束信息）
+        syncGameState(result.newState, true, winnerSide);
+        setGameResult({
+          winner: winnerSide,
+          isWin,
+          // eslint-disable-next-line react-hooks/purity -- 事件回调中计算对局时长
+          duration: gameStartTimeRef.current ? Date.now() - gameStartTimeRef.current : 0,
+          moveCount: result.newState.moveHistory.length,
+          surrenderBy: null,
+        });
+      }
+      setPhase('ended');
+    } else {
+      // 同步到服务器
+      syncGameState(result.newState);
+    }
+    // 重置限时计时器
+    // eslint-disable-next-line react-hooks/purity -- 事件回调中重置计时起点
+    lastMoveTimeRef.current = Date.now();
+    setTurnTimeLeft(turnTimeLimit);
+  };
+
+  // 同步游戏状态
+  const syncGameState = async (state: GameState, gameOver?: boolean, winner?: string) => {
+    // 优先走 WebSocket 实时通道；未连接时回退 HTTP
+    const sentViaWs = battleSocketRef.current?.send('move', { gameState: state, gameOver, winner }) ?? false;
+    if (sentViaWs) return;
+    try {
+      const base = await getOnlineServerUrl();
+      await fetch(`${base}/api/v1/lan/rooms/${roomId}/gameState`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ playerId, gameState: state, gameOver, winner }),
+      });
+    } catch (error) {
+      console.error('同步游戏状态失败:', error);
+    }
+  };
+
+  // 超时随机走一步棋
+  const doRandomMove = () => {
+    if (!gameState) return;
+
+    const mySideTag = sideStringToTag(mySide);
+    // 收集所有己方棋子的合法走法
+    const allMoves: { pieceId: number; col: number; row: number }[] = [];
+    for (const piece of gameState.pieces) {
+      if (!piece.alive) continue;
+      // mySideTag 为 RED_SIDE(true) 时己方是红方（ID 16-31），为 BLACK_SIDE(false) 时己方是黑方（ID 0-15）
+      const isMyPiece = mySideTag ? piece.id >= 16 : piece.id < 16;
+      if (!isMyPiece) continue;
+      const moves = getValidMoves(gameState, piece.id);
+      for (let c = 0; c < 9; c++) {
+        for (let r = 0; r < 10; r++) {
+          if (moves[c]?.[r]) {
+            allMoves.push({ pieceId: piece.id, col: c, row: r });
+          }
+        }
+      }
+    }
+
+    if (allMoves.length === 0) return;
+
+    // 随机选择一个走法
+    const randomMove = allMoves[Math.floor(Math.random() * allMoves.length)];
+    const result = makeMove(gameState, randomMove.pieceId, randomMove.col, randomMove.row);
+    if (!result) return;
+
+    // 吃子/将军特效（终局时不播，由绝杀特效接管）
+    triggerMoveEffect(result.captured, result.isCheck, result.isGameOver);
+    // 走子音效：将军时播男声将军语音（替代走子音，避免混音重叠），否则吃子/走子音
+    if (result.isCheck && !result.isGameOver) {
+      playJiangJunSound(); // 男声将军语音（内置节流）
+    } else if (result.captured !== -1) {
+      playSound('eat');
+    } else {
+      playSound('go');
+    }
+
+    setGameState(result.newState);
+    // 记录乐观更新：上传落地前轮询不得用旧局面覆盖（防棋子回退重走）
+    pendingSyncRef.current = { historyLen: result.newState.moveHistory.length, at: Date.now() };
+    setSelectedPieceId(null);
+    setValidMoves(null);
+    // 同步「最近一步」光环（超时随机走棋与手动走棋一致，展示落点光环）
+    const movedPiece = gameState.pieces[randomMove.pieceId];
+    setLastMove({
+      fromCol: movedPiece.col,
+      fromRow: movedPiece.row,
+      toCol: randomMove.col,
+      toRow: randomMove.row,
+    });
+
+    // 检查是否绝杀/困毙/重复局面裁决（长将判负/长捉判负/不变作和）/将帅被吃
+    if (result.isGameOver) {
+      const isDraw = result.newState.gameStatus === 'draw';
+      setJueShaVisible(true);
+      setGameOverReason(result.gameOverReason);
+      setGameEndReason(isDraw ? 'draw' : 'checkmate');
+      if (isDraw) {
+        syncGameState(result.newState, true, 'draw');
+        setGameResult({
+          winner: null,
+          isWin: false,
+          duration: gameStartTimeRef.current ? Date.now() - gameStartTimeRef.current : 0,
+          moveCount: result.newState.moveHistory.length,
+          surrenderBy: null,
+          isDraw: true,
+        });
+      } else {
+        // 引擎判定真实胜方（长将/长捉判负时走棋方为败方）
+        const winnerSide: 'red' | 'black' = getWinnerSideTag(result.newState) === RED_SIDE ? 'red' : 'black';
+        const isWin = winnerSide === mySide;
+        syncGameState(result.newState, true, winnerSide);
+        setGameResult({
+          winner: winnerSide,
+          isWin,
+          duration: gameStartTimeRef.current ? Date.now() - gameStartTimeRef.current : 0,
+          moveCount: result.newState.moveHistory.length,
+          surrenderBy: null,
+        });
+      }
+      setPhase('ended');
+    } else {
+      syncGameState(result.newState);
+    }
+    lastMoveTimeRef.current = Date.now();
+    setTurnTimeLeft(turnTimeLimit);
+  };
+
+  // 限时倒计时
+  useEffect(() => {
+    if (phase !== 'playing' || turnTimeLimit <= 0) return;
+
+    const timer = setInterval(() => {
+      const elapsed = Math.floor((Date.now() - lastMoveTimeRef.current) / 1000);
+      const remaining = Math.max(0, turnTimeLimit - elapsed);
+      setTurnTimeLeft(remaining);
+
+      // 超时随机走一步棋
+      if (remaining <= 0 && isMyTurn) {
+        doRandomMove();
+      }
+    }, 1000);
+
+    return () => clearInterval(timer);
+  }, [phase, turnTimeLimit, isMyTurn]);
+
+  // 局时时钟展示（基本用时 + 加秒制/读秒制）：以服务端快照为锚点做 1s 本地插值；仅当前走棋方的钟走动。
+  // 读秒制下基本用时耗尽后进入读秒阶段：芯片显示「读 M:SS」（每步完整读秒时长），读秒 ≤10s 变红警示
+  useEffect(() => {
+    if (phase !== 'playing') return;
+
+    const formatClock = (ms: number): string => {
+      const totalSec = Math.max(0, Math.ceil(ms / 1000));
+      const m = Math.floor(totalSec / 60);
+      const s = totalSec % 60;
+      return `${m}:${s.toString().padStart(2, '0')}`;
+    };
+
+    const tick = () => {
+      const snap = clockSnapRef.current;
+      if (!snap) {
+        setClockText(prev => (prev.mine === null && prev.opp === null ? prev : { mine: null, opp: null, mineUrgent: false, oppUrgent: false }));
+        return;
+      }
+      // 服务端校正时间：lastMoveTime/serverNow 均为服务端时钟域，比较需加偏移
+      // 悔棋/求和协商期间：以暂停锚点为「现在」，时钟显示冻结在暂停时刻
+      const correctedNow = Date.now() + serverTimeOffsetRef.current;
+      const anchorNow = snap.clockPausedAt ?? correctedNow;
+      const elapsed = Math.max(0, anchorNow - snap.lastMoveTime);
+      const toMove: 'red' | 'black' = snap.sideTag === RED_SIDE ? 'red' : 'black';
+      const byoMs = roomByoyomiRef.current * 1000;
+      const myTag = sideStringToTag(mySideRef.current);
+      const myColor: 'red' | 'black' = myTag === RED_SIDE ? 'red' : 'black';
+      const oppColor: 'red' | 'black' = myColor === 'red' ? 'black' : 'red';
+
+      // 某方的芯片展示：走棋方实时扣减；读秒制下基本用时耗尽显示读秒剩余（非走棋方静态展示完整读秒时段）
+      const displayFor = (color: 'red' | 'black'): { text: string; urgent: boolean } => {
+        const moving = toMove === color;
+        const net = moving ? snap[color] - elapsed : snap[color];
+        if (net > 0) {
+          return { text: formatClock(net), urgent: moving && net <= 30000 };
+        }
+        if (byoMs > 0) {
+          const byoRemain = moving ? byoMs + net : byoMs;
+          return { text: `读${formatClock(byoRemain)}`, urgent: moving && byoRemain <= 10000 };
+        }
+        return { text: formatClock(0), urgent: moving };
+      };
+
+      const mineD = displayFor(myColor);
+      const oppD = displayFor(oppColor);
+      const next = { mine: mineD.text, opp: oppD.text, mineUrgent: mineD.urgent, oppUrgent: oppD.urgent };
+      setClockText(prev =>
+        prev.mine === next.mine && prev.opp === next.opp && prev.mineUrgent === next.mineUrgent && prev.oppUrgent === next.oppUrgent
+          ? prev
+          : next
+      );
+    };
+
+    tick();
+    const timer = setInterval(tick, 1000);
+    return () => clearInterval(timer);
+  }, [phase]);
+
+  // 复盘自动保存：对局进入 ended（绝杀/困毙/认输/断线判负/超时判负）时保存完整着法到本地历史，每局仅一次
+  useEffect(() => {
+    if (phase !== 'ended' || !gameResult || replaySavedRef.current) return;
+    replaySavedRef.current = true;
+    const finalState = gameStateRef.current;
+    const winnerSide = gameResult.winner === 'red' || gameResult.winner === 'black'
+      ? gameResult.winner
+      : null;
+    saveReplay({
+      timestamp: Date.now(),
+      mode: 'lan',
+      moveCount: finalState.moveHistory.length,
+      moves: finalState.moveHistory,
+      firstMoveSide: 'red', // 在线对局固定红先
+      winnerSide,
+      mySide: mySide === 'black' ? 'black' : 'red',
+      handicap: roomHandicapRef.current.length > 0 ? roomHandicapRef.current : undefined, // 让子局回放需从让子局面起摆
+      note: `对手·${opponentName || '未知'}`,
+    }).catch(() => undefined);
+  }, [phase, gameResult, mySide, opponentName]);
+
+  // 认输
+  const handleSurrender = async () => {
+    setShowSurrenderModal(false);
+    // 优先 WebSocket 实时通道；结算界面由服务端状态广播推送驱动
+    const sentViaWs = battleSocketRef.current?.send('surrender', {}) ?? false;
+    if (sentViaWs) return;
+    try {
+      const base = await getOnlineServerUrl();
+      const response = await fetch(`${base}/api/v1/lan/rooms/${roomId}/surrender`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ playerId }),
+      });
+      const data = await response.json();
+
+      if (data.success) {
+        const isWin = data.winner === mySide;
+        setGameResult({
+          winner: data.winner,
+          isWin,
+          duration: data.duration || gameDuration,
+          moveCount: data.moveCount || gameState.moveHistory.length,
+          surrenderBy: data.surrenderBy,
+        });
+        setPhase('ended');
+        // 认输：仅普通文字结算，不播绝杀特效
+        setGameEndReason('resign');
+        setJueShaVisible(true);
+      }
+    } catch (error) {
+      console.error('认输失败:', error);
+    }
+  };
+
+  // 悔棋（需对方同意）：撤销双方各一步，目标局面随请求提交给服务端
+  const handleUndo = async () => {
+    if (!isMyTurn || gameState.moveHistory.length < 2 || undoPendingRef.current) return;
+    if (undoBlockedRef.current) {
+      Alert.alert('提示', '对方已连续拒绝 2 次，本局不能再发起悔棋');
+      return;
+    }
+
+    // 悔棋 = 回退对方一步 + 回退我方一步，回到我方走棋前
+    const afterOpponent = undoMove(gameState);
+    const proposed = afterOpponent ? undoMove(afterOpponent) : null;
+    if (!proposed) return;
+
+    // 优先 WebSocket 实时通道；处理结果由服务端状态广播推送
+    const sentViaWs = battleSocketRef.current?.send('undo', { proposedState: proposed }) ?? false;
+    if (sentViaWs) {
+      undoPendingRef.current = true;
+      setUndoPending(true);
+      return;
+    }
+
+    try {
+      const base = await getOnlineServerUrl();
+      const response = await fetch(`${base}/api/v1/lan/rooms/${roomId}/undo`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ playerId, proposedState: proposed }),
+      });
+      const data = await response.json();
+
+      if (data.success) {
+        undoPendingRef.current = true;
+        setUndoPending(true);
+      } else {
+        Alert.alert('提示', data.message || '悔棋请求失败');
+      }
+    } catch (error) {
+      console.error('悔棋失败:', error);
+      Alert.alert('提示', '网络异常，悔棋请求发送失败');
+    }
+  };
+
+  // 响应对方的悔棋请求
+  const handleUndoResponse = async (agreed: boolean) => {
+    setUndoRequestFromOpponent(false);
+    // 优先 WebSocket 实时通道；处理结果由服务端状态广播推送
+    const sentViaWs = battleSocketRef.current?.send('undoResponse', { agreed }) ?? false;
+    if (sentViaWs) return;
+    try {
+      const base = await getOnlineServerUrl();
+      await fetch(`${base}/api/v1/lan/rooms/${roomId}/undoResponse`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ playerId, agreed }),
+      });
+    } catch (error) {
+      console.error('响应悔棋请求失败:', error);
+    }
+  };
+
+  // 求和（需对方同意）：发送求和请求，对方同意则以和棋结束对局
+  const handleDrawRequest = async () => {
+    if (drawPendingRef.current || phase !== 'playing') return;
+    if (drawBlockedRef.current) {
+      Alert.alert('提示', '对方已连续拒绝 2 次，本局不能再发起求和');
+      return;
+    }
+
+    // 优先 WebSocket 实时通道；处理结果由服务端状态广播推送
+    const sentViaWs = battleSocketRef.current?.send('draw', {}) ?? false;
+    if (sentViaWs) {
+      drawPendingRef.current = true;
+      setDrawPending(true);
+      return;
+    }
+
+    try {
+      const base = await getOnlineServerUrl();
+      const response = await fetch(`${base}/api/v1/lan/rooms/${roomId}/draw`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ playerId }),
+      });
+      const data = await response.json();
+
+      if (data.success) {
+        drawPendingRef.current = true;
+        setDrawPending(true);
+      } else {
+        Alert.alert('提示', data.message || '求和请求失败');
+      }
+    } catch (error) {
+      console.error('求和失败:', error);
+      Alert.alert('提示', '网络异常，求和请求发送失败');
+    }
+  };
+
+  // 响应对方的求和请求：同意则本地立即进入和棋结算（请求方通过轮询同步）
+  const handleDrawResponse = async (agreed: boolean) => {
+    setDrawRequestFromOpponent(false);
+    // 优先 WebSocket 实时通道；和棋结算由服务端状态广播推送驱动
+    const sentViaWs = battleSocketRef.current?.send('drawResponse', { agreed }) ?? false;
+    if (sentViaWs) return;
+    try {
+      const base = await getOnlineServerUrl();
+      const response = await fetch(`${base}/api/v1/lan/rooms/${roomId}/drawResponse`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ playerId, agreed }),
+      });
+      const data = await response.json();
+
+      if (data.success && agreed) {
+        setGameResult({
+          winner: null,
+          isWin: false,
+          duration: gameStartTimeRef.current ? Date.now() - gameStartTimeRef.current : 0,
+          moveCount: gameStateRef.current.moveHistory.length,
+          surrenderBy: null,
+          isDraw: true,
+        });
+        setPhase('ended');
+        // 和棋：仅普通文字结算，不播绝杀特效
+        setGameEndReason('draw');
+        setJueShaVisible(true);
+      }
+    } catch (error) {
+      console.error('响应求和请求失败:', error);
+    }
+  };
+
+  // ===== 对局内 emoji 表情互动 =====
+  // 是否可使用表情：对手已加入且处于准备/对局阶段
+  const canUseEmoji = !!opponentName && (phase === 'waiting' || phase === 'playing');
+
+  // 切换表情下拉栏：打开瞬间用 measureInWindow 实测名称行位置（窗口坐标 → 根容器坐标），
+  // 确保下拉栏精确落在名称行正下方；测量接口不可用时退化为 onLayout 相对坐标锚点
+  const toggleEmojiPicker = useCallback(() => {
+    if (!canUseEmoji) return;
+    if (emojiPickerOpen) {
+      setEmojiPickerOpen(false);
+      return;
+    }
+    type Measurable = { measureInWindow?: (cb: (x: number, y: number, w: number, h: number) => void) => void };
+    const row = myNameRowRef.current as unknown as Measurable | null;
+    const host = containerRef.current as unknown as Measurable | null;
+    if (row?.measureInWindow && host?.measureInWindow) {
+      row.measureInWindow((_rx, ry, _rw, rh) => {
+        host.measureInWindow!((_hx, hy) => {
+          setEmojiDropdownTop(Math.max(ry - hy + rh + 6, 0));
+          setEmojiPickerOpen(true);
+        });
+      });
+    } else {
+      setEmojiDropdownTop(null);
+      setEmojiPickerOpen(true);
+    }
+  }, [canUseEmoji, emojiPickerOpen, containerRef]);
+
+  // 发送表情：本地立即展示在我方名称左侧，同时上传供对方轮询获取
+  const handleSendEmoji = useCallback(async (emoji: string) => {
+    setEmojiPickerOpen(false);
+    const id = `${playerId}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    addActiveEmoji({ id, playerId, emoji });
+    // 优先 WebSocket 实时通道；对方经服务端广播实时收到（按 id 去重）
+    const sentViaWs = battleSocketRef.current?.send('emoji', { emoji, id }) ?? false;
+    if (sentViaWs) return;
+    try {
+      const base = await getOnlineServerUrl();
+      /**
+       * 服务端文件：server/src/routes/lanGame.ts
+       * 接口：POST /api/v1/lan/rooms/:roomId/emoji
+       * Body 参数：playerId: string, emoji: string, id: string
+       */
+      await fetch(`${base}/api/v1/lan/rooms/${roomId}/emoji`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ playerId, emoji, id }),
+      });
+    } catch (error) {
+      console.error('发送表情失败:', error);
+    }
+  }, [playerId, roomId, addActiveEmoji]);
+
+  // 我方活跃表情（显示在我方名称左侧）/ 对方活跃表情（显示在对方名称右侧）
+  const myEmojis = useMemo(() => activeEmojis.filter(e => e.playerId === playerId), [activeEmojis, playerId]);
+  const opponentEmojis = useMemo(() => activeEmojis.filter(e => e.playerId !== playerId), [activeEmojis, playerId]);
+
+  // 让子幽灵标记：被让出的棋子在对局棋盘的初始位置半透明展示 + 红色「让」角标，
+  // 让双方开局前即明确哪些棋子被让。仅在开局前（等待/选边/公示）展示——
+  // 开局与结算阶段让子方即以排除让子后的局面对弈，棋盘不再展示让子棋子及其标记
+  const ghostPieces = useMemo(
+    () => {
+      if (phase === 'playing' || phase === 'ended') return [];
+      return roomHandicap
+        .map(id => {
+          const pos = INITIAL_PIECE_POS.get(id);
+          return pos ? { id, col: pos.col, row: pos.row } : null;
+        })
+        .filter((g): g is { id: number; col: number; row: number } => g !== null);
+    },
+    [roomHandicap, phase]
+  );
+
+  // 棋局开始前的展示用局面：存在让子时，本地标准初始局面需同步移除被让棋子，
+  // 棋盘才能在被让位置渲染幽灵标记（否则被正常棋子占据而遮蔽，误导用户以为不让子）；
+  // playing/ended 阶段直接用服务端局面（上传方 uploadInitialGame 已应用让子）
+  const displayGameState = useMemo(() => {
+    if (roomHandicap.length === 0) return gameState;
+    if (phase === 'playing' || phase === 'ended') return gameState;
+    return applyHandicap(cloneGameState(gameState), roomHandicap);
+  }, [gameState, roomHandicap, phase]);
+
+  // 活跃表情超时自动移除（略晚于淡出动画完成，避免提前消失）
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setActiveEmojis(prev => {
+        const now = Date.now();
+        const next = prev.filter(e => now - e.receivedAt <= EMOJI_DISPLAY_MS + 400);
+        return next.length === prev.length ? prev : next;
+      });
+    }, 800);
+    return () => clearInterval(timer);
+  }, []);
+
+  // 阶段切换导致不可用（如进入结算）时自动收起表情栏
+  useEffect(() => {
+    if (!canUseEmoji && emojiPickerOpen) setEmojiPickerOpen(false);
+  }, [canUseEmoji, emojiPickerOpen]);
+
+  // 重置本地状态回到准备阶段（重新对局）
+  const resetForRematch = () => {
+    if (revealTimerRef.current) { clearTimeout(revealTimerRef.current); revealTimerRef.current = null; }
+    if (countdownTimerRef.current) { clearInterval(countdownTimerRef.current); countdownTimerRef.current = null; }
+    setGameState(createInitialState());
+    setSelectedPieceId(null);
+    setValidMoves(null);
+    setLastMove(null);
+    setPhase('waiting');
+    setGameResult(null);
+    setGameDuration(0);
+    setJueShaVisible(false);
+    setGameEndReason(null);
+    gameStartTimeRef.current = 0;
+    // 注意：playedMatchIdRef（已入局纪元）刻意不重置——重赛后轮询若先拿到上一局旧快照
+    // （phase=playing + 旧 matchId），须凭它识别并忽略，避免跳过准备阶段直接进入对局
+    // 准备阶段状态重置：重新选边与准备
+    setMyPreference(null);
+    setMyReady(false);
+    myReadyRef.current = false;
+    readyInFlightRef.current = 0;
+    // 宽限窗口内轮询不用服务端旧数据覆盖本端准备状态，避免重赛后被旧状态误置为「已准备」
+    lastReadyToggleRef.current = Date.now();
+    setOpponentReady(false);
+    setOpponentPreference(null);
+    setSideRandom(false);
+    revealStartedRef.current = false;
+    amUploaderRef.current = false;
+    uploadedRef.current = false;
+    setReadyCountdown(null);
+    setSidePickStage(false);
+    setSidePickVisible(false);
+    setSidePickResultMode(false);
+    seenHistoryLenRef.current = 0;
+    pendingSyncRef.current = null; // 清除走子乐观更新保护基线
+    replaySavedRef.current = false; // 重新对局允许再次自动保存复盘
+    // 求和协商状态重置
+    drawPendingRef.current = false;
+    setDrawPending(false);
+    setDrawRequestFromOpponent(false);
+    // 协商封禁状态重置（服务端重赛时已清零，本地同步复位避免旧封禁残留）
+    undoBlockedRef.current = false;
+    setUndoBlocked(false);
+    drawBlockedRef.current = false;
+    setDrawBlocked(false);
+    // emoji 表情状态重置
+    setEmojiPickerOpen(false);
+    setActiveEmojis([]);
+    seenEmojiIdsRef.current = new Set();
+  };
+
+  // 重新对局：必须等服务端重置落地后再本地重置——否则本地已回准备阶段而服务端仍是
+  // ended，此刻点准备会被 400 拒绝并回滚（表现为「准备跳回」）。respondAction 成功
+  // 即广播，对手经 WS 即时同步，无需额外走 WS 通道
+  const handleRematch = async () => {
+    if (rematchInFlightRef.current) return; // 防连点：服务端虽已幂等，仍避免无谓并发请求
+    rematchInFlightRef.current = true;
+    try {
+      const base = await getOnlineServerUrl();
+      /**
+       * 服务端文件：server/src/routes/lanGame.ts
+       * 接口：POST /api/v1/lan/rooms/:roomId/rematch
+       * Body 参数：playerId: string
+       */
+      const response = await fetch(`${base}/api/v1/lan/rooms/${roomId}/rematch`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ playerId }),
+      });
+      const data = await response.json();
+      if (!data.success) {
+        console.error('重新对局被服务端拒绝:', data);
+        // 成员身份类拒绝（已被移出房间/房间不存在）：提示并返回大厅，避免卡在结算页
+        const msg = typeof data?.message === 'string' ? data.message : '';
+        if ((msg.includes('不在房间') || msg.includes('房间不存在')) && !roomGoneAlertedRef.current) {
+          roomGoneAlertedRef.current = true;
+          Alert.alert('提示', '你已不在该房间，请重新加入', [{ text: '确定', onPress: exitToLobby }]);
+        }
+        return;
+      }
+    } catch (error) {
+      console.error('重新对局失败:', error);
+      return;
+    } finally {
+      rematchInFlightRef.current = false;
+    }
+    // 服务端已确认重置 → 重置本地状态
+    resetForRematch();
+  };
+
+  // 返回：通知服务端离开房间后再返回（房间无人时服务端自动销毁，等待期离开会重置对手状态）。
+  // 等待离开请求落地（上限 800ms 兜底）再跳转：否则大厅聚焦轮询可能在离开生效前查到旧成员身份，
+  // 误显示「回到对局/未开始房间」的回连提醒
+  const handleBack = useCallback(async () => {
+    // 先置主动退出标记：抑制离开请求与 2s 轮询竞态导致的「房间已关闭/你已被移出房间」误报
+    intentionalExitRef.current = true;
+    try {
+      const base = await getOnlineServerUrl();
+      /**
+       * 服务端文件：server/src/routes/lanGame.ts
+       * 接口：POST /api/v1/lan/rooms/:roomId/leave
+       * Body 参数：playerId: string
+       */
+      await Promise.race([
+        fetch(`${base}/api/v1/lan/rooms/${roomId}/leave`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ playerId }),
+        }).catch((err: unknown) => console.error('离开房间请求失败:', err)),
+        new Promise(resolve => setTimeout(resolve, 800)),
+      ]);
+    } catch (err: unknown) {
+      console.error('离开房间请求失败:', err);
+    }
+    // 离开房间的语义目标始终是大厅，经 exitToLobby 有栈 back、无栈（Web 刷新）replace 兜底
+    exitToLobby();
+  }, [roomId, playerId, exitToLobby]);
+
+  // handleBack 最新引用：供安卓返回键监听（仅挂载时订阅一次）调用，
+  // 避免 useSafeRouter 每次渲染返回新对象导致监听反复订阅/退订
+  const handleBackRef = useRef(handleBack);
+  handleBackRef.current = handleBack;
+
+  // 卸载即视为主动退出：覆盖 iOS 侧滑等不经 handleBack 的退出路径，
+  // 抑制卸载后仍在途的轮询触发「房间已关闭」误报
+  useEffect(() => () => { intentionalExitRef.current = true; }, []);
+
+  // 卸载兜底：iOS 侧滑返回等不经过返回键/返回按钮的退出路径不会触发 handleBack，
+  // 组件卸载时补发一次离开请求，避免等待阶段残留成员身份导致大厅误显示回连提醒
+  // （与 handleBack 的离开请求幂等兼容，重复调用服务端返回 404 无副作用）。
+  // 仅限原生端：Web 端页面刷新 / HMR 热更新同样触发组件卸载，若补发离开会把自己
+  // 误移出房间（刷新后 URL 恢复回到对局页却已不是成员，一切操作报「玩家不在房间中」）；
+  // Web 端真正关闭页面的场景由服务端等待清扫器（30s 无连接）兜底清理。
+  useEffect(() => {
+    if (Platform.OS === 'web') return;
+    return () => {
+      getOnlineServerUrl()
+        .then(base =>
+          fetch(`${base}/api/v1/lan/rooms/${roomId}/leave`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ playerId }),
+          })
+        )
+        .catch(() => undefined);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // 安卓系统返回键（侧边返回手势）：与顶部返回按钮一致——先离开房间再返回。
+  // 若走默认 pop 路由则不会触发离开请求，导致房间残留/未真正退出房间。
+  // （有 Modal 打开时由 Modal 自行接管返回键，此处不会触发）
+  useEffect(() => {
+    const onHardwareBack = () => {
+      handleBackRef.current();
+      return true; // 拦截默认返回，交由 handleBack 统一处理
+    };
+    const sub = BackHandler.addEventListener('hardwareBackPress', onHardwareBack);
+    return () => sub.remove();
+  }, []);
+
+  // 双方均准备后进入 3 秒倒数（准备按钮上显示），倒数期间任意一方可取消准备；
+  // 倒数完成自动弹出选边弹窗（选边仅通过弹窗进行）
+  const isRed = mySide === 'red';
+
+  return (
+    <Screen>
+      <View style={styles.container} ref={containerRef}>
+        {/* 顶部信息栏 */}
+        <View style={styles.topBar}>
+          {/* 返回按钮：与其他页面一致的圆角描边芯片样式 */}
+          <View style={styles.backBtnZone}>
+            <TouchableOpacity style={styles.backBtn} onPress={handleBack}>
+              <FontAwesome6 name="chevron-left" size={20} color={COLORS.textPrimary} />
+            </TouchableOpacity>
+          </View>
+
+          <View style={styles.gameInfo}>
+            <Text style={styles.gameTitle} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.75}>
+              {roomName || '在线对局'}
+            </Text>
+            <Text style={styles.gameSubtitle} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.8}>
+              {phase === 'waiting' && !revealStartedRef.current
+                ? params.playerName
+                : `${isRed ? '红方' : '黑方'} · ${params.playerName}`}
+            </Text>
+          </View>
+
+          {phase === 'playing' && (
+            <View style={styles.turnIndicator}>
+              {/* 圆点跟随当前走棋方的棋子颜色（与其他页面顶栏一致） */}
+              <View style={[styles.turnDot, { backgroundColor: gameState.sideTag === RED_SIDE ? COLORS.redPiece : COLORS.blackPiece }]} />
+              <Text style={styles.turnText}>
+                {isMyTurn ? '你的回合' : '对手回合'}
+              </Text>
+            </View>
+          )}
+          {/* 非对局阶段：右侧显示房间设置按钮（与返回按钮同款芯片样式，右对齐保持标题居中） */}
+          {phase !== 'playing' && (
+            <View style={[styles.backBtnZone, { alignItems: 'flex-end' }]}>
+              <TouchableOpacity
+                style={styles.backBtn}
+                onPress={handleOpenSettings}
+                activeOpacity={0.8}
+              >
+                <FontAwesome6 name="gear" size={18} color={COLORS.textPrimary} />
+              </TouchableOpacity>
+            </View>
+          )}
+        </View>
+
+        {/* 标题行下方内容宿主（相对定位，被吃棋子抽屉锚定于此 = 标题行正下方） */}
+        <View
+          style={styles.capturedDrawerHost}
+          onLayout={(e) => {
+            setBoardAreaH(e.nativeEvent.layout.height);
+            setDrawerHostY(e.nativeEvent.layout.y);
+          }}
+        >
+          {/* 被吃棋子明细抽屉：点击摘要文字后自标题行向下展开（浮层，棋盘不动） */}
+          <CapturedPiecesDrawer
+            side={capturedDrawerSide}
+            gameState={gameState}
+            playerSide={mySide as 'red' | 'black'}
+            maxBoardHeight={maxBoardHeight}
+          />
+
+          {/* 棋盘区域：与人机对战一致——棋盘直接挂在水平居中容器中（屏宽居中逻辑由
+              ChessBoard 外层容器承担），名字角标为棋盘上下独立行，不再悬浮遮挡棋盘；
+              顶部留白由预算控制：优先垂直居中，预留不足时整体下移贴住预留区 */}
+          <View style={[styles.boardContainer, { paddingTop: boardPadTop }]}>
+            {/* 对手名角标行：棋盘上方独立行，左对齐（未加入时显示等待提示） */}
+            <View style={[styles.nameRow, { width: screenWidth }]} pointerEvents="none">
+              <View style={styles.nameChip}>
+                <View
+                  style={[
+                    styles.nameChipDot,
+                    !opponentName && styles.nameChipDotWaiting,
+                    phase === 'waiting' && opponentName && !opponentReady && styles.nameChipDotNotReady,
+                  ]}
+                />
+                <Text style={styles.nameChipText} numberOfLines={1}>
+                  {opponentName || '等待对手加入'}
+                </Text>
+                {phase === 'waiting' && opponentName !== '' && (
+                  <View style={[styles.readyTag, opponentReady ? styles.readyTagOn : styles.readyTagOff]}>
+                    <Text style={[styles.readyTagText, opponentReady ? styles.readyTagTextOn : styles.readyTagTextOff]}>
+                      {opponentReady ? '已准备' : '未准备'}
+                    </Text>
+                  </View>
+                )}
+              </View>
+
+              {/* 对手局时时钟（基本用时+加秒制，服务端快照 1s 插值，≤30s 且轮其走棋时告警红显） */}
+              {phase === 'playing' && clockText.opp !== null && (
+                <View style={[styles.nameChip, styles.timerChip]}>
+                  <FontAwesome6 name="hourglass-half" size={10} color={clockText.oppUrgent ? COLORS.danger : COLORS.textLight} />
+                  <Text style={[styles.timerChipText, clockText.oppUrgent && styles.timerChipTextUrgent]}>
+                    {clockText.opp}
+                  </Text>
+                </View>
+              )}
+
+              {/* 对方发送的表情气泡：显示在对方名称角标右侧 */}
+              {opponentEmojis.map(e => (
+                <EmojiBubble key={e.id} emoji={e.emoji} lifetime={EMOJI_DISPLAY_MS} />
+              ))}
+
+              {/* 回合倒计时：统一显示在棋盘右上方，与对方名称同一行对齐（对局开启限时且进入对局后显示） */}
+              {phase === 'playing' && turnTimeLimit > 0 && (
+                <View style={[styles.nameChip, styles.timerChip]}>
+                  <FontAwesome6
+                    name="clock"
+                    size={11}
+                    color={turnTimeLeft <= 30 && isMyTurn ? COLORS.danger : COLORS.textLight}
+                  />
+                  <Text style={[styles.timerChipText, turnTimeLeft <= 30 && isMyTurn && styles.timerChipTextUrgent]}>
+                    {formatTurnClock(turnTimeLeft)}
+                  </Text>
+                </View>
+              )}
+            </View>
+
+            {/* 棋盘几何测量包裹层：绝杀特效据此锁定棋盘中心/底边（collapsable=false 保证 Android 可测量） */}
+            <View ref={boardRef} onLayout={measureBoardFrame} collapsable={false}>
+            <ChessBoard
+              gameState={displayGameState}
+              selectedPieceId={selectedPieceId}
+              validMoves={validMoves}
+              lastMove={lastMove}
+              isFlipped={!isRed}
+              onPiecePress={handlePiecePress}
+              onEmptyPress={handleMove}
+              onMove={handleMove}
+              capturedByRed={capturedByRed}
+              capturedByBlack={capturedByBlack}
+              hideCaptured={jueShaVisible}
+              playerSide={mySide as 'red' | 'black'}
+              onCapturedPress={(side) => setCapturedDrawerSide(prev => (prev === side ? null : side))}
+              maxBoardHeight={maxBoardHeight}
+              capturedStripOffset={30}
+              moveEffect={moveEffect}
+              onBoardLayout={setBoardSize}
+              ghostPieces={ghostPieces}
+            />
+            </View>
+
+            {/* 我方名角标行：棋盘下方独立行，右对齐。点击名称角标在其正下方展开表情下拉栏；
+                ref 用于点按瞬间实测窗口坐标锚定下拉栏；onLayout 值仅作回退锚点 */}
+            <View
+              ref={myNameRowRef}
+              style={[styles.nameRow, styles.nameRowMe, { width: screenWidth, zIndex: 40 }]}
+              pointerEvents="box-none"
+              onLayout={(e) => {
+                const { y, height } = e.nativeEvent.layout;
+                setEmojiAnchorY(y + height);
+              }}
+            >
+              {/* 我方发送的表情气泡：显示在我方名称角标左侧 */}
+              {myEmojis.map(e => (
+                <EmojiBubble key={e.id} emoji={e.emoji} lifetime={EMOJI_DISPLAY_MS} />
+              ))}
+              {/* 我方局时时钟（基本用时+加秒制；轮我方走棋且 ≤30s 时告警红显） */}
+              {phase === 'playing' && clockText.mine !== null && (
+                <View style={[styles.nameChip, styles.timerChip]}>
+                  <FontAwesome6 name="hourglass-half" size={10} color={clockText.mineUrgent ? COLORS.danger : COLORS.textLight} />
+                  <Text style={[styles.timerChipText, clockText.mineUrgent && styles.timerChipTextUrgent]}>
+                    {clockText.mine}
+                  </Text>
+                </View>
+              )}
+              {/* 我方名称角标：可点击展开/收起表情栏（含表情入口图标提示） */}
+              <TouchableOpacity
+                style={styles.nameChip}
+                onPress={toggleEmojiPicker}
+                disabled={!canUseEmoji}
+                activeOpacity={0.8}
+              >
+                <Text style={styles.nameChipText} numberOfLines={1}>{params.playerName}</Text>
+                <View style={[styles.nameChipDot, phase === 'waiting' && !myReady && styles.nameChipDotNotReady]} />
+                {phase === 'waiting' && (
+                  <View style={[styles.readyTag, myReady ? styles.readyTagOn : styles.readyTagOff]}>
+                    <Text style={[styles.readyTagText, myReady ? styles.readyTagTextOn : styles.readyTagTextOff]}>
+                      {myReady ? '已准备' : '未准备'}
+                    </Text>
+                  </View>
+                )}
+                {canUseEmoji && (
+                  <FontAwesome6 name="face-smile" size={12} color={emojiPickerOpen ? COLORS.primary : COLORS.textLight} />
+                )}
+              </TouchableOpacity>
+            </View>
+
+            {/* 底部操作栏：与人机对战一致的样式与布局位置（数值屏宽 + 自适应间距），
+                全阶段常驻挂载以保持棋盘位置稳定，非交互阶段隐藏内容但保留占位 */}
+            <View
+              style={[styles.bottomBar, { width: screenWidth, marginTop: dynamicGap }]}
+              onLayout={(e) => setBottomBarH(e.nativeEvent.layout.height)}
+            >
+              {phase === 'waiting' && (
+                /* 等待阶段：仅保留准备按钮（随时可点）。双方就绪后按钮显示 3 秒倒数，
+                   倒数期间再次点击即取消准备；倒数完成进入选边阶段后锁定不可取消 */
+                <TouchableOpacity
+                  style={[styles.actionButton, sidePickStage && styles.actionButtonDisabled]}
+                  onPress={handleReady}
+                  disabled={sidePickStage}
+                >
+                  <FontAwesome6
+                    name="circle-check"
+                    size={16}
+                    color={myReady ? COLORS.textLight : COLORS.textPrimary}
+                  />
+                  <Text style={[styles.actionButtonText, myReady && { color: COLORS.textLight }]}>
+                    {readyCountdown !== null ? `已准备(${readyCountdown})` : myReady ? '已准备' : '准备'}
+                  </Text>
+                </TouchableOpacity>
+              )}
+              {phase === 'playing' && !jueShaVisible && (
+                <>
+                  <TouchableOpacity
+                    style={[styles.actionButton, (!isMyTurn || gameState.moveHistory.length < 2 || undoPending || undoBlocked) && styles.actionButtonDisabled]}
+                    onPress={handleUndo}
+                    disabled={!isMyTurn || gameState.moveHistory.length < 2 || undoPending || undoBlocked}
+                  >
+                    <FontAwesome6 name="rotate-left" size={16} color={COLORS.textPrimary} />
+                    <Text style={styles.actionButtonText}>
+                      {undoPending ? '等待对方同意' : undoBlocked ? '悔棋已禁' : '悔棋'}
+                    </Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={[styles.actionButton, (drawPending || drawBlocked) && styles.actionButtonDisabled]}
+                    onPress={handleDrawRequest}
+                    disabled={drawPending || drawBlocked}
+                  >
+                    <FontAwesome6 name="handshake" size={16} color={COLORS.textPrimary} />
+                    <Text style={styles.actionButtonText}>
+                      {drawPending ? '求和中' : drawBlocked ? '求和已禁' : '求和'}
+                    </Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity style={styles.actionButton} onPress={() => setShowSurrenderModal(true)}>
+                    <FontAwesome6 name="flag" size={16} color={COLORS.textPrimary} />
+                    <Text style={styles.actionButtonText}>认输</Text>
+                  </TouchableOpacity>
+                </>
+              )}
+              {(phase === 'reveal' || phase === 'countdown' || phase === 'ended' || (phase === 'playing' && jueShaVisible)) && (
+                /* 占位按钮：不可见但保持底部栏高度，避免公示/倒数/绝杀/结算阶段棋盘跳动 */
+                <View style={[styles.actionButton, { opacity: 0 }]} pointerEvents="none">
+                  <FontAwesome6 name="flag" size={16} color={COLORS.textPrimary} />
+                  <Text style={styles.actionButtonText}>占位</Text>
+                </View>
+              )}
+            </View>
+
+          {/* 对方断线等待浮层 */}
+          {opponentDisconnected && phase === 'playing' && (
+            <View style={styles.overlay}>
+              <View style={styles.disconnectCard}>
+                <Text style={styles.disconnectTitle}>对方已断线</Text>
+                <Text style={styles.disconnectHint}>等待对方重新连接...</Text>
+                <Text style={styles.disconnectCountdown}>{disconnectCountdown}s</Text>
+                <Text style={styles.disconnectSubHint}>倒计时结束后对方未重连将判负</Text>
+              </View>
+            </View>
+          )}
+
+          {/* 结算浮层：绝杀/困毙播放「绝/杀」特效；长将/长捉判负、认输/和棋/断线判负仅普通文字结算 */}
+          {jueShaVisible && (
+            <JueShaOverlay
+              visible={jueShaVisible}
+              boardFrame={jueshaBoardFrame}
+              showEffect={
+                gameEndReason === 'checkmate' &&
+                gameOverReason !== 'changjiang' &&
+                gameOverReason !== 'changzhuo' &&
+                gameOverReason !== 'repetition'
+              }
+              resultText={
+                gameResult
+                  ? gameResult.isDraw
+                    ? '和棋'
+                    : gameOverReason === 'changjiang'
+                      ? (gameResult.isWin ? '对手长将判负，你获胜！' : '你方长将判负')
+                      : gameOverReason === 'changzhuo'
+                        ? (gameResult.isWin ? '对手长捉判负，你获胜！' : '你方长捉判负')
+                        : gameResult.surrenderBy
+                          ? (gameResult.surrenderBy === playerId ? '你选择了认输' : '对手选择了认输')
+                          : gameEndReason === 'disconnect'
+                            ? (gameResult.isWin ? '对方断线，你获胜' : '你断线超时判负')
+                            : gameEndReason === 'timeout'
+                              ? (gameResult.isWin ? '对方超时，你获胜' : '你超时判负')
+                              : gameResult.isWin ? '恭喜获胜！' : '对局失败'
+                  : ''
+              }
+              primaryText="返回房间"
+              secondaryText="退出房间"
+              onPlayAgain={handleRematch}
+              onGoHome={handleBack}
+            />
+          )}
+          </View>
+        </View>
+
+        {/* 表情下拉栏：点击我方名称角标后在其正下方展开，宽度适配屏幕，单行横滑选取
+            （展示不全时左右滑动）。挂载于根容器：锚点为点按瞬间实测的窗口坐标
+            （换算为根容器坐标），回退为 onLayout 相对坐标 + 宿主偏移 */}
+        {emojiPickerOpen && canUseEmoji && (
+          <View
+            style={[
+              styles.emojiDropdown,
+              { top: emojiDropdownTop ?? (drawerHostY + emojiAnchorY + 6), width: Math.max(screenWidth - 24, 0) },
+            ]}
+          >
+            <ScrollView
+              horizontal
+              showsHorizontalScrollIndicator={false}
+              keyboardShouldPersistTaps="handled"
+              contentContainerStyle={styles.emojiDropdownContent}
+            >
+              {EMOJI_LIST.map(em => (
+                <TouchableOpacity
+                  key={em}
+                  style={styles.emojiDropdownCell}
+                  onPress={() => {
+                    handleSendEmoji(em);
+                    setEmojiPickerOpen(false);
+                  }}
+                  activeOpacity={0.7}
+                >
+                  <Text style={styles.emojiDropdownCellText}>{em}</Text>
+                </TouchableOpacity>
+              ))}
+            </ScrollView>
+          </View>
+        )}
+
+        {/* 选边弹窗（双方均准备后开启；双方选定前可自由更改） */}
+        <Modal visible={sidePickVisible} transparent animationType="fade" statusBarTranslucent onRequestClose={() => undefined}>
+          <View style={styles.modalOverlay}>
+            <View style={styles.modalContent}>
+              {sidePickResultMode ? (
+                /* 选边结果公示：选边结束后弹窗保持不动，内容以动画切换为执棋结果，3 秒后开局 */
+                <Animated.View
+                  style={[
+                    styles.sideResultWrap,
+                    {
+                      opacity: sidePickResultAnim,
+                      transform: [
+                        {
+                          translateY: sidePickResultAnim.interpolate({
+                            inputRange: [0, 1],
+                            outputRange: [26, 0],
+                          }),
+                        },
+                      ],
+                    },
+                  ]}
+                >
+                  <Text style={styles.modalTitle}>执棋结果</Text>
+                  {roomHandicap.length > 0 && (
+                    <Text style={styles.sideResultHandicap}>红方让子先行</Text>
+                  )}
+                  <Text style={[styles.sideResultMain, isRed ? styles.revealSideRed : styles.revealSideBlack]}>
+                    您将：{isRed ? '执红先手' : '执黑后手'}
+                  </Text>
+                  {sideRandom && <Text style={styles.sideResultRandom}>双方选边相同，已随机分配</Text>}
+                  <Text style={styles.sideResultWish}>祝您旗开得胜</Text>
+                  <Text style={styles.sideResultCountdown}>{countdown} 秒后开局</Text>
+                </Animated.View>
+              ) : (
+                <>
+                  <Text style={styles.modalTitle}>选择执棋方</Text>
+                  <View style={styles.sidePickRow}>
+                    {/* 执红：本端/对方选定后以红色描边 + 右上角「我方/对手」小字标注 */}
+                    <TouchableOpacity
+                      style={[
+                        styles.sidePickBtn,
+                        (myPreference === 'red' || opponentPreference === 'red') && styles.sidePickBtnRed,
+                      ]}
+                      onPress={() => handlePickSide('red')}
+                      activeOpacity={0.8}
+                    >
+                      {(myPreference === 'red' || opponentPreference === 'red') && (
+                        <View style={styles.sidePickBadges}>
+                          {myPreference === 'red' && (
+                            <View style={[styles.sideBadge, { backgroundColor: COLORS.primary }]}>
+                              <Text style={styles.sideBadgeTextSolid}>我方</Text>
+                            </View>
+                          )}
+                          {opponentPreference === 'red' && (
+                            <View style={[styles.sideBadge, styles.sideBadgeOutline, { borderColor: COLORS.primary }]}>
+                              <Text style={[styles.sideBadgeTextOutline, { color: COLORS.primary }]}>对手</Text>
+                            </View>
+                          )}
+                        </View>
+                      )}
+                      <View style={[styles.sideDot, styles.sideDotRed]} />
+                      <Text
+                        style={[
+                          styles.sidePickBtnText,
+                          (myPreference === 'red' || opponentPreference === 'red') && styles.sidePickBtnTextActive,
+                        ]}
+                      >
+                        执红先手
+                      </Text>
+                    </TouchableOpacity>
+                    {/* 执黑：本端/对方选定后以黑色描边 + 右上角「我方/对手」小字标注 */}
+                    <TouchableOpacity
+                      style={[
+                        styles.sidePickBtn,
+                        (myPreference === 'black' || opponentPreference === 'black') && styles.sidePickBtnBlack,
+                      ]}
+                      onPress={() => handlePickSide('black')}
+                      activeOpacity={0.8}
+                    >
+                      {(myPreference === 'black' || opponentPreference === 'black') && (
+                        <View style={styles.sidePickBadges}>
+                          {myPreference === 'black' && (
+                            <View style={[styles.sideBadge, { backgroundColor: '#3C2A1E' }]}>
+                              <Text style={styles.sideBadgeTextSolid}>我方</Text>
+                            </View>
+                          )}
+                          {opponentPreference === 'black' && (
+                            <View style={[styles.sideBadge, styles.sideBadgeOutline, { borderColor: '#3C2A1E' }]}>
+                              <Text style={[styles.sideBadgeTextOutline, { color: '#3C2A1E' }]}>对手</Text>
+                            </View>
+                          )}
+                        </View>
+                      )}
+                      <View style={[styles.sideDot, styles.sideDotBlack]} />
+                      <Text
+                        style={[
+                          styles.sidePickBtnText,
+                          (myPreference === 'black' || opponentPreference === 'black') && styles.sidePickBtnTextActive,
+                        ]}
+                      >
+                        执黑后手
+                      </Text>
+                    </TouchableOpacity>
+                  </View>
+                  <Text style={styles.modalHint}>
+                    双方选定后公示执棋结果（选边相同将随机分配），对方选定前可自由更改
+                  </Text>
+                </>
+              )}
+            </View>
+          </View>
+        </Modal>
+
+        {/* 房间信息/设置弹窗（顶栏齿轮打开；房主在等待阶段可修改；布局与大厅创建房间弹窗一致） */}
+        <Modal visible={settingsVisible} transparent animationType="fade" statusBarTranslucent>
+          <View style={styles.modalOverlay}>
+            <View style={styles.settingsModalContent}>
+              <ScrollView style={{ flexGrow: 0 }} showsVerticalScrollIndicator={false}>
+              {(() => {
+                const canEdit = phase === 'waiting' && hostId === playerId;
+                // 展示值：编辑模式取编辑态，查看模式取房间实际值
+                const baseVal = canEdit ? editBaseTime : baseTimeSeconds;
+                const turnVal = canEdit ? editTurn : turnTimeLimit;
+                const incVal = canEdit ? editIncrement : roomIncrementRef.current;
+                const byoVal = canEdit ? editByoyomi : roomByoyomiRef.current;
+                const hcVal = canEdit ? editHandicap : roomHandicap;
+                return (
+                  <>
+                    {openSelect && (
+                      <TouchableWithoutFeedback onPress={() => setOpenSelect(null)}>
+                        <View style={formStyles.selectBackdrop} />
+                      </TouchableWithoutFeedback>
+                    )}
+                    <Text style={[styles.modalTitle, { marginBottom: 16 }]}>房间设置</Text>
+                    {/* 房间号（分享用，只读） */}
+                    <View style={formStyles.fieldRowInline}>
+                      <View style={formStyles.fieldCol}>
+                        <Text style={formStyles.fieldLabel}>房间号</Text>
+                        <View style={formStyles.fieldValueBox}>
+                          <Text style={formStyles.fieldValueText}>{roomId}</Text>
+                        </View>
+                      </View>
+                    </View>
+
+                    {/* 房间名 + 房间密码（同行双列） */}
+                    <View style={formStyles.fieldRowInline}>
+                      <View style={formStyles.fieldCol}>
+                        <Text style={formStyles.fieldLabel}>房间名</Text>
+                        {canEdit ? (
+                          <TextInput
+                            style={formStyles.fieldInput}
+                            value={editName}
+                            onChangeText={setEditName}
+                            maxLength={5}
+                            placeholder="5字以内"
+                            placeholderTextColor={COLORS.textLight}
+                          />
+                        ) : (
+                          <View style={formStyles.fieldValueBox}>
+                            <Text style={formStyles.fieldValueText} numberOfLines={1}>{roomName || '未命名'}</Text>
+                          </View>
+                        )}
+                      </View>
+                      <View style={formStyles.fieldCol}>
+                        <Text style={formStyles.fieldLabel}>房间密码</Text>
+                        {canEdit ? (
+                          <TextInput
+                            style={formStyles.fieldInput}
+                            value={editPassword}
+                            onChangeText={(t) => setEditPassword(t.replace(/\D/g, ''))}
+                            keyboardType="number-pad"
+                            maxLength={6}
+                            placeholder="6位数字可留空"
+                            placeholderTextColor={COLORS.textLight}
+                          />
+                        ) : (
+                          <View style={formStyles.fieldValueBox}>
+                            <Text style={formStyles.fieldValueText}>{roomPassword ? roomPassword : '无'}</Text>
+                          </View>
+                        )}
+                      </View>
+                    </View>
+
+                    <Text style={formStyles.settingsSectionTitle}>对战设置</Text>
+                    <View style={[formStyles.selectGrid, (openSelect === 'base' || openSelect === 'turn') && formStyles.selectGridOpen]}>
+                      <SettingSelect
+                        label="局时"
+                        valueText={BASE_TIME_OPTIONS.find(o => o.value === baseVal)?.label ?? `${baseVal}秒`}
+                        options={BASE_TIME_OPTIONS}
+                        disabled={!canEdit}
+                        open={openSelect === 'base'}
+                        onToggle={() => setOpenSelect(openSelect === 'base' ? null : 'base')}
+                        onSelect={(v) => { setEditBaseTime(v); if (v === 0) { setEditIncrement(0); setEditByoyomi(0); } setOpenSelect(null); }}
+                      />
+                      <SettingSelect
+                        label="步时"
+                        valueText={TURN_TIME_OPTIONS.find(o => o.value === turnVal)?.label ?? `${turnVal}秒`}
+                        options={TURN_TIME_OPTIONS}
+                        disabled={!canEdit}
+                        open={openSelect === 'turn'}
+                        onToggle={() => setOpenSelect(openSelect === 'turn' ? null : 'turn')}
+                        onSelect={(v) => { setEditTurn(v); setOpenSelect(null); }}
+                      />
+                    </View>
+                    <View style={[formStyles.selectGrid, (openSelect === 'inc' || openSelect === 'byo') && formStyles.selectGridOpen]}>
+                      <SettingSelect
+                        label="加秒"
+                        valueText={baseVal === 0 ? '不限时' : (INCREMENT_OPTIONS.find(o => o.value === incVal)?.label ?? `${incVal}秒`)}
+                        options={INCREMENT_OPTIONS}
+                        disabled={!canEdit || baseVal === 0 || byoVal > 0}
+                        open={openSelect === 'inc'}
+                        onToggle={() => setOpenSelect(openSelect === 'inc' ? null : 'inc')}
+                        onSelect={(v) => { setEditIncrement(v); if (v > 0) setEditByoyomi(0); setOpenSelect(null); }}
+                      />
+                      <SettingSelect
+                        label="读秒"
+                        valueText={baseVal === 0 ? '不限时' : (BYOYOMI_OPTIONS.find(o => o.value === byoVal)?.label ?? `${byoVal}秒`)}
+                        options={BYOYOMI_OPTIONS}
+                        disabled={!canEdit || baseVal === 0 || incVal > 0}
+                        open={openSelect === 'byo'}
+                        onToggle={() => setOpenSelect(openSelect === 'byo' ? null : 'byo')}
+                        onSelect={(v) => { setEditByoyomi(v); if (v > 0) setEditIncrement(0); setOpenSelect(null); }}
+                      />
+                    </View>
+                    {baseVal > 0 && (
+                      <Text style={formStyles.selectHint}>加秒：每走一步补回秒数 · 读秒：局时耗尽后每步固定时长（二选一）</Text>
+                    )}
+                    {turnVal > 0 && (
+                      <Text style={formStyles.selectHint}>步时超时将由系统自动走一步棋</Text>
+                    )}
+
+                    <Text style={formStyles.settingsSectionTitle}>让子设置</Text>
+                    <HandicapBoard
+                      selected={hcVal}
+                      onToggle={canEdit ? (id) => {
+                        setEditHandicap(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]);
+                      } : undefined}
+                      readOnly={!canEdit}
+                    />
+                    <Text style={formStyles.hcSummary}>
+                      {hcVal.length === 0 ? '不让子（标准开局）' : `已让 ${hcVal.length} 枚棋子（红方让子先行）`}
+                    </Text>
+                    {!canEdit && phase === 'waiting' && (
+                      <Text style={styles.modalHint}>仅房主可修改房间信息与设置</Text>
+                    )}
+                    <View style={[styles.modalButtons, { marginTop: 20 }]}>
+                      <TouchableOpacity
+                        style={styles.settingsBtnCancel}
+                        onPress={() => setSettingsVisible(false)}
+                      >
+                        <Text style={styles.settingsBtnCancelText}>{canEdit ? '取消' : '关闭'}</Text>
+                      </TouchableOpacity>
+                      {canEdit && (
+                        <TouchableOpacity
+                          style={[styles.settingsBtnConfirm, { opacity: savingSettings || !editName.trim() ? 0.5 : 1 }]}
+                          onPress={handleSaveSettings}
+                          disabled={savingSettings || !editName.trim()}
+                        >
+                          <Text style={styles.settingsBtnConfirmText}>{savingSettings ? '保存中…' : '保存'}</Text>
+                        </TouchableOpacity>
+                      )}
+                    </View>
+                  </>
+                );
+              })()}
+              </ScrollView>
+            </View>
+          </View>
+        </Modal>
+
+        {/* 认输确认弹窗 */}
+        <Modal visible={showSurrenderModal} transparent animationType="fade"
+        statusBarTranslucent>
+          <View style={styles.modalOverlay}>
+            <View style={styles.modalContent}>
+              <Text style={styles.modalTitle}>确认认输</Text>
+              <Text style={styles.modalText}>
+                确定要认输吗？认输后对手将获胜。
+              </Text>
+              <View style={styles.modalButtons}>
+                <TouchableOpacity
+                  style={styles.modalButtonCancel}
+                  onPress={() => setShowSurrenderModal(false)}
+                >
+                  <Text style={styles.modalButtonTextCancel}>取消</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[styles.modalButtonCancel, { backgroundColor: COLORS.danger }]}
+                  onPress={handleSurrender}
+                >
+                  <Text style={styles.modalButtonTextConfirm}>确认认输</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+          </View>
+        </Modal>
+
+        {/* 对方悔棋请求确认弹窗 */}
+        <Modal visible={undoRequestFromOpponent} transparent animationType="fade"
+        statusBarTranslucent>
+          <View style={styles.modalOverlay}>
+            <View style={styles.modalContent}>
+              <Text style={styles.modalTitle}>悔棋请求</Text>
+              <Text style={styles.modalText}>
+                对方请求悔棋（撤销双方各一步），是否同意？
+              </Text>
+              <View style={styles.modalButtons}>
+                <TouchableOpacity
+                  style={styles.modalButtonCancel}
+                  onPress={() => handleUndoResponse(false)}
+                >
+                  <Text style={styles.modalButtonTextCancel}>拒绝</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[styles.modalButtonCancel, { backgroundColor: COLORS.primary }]}
+                  onPress={() => handleUndoResponse(true)}
+                >
+                  <Text style={styles.modalButtonTextConfirm}>同意</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+          </View>
+        </Modal>
+
+        {/* 对方求和请求确认弹窗 */}
+        <Modal visible={drawRequestFromOpponent} transparent animationType="fade"
+        statusBarTranslucent>
+          <View style={styles.modalOverlay}>
+            <View style={styles.modalContent}>
+              <Text style={styles.modalTitle}>求和请求</Text>
+              <Text style={styles.modalText}>
+                对方请求和棋，同意后本局以和棋结束，是否同意？
+              </Text>
+              <View style={styles.modalButtons}>
+                <TouchableOpacity
+                  style={styles.modalButtonCancel}
+                  onPress={() => handleDrawResponse(false)}
+                >
+                  <Text style={styles.modalButtonTextCancel}>拒绝</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[styles.modalButtonCancel, { backgroundColor: COLORS.primary }]}
+                  onPress={() => handleDrawResponse(true)}
+                >
+                  <Text style={styles.modalButtonTextConfirm}>同意</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+          </View>
+        </Modal>
+
+      </View>
+    </Screen>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    backgroundColor: COLORS.background,
+  },
+  topBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 16,
+    paddingTop: 8,
+    paddingBottom: 8,
+    backgroundColor: COLORS.card,
+    borderBottomWidth: 1,
+    borderBottomColor: COLORS.borderSolid,
+  },
+  backBtnZone: {
+    width: 100,
+    justifyContent: 'center',
+  },
+  backBtn: {
+    width: 40,
+    height: 40,
+    justifyContent: 'center',
+    alignItems: 'center',
+    borderRadius: 12,
+    backgroundColor: COLORS.card,
+    borderWidth: 1,
+    borderColor: COLORS.borderSolid,
+  },
+  gameInfo: {
+    flex: 1,
+    alignItems: 'center',
+  },
+  gameTitle: {
+    fontSize: 16,
+    fontWeight: '700',
+    color: COLORS.textPrimary,
+  },
+  gameSubtitle: {
+    fontSize: 13,
+    color: COLORS.textLight,
+    marginTop: 2,
+    textAlign: 'center',
+  },
+  turnIndicator: {
+    minWidth: 100,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'flex-end',
+    gap: 6,
+    backgroundColor: COLORS.card,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: COLORS.borderSolid,
+  },
+  turnDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+  },
+  turnText: {
+    fontSize: 13,
+    color: COLORS.textSecondary,
+  },
+  // 浮层（覆盖在棋盘上方）
+  overlay: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: 'rgba(245, 240, 232, 0.92)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 24,
+    // 公示/倒数/断线/结算浮层必须盖住棋盘：棋盘内部（被吃棋子抽屉等）使用了 elevation，
+    // Android 上无 elevation 的浮层会被其遮挡而"沉到棋盘下方"，需同时给高 zIndex + elevation
+    zIndex: 100,
+    elevation: 100,
+  },
+  waitingCard: {
+    backgroundColor: COLORS.card,
+    borderRadius: 16,
+    padding: 32,
+    alignItems: 'center',
+    width: '100%',
+    maxWidth: 340,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+  },
+  // 等待阶段：准备/选边简化按钮（基于底部按钮风格）
+  // 公示浮层：双方状态行
+  playersRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    alignSelf: 'stretch',
+    marginBottom: 20,
+    gap: 10,
+  },
+  playerChip: {
+    flex: 1,
+    backgroundColor: COLORS.background,
+    borderRadius: 12,
+    paddingVertical: 10,
+    paddingHorizontal: 8,
+    alignItems: 'center',
+    gap: 4,
+  },
+  playerChipName: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: COLORS.textPrimary,
+    maxWidth: '100%',
+  },
+  vsText: {
+    fontSize: 13,
+    fontWeight: '800',
+    color: COLORS.textLight,
+  },
+  // 选边弹窗：选边按钮行
+  sidePickRow: {
+    flexDirection: 'row',
+    gap: 12,
+    marginTop: 6,
+    marginBottom: 14,
+    alignSelf: 'stretch',
+    justifyContent: 'center',
+  },
+  sidePickBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    paddingVertical: 12,
+    paddingHorizontal: 18,
+    borderRadius: 12,
+    backgroundColor: COLORS.background,
+    borderWidth: 2,
+    borderColor: 'transparent',
+  },
+  sidePickBtnRed: {
+    borderColor: COLORS.primary,
+    backgroundColor: 'rgba(178,58,46,0.08)',
+  },
+  sidePickBtnBlack: {
+    borderColor: '#3C2A1E',
+    backgroundColor: 'rgba(60,42,30,0.08)',
+  },
+  sideDot: {
+    width: 12,
+    height: 12,
+    borderRadius: 6,
+  },
+  sideDotRed: {
+    backgroundColor: COLORS.primary,
+  },
+  sideDotBlack: {
+    backgroundColor: '#3C2A1E',
+  },
+  sidePickBtnText: {
+    fontSize: 15,
+    fontWeight: '600',
+    color: COLORS.textSecondary,
+  },
+  sidePickBtnTextActive: {
+    color: COLORS.textPrimary,
+  },
+  // 选边按钮右上角「我方/对手」小字标注
+  sidePickBadges: {
+    position: 'absolute',
+    top: -10,
+    right: 6,
+    flexDirection: 'row',
+    gap: 4,
+    zIndex: 2,
+    elevation: 2,
+  },
+  sideBadge: {
+    paddingHorizontal: 7,
+    paddingVertical: 2,
+    borderRadius: 9,
+    borderWidth: 1,
+    borderColor: 'transparent',
+  },
+  sideBadgeOutline: {
+    backgroundColor: COLORS.card,
+  },
+  sideBadgeTextSolid: {
+    fontSize: 10,
+    fontWeight: '700',
+    color: '#FFFFFF',
+    lineHeight: 13,
+  },
+  sideBadgeTextOutline: {
+    fontSize: 10,
+    fontWeight: '700',
+    lineHeight: 13,
+  },
+  // 选边结果公示（弹窗内容动画切换）
+  sideResultWrap: {
+    alignItems: 'center',
+    alignSelf: 'stretch',
+    paddingVertical: 6,
+  },
+  sideResultMain: {
+    fontSize: 24,
+    fontWeight: 'bold',
+    marginTop: 10,
+    marginBottom: 6,
+  },
+  sideResultRandom: {
+    fontSize: 12,
+    color: COLORS.textLight,
+    marginBottom: 4,
+  },
+  sideResultHandicap: {
+    fontSize: 15,
+    fontWeight: '700',
+    color: COLORS.primary,
+    letterSpacing: 2,
+    marginBottom: 10,
+  },
+  sideResultWish: {
+    fontSize: 15,
+    fontWeight: '600',
+    color: COLORS.textSecondary,
+    marginTop: 4,
+  },
+  sideResultCountdown: {
+    fontSize: 13,
+    color: COLORS.textLight,
+    marginTop: 14,
+  },
+  // 房间设置弹窗（布局与大厅创建房间弹窗一致：表单网格样式见共享组件 RoomSettingsControls 的 formStyles）
+  modalHint: {
+    fontSize: 12,
+    color: COLORS.textLight,
+    textAlign: 'center',
+    marginTop: 2,
+    marginBottom: 4,
+  },
+  // 设置弹窗容器（比通用弹窗更宽，容纳双列下拉网格与让子棋盘）
+  settingsModalContent: {
+    backgroundColor: COLORS.card,
+    borderRadius: 16,
+    padding: 24,
+    width: '85%',
+    maxWidth: 360,
+    maxHeight: '88%',
+  },
+  // 设置弹窗按钮（与大厅创建房间弹窗同款：圆角 10 + 15 号字）
+  settingsBtnCancel: {
+    flex: 1,
+    backgroundColor: COLORS.background,
+    borderRadius: 10,
+    padding: 12,
+    alignItems: 'center',
+  },
+  settingsBtnCancelText: {
+    color: COLORS.textSecondary,
+    fontSize: 15,
+  },
+  settingsBtnConfirm: {
+    flex: 1,
+    backgroundColor: COLORS.primary,
+    borderRadius: 10,
+    padding: 12,
+    alignItems: 'center',
+  },
+  settingsBtnConfirmText: {
+    color: '#fff',
+    fontSize: 15,
+    fontWeight: '600',
+  },
+  // 执棋结果公示
+  revealTitle: {
+    fontSize: 20,
+    fontWeight: 'bold',
+    color: COLORS.textPrimary,
+    marginBottom: 20,
+  },
+  revealSideText: {
+    fontSize: 13,
+    fontWeight: '700',
+    marginTop: 2,
+  },
+  revealSideRed: {
+    color: COLORS.primary,
+  },
+  revealSideBlack: {
+    color: '#3C2A1E',
+  },
+  revealRandomHint: {
+    fontSize: 12,
+    color: COLORS.textLight,
+  },
+  // 倒计时卡片
+  countdownCard: {
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  countdownSideText: {
+    fontSize: 20,
+    fontWeight: '600',
+    color: COLORS.textPrimary,
+    marginBottom: 24,
+  },
+  countdownNumber: {
+    fontSize: 80,
+    fontWeight: 'bold',
+    color: COLORS.primary,
+    marginBottom: 16,
+  },
+  countdownHint: {
+    fontSize: 16,
+    color: COLORS.textSecondary,
+  },
+  // 断线等待卡片
+  disconnectCard: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: COLORS.card,
+    borderRadius: 16,
+    paddingHorizontal: 40,
+    paddingVertical: 32,
+    borderWidth: 2,
+    borderColor: COLORS.primary,
+  },
+  disconnectTitle: {
+    fontSize: 22,
+    fontWeight: 'bold',
+    color: COLORS.textPrimary,
+    marginBottom: 8,
+  },
+  disconnectHint: {
+    fontSize: 14,
+    color: COLORS.textSecondary,
+    marginBottom: 16,
+  },
+  disconnectCountdown: {
+    fontSize: 48,
+    fontWeight: 'bold',
+    color: COLORS.primary,
+    marginBottom: 8,
+  },
+  disconnectSubHint: {
+    fontSize: 13,
+    color: COLORS.textLight,
+  },
+  // 棋盘
+  // 标题行下方内容宿主：被吃棋子抽屉（绝对定位）锚定于此容器顶部
+  capturedDrawerHost: {
+    flex: 1,
+  },
+  // 与人机模式一致：容器无额外 padding，棋盘由 ChessBoard 自身按屏宽居中
+  boardContainer: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'flex-start',
+  },
+  // 名字角标行：棋盘上下独立行（不遮挡棋盘），宽度在渲染处以数值屏宽传入
+  nameRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    height: 26,
+    marginBottom: 4,
+    paddingHorizontal: 12,
+  },
+  nameRowMe: {
+    justifyContent: 'flex-end',
+    marginBottom: 0,
+    marginTop: 4,
+  },
+  // 名字角标（药丸形描边小标签）
+  nameChip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    backgroundColor: COLORS.card,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: '#D7CCC8',
+    paddingVertical: 4,
+    paddingHorizontal: 10,
+    maxWidth: '46%',
+  },
+  nameChipDot: {
+    width: 6,
+    height: 6,
+    borderRadius: 3,
+    backgroundColor: '#2E7D32',
+  },
+  // 回合倒计时角标：与名字角标同款药丸，靠行尾右对齐
+  timerChip: {
+    marginLeft: 'auto',
+  },
+  timerChipText: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: COLORS.textPrimary,
+    fontVariant: ['tabular-nums'],
+  },
+  timerChipTextUrgent: {
+    color: COLORS.danger,
+  },
+  nameChipDotWaiting: {
+    backgroundColor: COLORS.textLight,
+  },
+  nameChipDotNotReady: {
+    backgroundColor: '#BDBDBD',
+  },
+  readyTag: {
+    paddingHorizontal: 6,
+    paddingVertical: 1,
+    borderRadius: 999,
+    borderWidth: 1,
+  },
+  readyTagOn: {
+    borderColor: '#2E7D32',
+    backgroundColor: 'rgba(46, 125, 50, 0.12)',
+  },
+  readyTagOff: {
+    borderColor: '#BDBDBD',
+    backgroundColor: 'rgba(0, 0, 0, 0.04)',
+  },
+  readyTagText: {
+    fontSize: 10,
+    fontWeight: '600',
+  },
+  readyTagTextOn: {
+    color: '#2E7D32',
+  },
+  readyTagTextOff: {
+    color: '#9E9E9E',
+  },
+  nameChipText: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: COLORS.textPrimary,
+    flexShrink: 1,
+  },
+  // ===== 对局内 emoji 表情互动 =====
+  // 表情气泡：名称角标旁的圆角小气泡（弹入/淡出动画由组件内 Animated 驱动）
+  emojiBubble: {
+    marginHorizontal: 5,
+    minWidth: 30,
+    height: 30,
+    borderRadius: 15,
+    backgroundColor: COLORS.card,
+    borderWidth: 1,
+    borderColor: COLORS.borderSolid,
+    alignItems: 'center',
+    justifyContent: 'center',
+    shadowColor: COLORS.primary,
+    shadowOpacity: 0.12,
+    shadowRadius: 6,
+    shadowOffset: { width: 0, height: 2 },
+    elevation: 3,
+  },
+  emojiBubbleText: {
+    fontSize: 18,
+    lineHeight: 22,
+  },
+  // 表情下拉栏：棋盘容器内的浮层（绝对定位于我方名称行正下方，宽度适配屏幕），
+  // 单行横滑展示全部表情，展示不全时左右滑动选取；点选任意表情后自动收起
+  emojiDropdown: {
+    position: 'absolute',
+    left: 0,
+    zIndex: 60,
+    backgroundColor: COLORS.card,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: COLORS.borderSolid,
+    marginHorizontal: 12,
+    shadowColor: COLORS.primary,
+    shadowOpacity: 0.14,
+    shadowRadius: 12,
+    shadowOffset: { width: 0, height: 4 },
+    elevation: 8,
+  },
+  emojiDropdownContent: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 6,
+    paddingVertical: 6,
+  },
+  emojiDropdownCell: {
+    width: 44,
+    height: 44,
+    borderRadius: 12,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  emojiDropdownCellText: {
+    fontSize: 26,
+    lineHeight: 32,
+  },
+  // 底部操作栏：与人机对战完全一致（宽度在渲染处以数值屏宽传入，按钮 flex:1 等分）
+  bottomBar: {
+    flexDirection: 'row',
+    justifyContent: 'center',
+    gap: 8,
+    paddingHorizontal: 16,
+  },
+  actionButton: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 5,
+    backgroundColor: COLORS.card,
+    paddingHorizontal: 6,
+    paddingVertical: 12,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: COLORS.borderSolid,
+  },
+  actionButtonDisabled: {
+    opacity: 0.4,
+  },
+  actionButtonText: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: COLORS.textPrimary,
+  },
+  // 弹窗
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.5)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  modalContent: {
+    backgroundColor: COLORS.card,
+    borderRadius: 16,
+    padding: 24,
+    width: '80%',
+    maxWidth: 320,
+  },
+  modalTitle: {
+    fontSize: 18,
+    fontWeight: 'bold',
+    color: COLORS.textPrimary,
+    marginBottom: 12,
+    textAlign: 'center',
+  },
+  modalText: {
+    fontSize: 14,
+    color: COLORS.textSecondary,
+    textAlign: 'center',
+    marginBottom: 20,
+    lineHeight: 20,
+  },
+  modalButtons: {
+    flexDirection: 'row',
+    gap: 12,
+  },
+  modalButtonCancel: {
+    flex: 1,
+    backgroundColor: COLORS.background,
+    borderRadius: 8,
+    padding: 12,
+    alignItems: 'center',
+  },
+  modalButtonTextCancel: {
+    color: COLORS.textSecondary,
+    fontSize: 14,
+  },
+  modalButtonTextConfirm: {
+    color: '#fff',
+    fontSize: 14,
+    fontWeight: '600',
+  },
+});

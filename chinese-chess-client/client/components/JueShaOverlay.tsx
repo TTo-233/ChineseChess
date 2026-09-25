@@ -1,0 +1,380 @@
+/**
+ * 绝杀特效组件 - 与开源项目 JueSha.xaml 完全一致
+ *
+ * 素材布局（基于原项目629x695棋盘网格区域）：
+ * - "绝"组: 位于左上 (0,0)，大"绝"270x270 + 小"绝"100x90 居中重叠
+ * - "杀"组: 偏移(69,34)，大"杀"270x270 + 小"杀"100x90 居中重叠
+ * - 底部背景: 偏移(29,74)，尺寸310x220
+ *
+ * 动画时间线（已取消红色背景闪烁，各阶段前移）：
+ * - 大"绝": 0~2.0s opacity 1→0
+ * - 小"绝": 0~1.5s opacity 0→1
+ * - 大"杀": 0.3~2.6s opacity 1→0
+ * - 小"杀": 0.3~1.8s opacity 0→1
+ * - 底部背景: 1.5~2.0s opacity 0→1
+ * - 按钮: 2.5s 淡入
+ * - 不淡出，保持最终画面
+ */
+import React, { useEffect, useState } from 'react';
+import { Animated, Image, StyleSheet, Text, TouchableOpacity, useWindowDimensions, View } from 'react-native';
+
+// 原项目素材尺寸（基于629x695棋盘网格区域）
+const GRID_WIDTH = 631;
+const GRID_HEIGHT = 697;
+
+// 大"绝"图片: 270x270 位于 (0,0)
+const JUE1_SIZE = 270;
+// 小"绝"图片: 100x90 位于 (85,90)（在270x270中居中）
+const JUE5_WIDTH = 100;
+const JUE5_HEIGHT = 90;
+const JUE5_LEFT = (JUE1_SIZE - JUE5_WIDTH) / 2;
+const JUE5_TOP = (JUE1_SIZE - JUE5_HEIGHT) / 2;
+
+// "杀"组偏移
+const SHA_OFFSET_X = 69;
+const SHA_OFFSET_Y = 34;
+
+// 大"杀"图片: 270x270 位于 (69,34)
+const SHA1_SIZE = 270;
+// 小"杀"图片: 100x90 位于 (69+85, 34+90) = (154,124)
+const SHA5_WIDTH = 100;
+const SHA5_HEIGHT = 90;
+const SHA5_LEFT = SHA_OFFSET_X + (SHA1_SIZE - SHA5_WIDTH) / 2;
+const SHA5_TOP = SHA_OFFSET_Y + (SHA1_SIZE - SHA5_HEIGHT) / 2;
+
+// 底部背景: 310x220 位于 (29,74)
+const TUOBA_WIDTH = 310;
+const TUOBA_HEIGHT = 220;
+const TUOBA_LEFT = 29;
+const TUOBA_TOP = 74;
+
+// 内容包围盒
+const CONTENT_WIDTH = 339;  // max(270, 69+270, 29+310) = 339
+const CONTENT_HEIGHT = 304; // max(270, 34+270, 74+220) = 304
+
+// 内容在网格区域中的居中偏移
+const CENTER_OFFSET_X = (GRID_WIDTH - CONTENT_WIDTH) / 2;
+const CENTER_OFFSET_Y = (GRID_HEIGHT - CONTENT_HEIGHT) / 2;
+
+interface JueShaOverlayProps {
+  visible: boolean;
+  onPlayAgain?: () => void;
+  onGoHome?: () => void;
+  resultText?: string;
+  /** 主按钮文案（默认"再来一局"） */
+  primaryText?: string;
+  /** 次按钮文案（默认"返回首页"） */
+  secondaryText?: string;
+  /** 残局闯关：过关后展示"下一关"按钮 */
+  onNextLevel?: () => void;
+  nextLevelText?: string;
+  /**
+   * 棋盘在浮层容器中的实际位置与尺寸（动态布局预算下棋盘尺寸/位置会变化）。
+   * 传入后：绝杀动画锁定棋盘中心、结果文字与按钮排到棋盘正下方；
+   * 未传入（null/undefined）时退回"屏幕居中"兜底，保证向后兼容。
+   */
+  boardFrame?: { x: number; y: number; width: number; height: number } | null;
+  /**
+   * 是否播放「绝/杀」字符特效。默认 true（绝杀/困毙终局）。
+   * 认输/和棋/断线判负等非绝杀终局传 false：不播字符特效，仅淡入结果文字与按钮。
+   */
+  showEffect?: boolean;
+}
+
+export default function JueShaOverlay({
+  visible,
+  onPlayAgain,
+  onGoHome,
+  resultText,
+  primaryText = '再来一局',
+  secondaryText = '返回首页',
+  onNextLevel,
+  nextLevelText = '下一关',
+  boardFrame,
+  showEffect = true,
+}: JueShaOverlayProps) {
+  const { width: screenWidth, height: screenHeight } = useWindowDimensions();
+
+  const [jue1Opacity] = useState(() => new Animated.Value(0));
+  const [jue5Opacity] = useState(() => new Animated.Value(0));
+  const [sha1Opacity] = useState(() => new Animated.Value(0));
+  const [sha5Opacity] = useState(() => new Animated.Value(0));
+  const [tuobaOpacity] = useState(() => new Animated.Value(0));
+  const [buttonsOpacity] = useState(() => new Animated.Value(0));
+
+  useEffect(() => {
+    if (!visible) return;
+
+    // 初始状态
+    jue1Opacity.setValue(0);
+    jue5Opacity.setValue(0);
+    sha1Opacity.setValue(0);
+    sha5Opacity.setValue(0);
+    tuobaOpacity.setValue(0);
+    buttonsOpacity.setValue(0);
+
+    // 非绝杀终局（认输/和棋/断线判负）：不播「绝/杀」字符特效，直接淡入结果文字与按钮
+    if (!showEffect) {
+      Animated.timing(buttonsOpacity, { toValue: 1, duration: 300, useNativeDriver: true }).start();
+      return;
+    }
+
+    Animated.parallel([
+      // 大"绝": 0~2.0s opacity 1→0
+      Animated.sequence([
+        Animated.timing(jue1Opacity, { toValue: 1, duration: 0, useNativeDriver: true }),
+        Animated.timing(jue1Opacity, { toValue: 0, duration: 2000, useNativeDriver: true }),
+      ]),
+      // 小"绝": 0~1.5s opacity 0→1
+      Animated.timing(jue5Opacity, { toValue: 1, duration: 1500, useNativeDriver: true }),
+      // 大"杀": 0.3~2.6s opacity 1→0
+      Animated.sequence([
+        Animated.delay(300),
+        Animated.timing(sha1Opacity, { toValue: 1, duration: 0, useNativeDriver: true }),
+        Animated.timing(sha1Opacity, { toValue: 0, duration: 2300, useNativeDriver: true }),
+      ]),
+      // 小"杀": 0.3~1.8s opacity 0→1
+      Animated.sequence([
+        Animated.delay(300),
+        Animated.timing(sha5Opacity, { toValue: 1, duration: 1500, useNativeDriver: true }),
+      ]),
+      // 底部背景: 1.5~2.0s opacity 0→1
+      Animated.sequence([
+        Animated.delay(1500),
+        Animated.timing(tuobaOpacity, { toValue: 1, duration: 500, useNativeDriver: true }),
+      ]),
+      // 按钮: 2.5s 淡入
+      Animated.sequence([
+        Animated.delay(2500),
+        Animated.timing(buttonsOpacity, { toValue: 1, duration: 400, useNativeDriver: true }),
+      ]),
+    ]).start();
+  }, [visible, showEffect]);
+
+  if (!visible) return null;
+
+  // 棋盘几何：优先用传入的真实棋盘位置（动态布局预算下棋盘尺寸/位置会变化），
+  // 未传入时退回"屏幕居中"估算，保证向后兼容
+  const boardW = boardFrame ? boardFrame.width : screenWidth - 16;
+  const boardCenterX = boardFrame ? boardFrame.x + boardFrame.width / 2 : screenWidth / 2;
+  const boardCenterY = boardFrame ? boardFrame.y + boardFrame.height / 2 : screenHeight / 2;
+  const boardBottom = boardFrame
+    ? boardFrame.y + boardFrame.height
+    : screenHeight / 2 + ((screenWidth - 16) / 631 * 842) / 2;
+
+  // 缩放比例：内容包围盒宽度约为棋盘宽度的 80%（随动态棋盘大小自适应，兜底防止过小）
+  const scale = Math.max((boardW * 0.8) / CONTENT_WIDTH, 0.1);
+  const contentW = CONTENT_WIDTH * scale;
+  const contentH = CONTENT_HEIGHT * scale;
+
+  // 绝杀动画锁定棋盘中心
+  const contentLeft = boardCenterX - contentW / 2;
+  const contentTop = boardCenterY - contentH / 2;
+
+  // 结果文字与按钮排到棋盘正下方（与棋盘底边留少量间距；紧凑排布以落入底部栏预留区 + 底部安全区内）
+  const buttonsTop = boardBottom + 6;
+
+  return (
+    <View style={styles.container} pointerEvents="box-none">
+      {/* 内容区域 - 锁定棋盘中心（仅绝杀/困毙终局播放；认输/和棋/断线判负不展示） */}
+      {showEffect && (
+      <View style={[
+        styles.contentArea,
+        {
+          left: contentLeft,
+          top: contentTop,
+          width: contentW,
+          height: contentH,
+        }
+      ]}>
+        {/* 底部背景（拖把图） */}
+        <Animated.View style={[
+          styles.tuobaContainer,
+          {
+            left: (TUOBA_LEFT - 0) * scale,
+            top: (TUOBA_TOP - 0) * scale,
+            width: TUOBA_WIDTH * scale,
+            height: TUOBA_HEIGHT * scale,
+            opacity: tuobaOpacity,
+          }
+        ]}>
+          <Image
+            source={require('@/assets/juesha_bg.png')}
+            style={styles.fullImage}
+            resizeMode="contain"
+          />
+        </Animated.View>
+
+        {/* 大"绝" */}
+        <Animated.View style={[
+          styles.charGroup,
+          {
+            left: 0,
+            top: 0,
+            width: JUE1_SIZE * scale,
+            height: JUE1_SIZE * scale,
+            opacity: jue1Opacity,
+          }
+        ]}>
+          <Image
+            source={require('@/assets/juesha_da_jue.png')}
+            style={styles.fullImage}
+            resizeMode="contain"
+          />
+        </Animated.View>
+
+        {/* 小"绝" */}
+        <Animated.View style={[
+          styles.charGroup,
+          {
+            left: JUE5_LEFT * scale,
+            top: JUE5_TOP * scale,
+            width: JUE5_WIDTH * scale,
+            height: JUE5_HEIGHT * scale,
+            opacity: jue5Opacity,
+          }
+        ]}>
+          <Image
+            source={require('@/assets/juesha_xiao_jue.png')}
+            style={styles.fullImage}
+            resizeMode="contain"
+          />
+        </Animated.View>
+
+        {/* 大"杀" */}
+        <Animated.View style={[
+          styles.charGroup,
+          {
+            left: SHA_OFFSET_X * scale,
+            top: SHA_OFFSET_Y * scale,
+            width: SHA1_SIZE * scale,
+            height: SHA1_SIZE * scale,
+            opacity: sha1Opacity,
+          }
+        ]}>
+          <Image
+            source={require('@/assets/juesha_da_sha.png')}
+            style={styles.fullImage}
+            resizeMode="contain"
+          />
+        </Animated.View>
+
+        {/* 小"杀" */}
+        <Animated.View style={[
+          styles.charGroup,
+          {
+            left: SHA5_LEFT * scale,
+            top: SHA5_TOP * scale,
+            width: SHA5_WIDTH * scale,
+            height: SHA5_HEIGHT * scale,
+            opacity: sha5Opacity,
+          }
+        ]}>
+          <Image
+            source={require('@/assets/juesha_xiao_sha.png')}
+            style={styles.fullImage}
+            resizeMode="contain"
+          />
+        </Animated.View>
+      </View>
+      )}
+
+      {/* 结果文字 + 按钮区域：排到棋盘正下方 */}
+      <Animated.View style={[styles.buttonsArea, { opacity: buttonsOpacity, top: buttonsTop }]}>
+        {resultText ? (
+          <Text style={styles.resultText}>{resultText}</Text>
+        ) : null}
+        <View style={styles.buttonsRow}>
+          {onNextLevel && (
+            <TouchableOpacity style={styles.buttonPrimary} onPress={onNextLevel}>
+              <Text style={styles.buttonPrimaryText}>{nextLevelText}</Text>
+            </TouchableOpacity>
+          )}
+          {onPlayAgain && (
+            <TouchableOpacity style={styles.buttonPrimary} onPress={onPlayAgain}>
+              <Text style={styles.buttonPrimaryText}>{primaryText}</Text>
+            </TouchableOpacity>
+          )}
+          {onGoHome && (
+            <TouchableOpacity style={styles.buttonSecondary} onPress={onGoHome}>
+              <Text style={styles.buttonSecondaryText}>{secondaryText}</Text>
+            </TouchableOpacity>
+          )}
+        </View>
+      </Animated.View>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: {
+    ...StyleSheet.absoluteFillObject,
+    zIndex: 100,
+    // Android 上棋盘内部存在 elevation 层，仅 zIndex 不足以盖住，需同时给 elevation
+    elevation: 100,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  contentArea: {
+    position: 'absolute',
+  },
+  charGroup: {
+    position: 'absolute',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  tuobaContainer: {
+    position: 'absolute',
+  },
+  fullImage: {
+    width: '100%',
+    height: '100%',
+  },
+  buttonsArea: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    alignItems: 'center',
+  },
+  resultText: {
+    fontSize: 18,
+    fontWeight: '600',
+    color: '#5D4037',
+    marginBottom: 8,
+    textShadowColor: 'rgba(255,255,255,0.8)',
+    textShadowOffset: { width: 0, height: 1 },
+    textShadowRadius: 4,
+  },
+  buttonsRow: {
+    flexDirection: 'row',
+    gap: 16,
+  },
+  buttonPrimary: {
+    backgroundColor: '#8B0000',
+    paddingHorizontal: 32,
+    paddingVertical: 10,
+    borderRadius: 8,
+    minWidth: 120,
+    alignItems: 'center',
+  },
+  buttonPrimaryText: {
+    color: '#FFFFFF',
+    fontSize: 16,
+    fontWeight: '600',
+  },
+  buttonSecondary: {
+    backgroundColor: 'rgba(255,255,255,0.9)',
+    paddingHorizontal: 32,
+    paddingVertical: 10,
+    borderRadius: 8,
+    minWidth: 120,
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: '#D4C4A8',
+  },
+  buttonSecondaryText: {
+    color: '#5D4037',
+    fontSize: 16,
+    fontWeight: '600',
+  },
+});
