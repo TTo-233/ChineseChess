@@ -5,7 +5,10 @@ import { getOnlineWsUrl } from '@/utils/serverConfig';
  *
  * 能力：
  * - 自动连接与指数退避重连（断线重连）
- * - 应用层心跳（每 2s 发送 { type: 'heartbeat' }），驱动服务端逻辑断线检测
+ * - 应用层心跳（每 2s 发送 { type: 'heartbeat', hidden }），驱动服务端逻辑断线检测
+ * - 可见性感知：后台标签页会被浏览器节流（定时器最长约 1 分钟一次甚至冻结），
+ *   进入后台立即上报 hidden=true 让服务端宽容判定，回到前台立即补发心跳并即时重连，
+ *   消除「切后台被误判断线」与「回前台后仍处于断线判定」两个缺口
  * - 统一分发服务端推送（welcome/state）与动作回执（ack）
  * - send() 返回是否成功发出，失败时由调用方走 HTTP 兜底
  *
@@ -13,6 +16,7 @@ import { getOnlineWsUrl } from '@/utils/serverConfig';
  */
 
 // WebSocket readyState 常量（兼容 RN 与 Web，避免依赖静态属性差异）
+const WS_CONNECTING = 0;
 const WS_OPEN = 1;
 
 export interface BattleSocketHandlers {
@@ -28,6 +32,8 @@ export interface BattleSocketHandlers {
 
 const HEARTBEAT_INTERVAL = 2000;
 const MAX_RECONNECT_DELAY = 8000;
+// 心跳补发阈值：定时器被节流（后台标签页）或页面从休眠恢复后，间隔明显超过该值时立即补发一次
+const HEARTBEAT_STALE_MS = HEARTBEAT_INTERVAL + 500;
 
 // 连接角色：对局玩家（可执行动作）或观战者（只读，仅接收状态推送）
 export type BattleSocketRole = 'player' | 'spectator';
@@ -52,6 +58,10 @@ export class BattleSocket {
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private reconnectAttempts = 0;
   private reqCounter = 0;
+  // 页面是否处于后台（浏览器/系统节流场景）：随心跳上报服务端，用于后台宽容判定
+  private hidden = false;
+  // 最近一次心跳成功发出的时刻：可见性未变化时据此避免重复补发
+  private lastHeartbeatAt = 0;
 
   constructor(roomId: string, identityId: string, handlers: BattleSocketHandlers, role: BattleSocketRole = 'player') {
     this.roomId = roomId;
@@ -114,6 +124,12 @@ export class BattleSocket {
           this.closedByUser = true;
           this.stopHeartbeat();
           this.handlers.onFatalError?.(message);
+          // 服务端已关闭连接：主动收尾，避免残留半开连接持续触发重连判定
+          try {
+            this.ws?.close();
+          } catch {
+            // 忽略
+          }
         }
       }
     };
@@ -131,8 +147,11 @@ export class BattleSocket {
 
   private startHeartbeat(): void {
     this.stopHeartbeat();
+    this.sendHeartbeat();
     this.heartbeatTimer = setInterval(() => {
-      this.sendRaw({ type: 'heartbeat' });
+      // 定时器在后台标签页会被浏览器节流（Chrome 最长约 1 分钟一次，甚至冻结）：
+      // 每次触发都补发一次心跳，让服务端看到的最近心跳时间尽快刷新，避免 10s 心跳超时被误判断线。
+      this.sendHeartbeat();
     }, HEARTBEAT_INTERVAL);
   }
 
@@ -141,6 +160,51 @@ export class BattleSocket {
       clearInterval(this.heartbeatTimer);
       this.heartbeatTimer = null;
     }
+  }
+
+  /** 发送一次应用层心跳（带可见性标记）；未连接时不发送，返回是否已发出 */
+  private sendHeartbeat(): boolean {
+    const sent = this.sendRaw({ type: 'heartbeat', hidden: this.hidden });
+    if (sent) this.lastHeartbeatAt = Date.now();
+    return sent;
+  }
+
+  /**
+   * 上报页面可见性并立即补发心跳。
+   * - hidden=true：进入后台，趁定时器尚未被节流立刻把「我在后台」送达服务端，服务端据此宽容判定；
+   * - hidden=false：回到前台，立即以「已在线」身份补发心跳，并即时重连（服务端若已进入断线等待，
+   *   心跳/重连会立即撤销等待倒计时，避免回前台后仍被判负）。
+   */
+  setHidden(hidden: boolean): void {
+    const changed = this.hidden !== hidden;
+    this.hidden = hidden;
+    // 可见性变化必须立即送达服务端；未变化时仅在距上次心跳已超过补发阈值时才补发，避免无谓的重复帧
+    if (changed || Date.now() - this.lastHeartbeatAt >= HEARTBEAT_STALE_MS) this.sendHeartbeat();
+    if (!hidden && changed) this.resume();
+  }
+
+  /** 立即补发一次心跳（页面重新可见/从休眠恢复等场景由调用方触发） */
+  heartbeatNow(): void {
+    this.sendHeartbeat();
+  }
+
+  /** 页面恢复活跃：跳过退避立即重连，并清零退避计数（后台被节流期间连接可能已被服务端回收） */
+  resume(): void {
+    if (this.closedByUser) return;
+    this.reconnectAttempts = 0;
+    if (this.ws && this.ws.readyState === WS_OPEN) {
+      this.sendHeartbeat();
+      return;
+    }
+    // 已有连接正在建立：等待其 onopen 即可，避免并发创建重复连接
+    if (this.ws && this.ws.readyState === WS_CONNECTING && !this.reconnectTimer) {
+      return;
+    }
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    this.openSocket();
   }
 
   private scheduleReconnect(): void {

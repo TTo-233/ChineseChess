@@ -355,8 +355,15 @@ export default function LanBattleScreen() {
   const [opponentDisconnected, setOpponentDisconnected] = useState(false);
   const [disconnectCountdown, setDisconnectCountdown] = useState(60); // 断线等待倒计时（秒）
   const heartbeatRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  // 被移出房间/房间已关闭的提示去重：轮询每 2s 触发，避免重复弹窗
-  const roomGoneAlertedRef = useRef(false);
+  // 会话已终结（房间被销毁/本人被移出/断线判负后房间解散）：
+  // 页面必须切到终结态并给出返回大厅入口——Web 端 Alert.alert 是空实现（react-native-web 未实现），
+  // 只靠弹窗会导致「服务端房间已销毁、前端 UI 仍停在棋盘」的卡死，因此改用可见的终态浮层。
+  const [sessionGone, setSessionGone] = useState<{ title: string; hint: string } | null>(null);
+  const sessionGoneRef = useRef(false);
+  // 本端曾被服务端标记断线（据此把终态文案区分为「断线判负」而非泛化的「房间已关闭」）
+  const selfDisconnectedRef = useRef(false);
+  // 页面是否处于后台（Web 切标签页 / 移动端切后台）：心跳携带该标记，服务端据此在节流场景宽容判定
+  const pageHiddenRef = useRef(false);
   // 主动退出标记：返回按钮/侧滑等本人主动离开房间时置位。
   // 离开请求会让服务端销毁房间（独住房主）或移出本人，与 2s 轮询存在竞态——
   // 在途轮询可能拿到 404 或「成员列表无本人」，误报「房间已关闭/你已被移出房间」。
@@ -431,13 +438,81 @@ export default function LanBattleScreen() {
     }
   }, [roomId, playerId]);
 
-  // App 回到前台时显式上报重连（覆盖「切后台被判断线 → 回前台」路径）
+  // HTTP 兜底心跳：WS 为主通道（BattleSocket 内部按 2s 发送），此通道用于 WS 断开时的保活与
+  // 可见性变化的即时上报。hidden=true 表示页面在后台（浏览器会节流定时器），服务端据此宽容判定。
+  const sendHeartbeatNow = useCallback(async () => {
+    if (sessionGoneRef.current) return; // 会话已终结（房间已销毁）：不再发送无意义心跳
+    try {
+      const base = await getOnlineServerUrl();
+      await fetch(`${base}/api/v1/lan/rooms/${roomId}/heartbeat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ playerId, hidden: pageHiddenRef.current }),
+      });
+    } catch (error) {
+      console.error('心跳发送失败:', error);
+    }
+  }, [roomId, playerId]);
+
+  // 会话终结统一处理：房间被销毁 / 本人被移出房间 / 断线判负后房间解散。
+  // 服务端权威状态已不可获取（404 或成员列表无本人），此处只做两件事：
+  // 切到可见的终态浮层（UI 必须刷新，不能继续停在棋盘上）+ 提供返回大厅入口。
+  // 注意：Web 端不可依赖 Alert.alert——react-native-web 的 Alert.alert 是空实现，
+  // 只弹窗（不落 UI 状态）正是「房间已销毁但 UI 未刷新」的根因。
+  const handleSessionGone = useCallback((reason: 'room-closed' | 'removed' | 'removed-idle') => {
+    if (sessionGoneRef.current || intentionalExitRef.current) return; // 主动退出不误报
+    sessionGoneRef.current = true;
+    // 本端曾被标记断线时，文案按「断线判负」呈现（服务端已判负；房间可能同时被解散）
+    const disconnectedLoss = selfDisconnectedRef.current;
+    const notice = reason === 'removed-idle'
+      ? { title: '已离开房间', hint: '你已被移出房间（连接中断过久）' }
+      : reason === 'removed'
+        ? disconnectedLoss
+          ? { title: '断线判负', hint: '你长时间未回到对局，已被判负' }
+          : { title: '已离开对局', hint: '你已不在该房间中' }
+        : disconnectedLoss
+          ? { title: '断线判负', hint: '你长时间未回到对局，已被判负，房间已关闭' }
+          : { title: '对局已结束', hint: '房间已关闭' };
+    setSessionGone(notice);
+    // 终态浮层必须盖住棋盘，且不能再接受走子：本地阶段切到 ended，停掉心跳与状态轮询
+    setPhase('ended');
+    // 房间已不存在：结算浮层的「返回房间」等入口必然失败，改用终态浮层统一收口
+    setJueShaVisible(false);
+    setOpponentDisconnected(false);
+    setUndoRequestFromOpponent(false);
+    setDrawRequestFromOpponent(false);
+  }, []);
+
+  // 页面可见性变化（Web 切标签页 / 移动端切后台）→ 立即同步服务端：
+  // - 进入后台：趁定时器尚未被节流，立刻上报 hidden=true，服务端在宽容窗口内不判定断线
+  // - 回到前台：立即上报 hidden=false（清断线等待）+ 补发心跳 + 即时重连被回收的连接，
+  //   消除「后台被节流 → 回前台仍处于断线倒计时/已被判负」的缺口
   useEffect(() => {
+    const applyVisibility = (hidden: boolean) => {
+      pageHiddenRef.current = hidden;
+      battleSocketRef.current?.setHidden(hidden);
+      if (hidden) return;
+      // 回到前台：WS 通道补发心跳并即时重连；HTTP 兜底通道同步补发，并显式上报重连
+      void sendHeartbeatNow();
+      sendReconnect();
+    };
+    // AppState 在 Web 端同样由 document 可见性驱动（react-native-web 实现），两端统一走它
     const sub = AppState.addEventListener('change', (state) => {
-      if (state === 'active') sendReconnect();
+      applyVisibility(state !== 'active');
     });
-    return () => sub.remove();
-  }, [sendReconnect]);
+    // Web 额外兜底：bfcache 恢复/窗口重新聚焦时 visibilitychange 可能不触发，补两个事件源
+    const onResume = () => applyVisibility(false);
+    const win = Platform.OS === 'web' && typeof window !== 'undefined' ? window : null;
+    win?.addEventListener?.('focus', onResume);
+    win?.addEventListener?.('pageshow', onResume);
+    // 初始化：进入页面时按当前可见性对齐一次（后台标签页直接打开对局链接的场景）
+    applyVisibility(AppState.currentState !== 'active');
+    return () => {
+      sub?.remove();
+      win?.removeEventListener?.('focus', onResume);
+      win?.removeEventListener?.('pageshow', onResume);
+    };
+  }, [sendReconnect, sendHeartbeatNow]);
 
   // 检查房间状态（等待对手加入/准备）
   useFocusEffect(
@@ -446,19 +521,17 @@ export default function LanBattleScreen() {
       sendReconnect();
       const checkRoom = async () => {
         // 已主动退出：离开请求已发出，后续轮询的 404/成员缺失是退出竞态的必然结果，直接短路
-        if (intentionalExitRef.current) return;
+        // 会话已终结（房间已销毁/已被移出）：终态浮层已给出，无需继续轮询
+        if (intentionalExitRef.current || sessionGoneRef.current) return;
         try {
           const base = await getOnlineServerUrl();
           // 携带 playerId：服务端据此刷新成员活跃时间，等待清扫器不会把 HTTP 轮询活跃但 WS 异常的成员误踢
           const response = await fetch(`${base}/api/v1/lan/rooms/${roomId}?playerId=${encodeURIComponent(playerId)}`);
-          // 房间已被销毁（如本人无活跃连接被服务端清扫、房主离开致房间解散）：提示并退出
+          // 房间已被销毁（如本人无活跃连接被服务端清扫、房主离开致房间解散、断线判负后房间解散）：
+          // 切终态浮层并给出返回大厅入口
           // （响应返回时可能已主动退出——在途请求与退出动作的竞态，须再次检查退出标记）
           if (response.status === 404) {
-            if (!roomGoneAlertedRef.current && !intentionalExitRef.current) {
-              roomGoneAlertedRef.current = true;
-              // 经 exitToLobby 回大厅：有栈 back、无栈（Web 刷新）replace 兜底
-              Alert.alert('提示', '房间已关闭', [{ text: '确定', onPress: exitToLobby }]);
-            }
+            handleSessionGone('room-closed');
             return;
           }
           const data = await response.json();
@@ -502,13 +575,11 @@ export default function LanBattleScreen() {
               setOpponentPreference(null);
             }
             const me = room.players.find((p: any) => p.id === playerId);
-            // 等待阶段本人已不在成员列表：无活跃连接超时被服务端清扫（如切后台过久）→ 提示并退出
-            if (!me && room.phase === 'waiting' && phaseRef.current === 'waiting') {
-              if (!roomGoneAlertedRef.current && !intentionalExitRef.current) {
-                roomGoneAlertedRef.current = true;
-                // 经 exitToLobby 回大厅：有栈 back、无栈（Web 刷新）replace 兜底
-                Alert.alert('提示', '你已被移出房间（连接中断过久）', [{ text: '确定', onPress: exitToLobby }]);
-              }
+            // 本人已不在成员列表：等待阶段是无活跃连接超时被服务端清扫（如切后台过久），
+            // 对局中/结算阶段则是断线判负后房间自愈（服务端移出失联成员）——
+            // 两种情况都必须刷新 UI，否则前端会永远停在棋盘/结算页
+            if (!me) {
+              handleSessionGone(room.phase === 'waiting' && phaseRef.current === 'waiting' ? 'removed-idle' : 'removed');
               return;
             }
             // 等待阶段同步自己的准备/选边状态（对手离开会被服务端重置）
@@ -592,7 +663,7 @@ export default function LanBattleScreen() {
       checkRoom();
       const interval = setInterval(checkRoom, 2000);
       return () => clearInterval(interval);
-    }, [roomId, playerId, sendReconnect])
+    }, [roomId, playerId, sendReconnect, handleSessionGone])
   );
 
   // 统一处理服务端对局状态（HTTP 轮询响应与 WebSocket state 推送共用）
@@ -796,6 +867,8 @@ export default function LanBattleScreen() {
       }
       // 发现自己被标记断线（如切后台导致心跳超时）：本页面正存活接收状态，立即显式上报重连
       if (data.disconnectedPlayerId === playerId) {
+        // 记录「本端曾因断线被标记」：若后续房间被解散，终态文案据此显示为断线判负
+        selfDisconnectedRef.current = true;
         sendReconnect();
       }
 
@@ -837,14 +910,22 @@ export default function LanBattleScreen() {
         // WS 重连成功且 App 在前台：显式上报重连（后台自动重连不算，sendReconnect 内部有前台校验）
         if (connected) sendReconnect();
       },
+      // 服务端判定重连无意义（房间已销毁/本人已被移出房间）：立刻切终态 UI 并给出返回大厅入口。
+      // 该回执是断线判负后房间解散时本端唯一的权威信号，必须消费，否则页面会永远停在棋盘上。
+      onFatalError: message => {
+        setWsConnected(false);
+        handleSessionGone(message.includes('不在房间') ? 'removed' : 'room-closed');
+      },
     });
     battleSocketRef.current = socket;
+    // 同步当前可见性：后台标签页刷新/直接打开对局链接时，连接建立后首个心跳就要带 hidden=true
+    socket.setHidden(pageHiddenRef.current);
     socket.connect();
     return () => {
       battleSocketRef.current = null;
       socket.close();
     };
-  }, [roomId, playerId, sendReconnect]);
+  }, [roomId, playerId, sendReconnect, handleSessionGone]);
 
   // 对局中轮询游戏状态（WebSocket 兜底通道：仅在 WS 未连接时启用）
   useEffect(() => {
@@ -853,10 +934,17 @@ export default function LanBattleScreen() {
 
     const poll = async () => {
       if (pollInFlightRef.current) return; // 上一次轮询未返回则跳过，防止并发乱序
+      if (sessionGoneRef.current) return; // 房间已终结：停止无意义轮询
       pollInFlightRef.current = true;
       try {
         const base = await getOnlineServerUrl();
         const response = await fetch(`${base}/api/v1/lan/rooms/${roomId}/gameState`);
+        // 房间已销毁（断线判负后解散、房主离开等）：404/非 2xx 时 body 不是对局状态负载，
+        // 直接交给 applyServerState 会被静默忽略 → 前端停在棋盘上不刷新。此处显式切终态。
+        if (response.status === 404) {
+          handleSessionGone('room-closed');
+          return;
+        }
         const data = await response.json();
         applyServerStateRef.current(data);
       } catch (error) {
@@ -871,27 +959,19 @@ export default function LanBattleScreen() {
     return () => {
       if (pollRef.current) clearInterval(pollRef.current);
     };
-  }, [phase, roomId, wsConnected]);
+  }, [phase, roomId, wsConnected, handleSessionGone]);
 
-  // 心跳发送（对局中每5秒发送一次）
+  // 心跳发送（对局中每5秒发送一次；可见性变化时由上方可见性 effect 立即补发）
   useEffect(() => {
     if (phase !== 'playing') return;
 
-    const sendHeartbeat = async () => {
-      const base = await getOnlineServerUrl();
-      fetch(`${base}/api/v1/lan/rooms/${roomId}/heartbeat`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ playerId }),
-      }).catch((err: unknown) => console.error('心跳发送失败:', err));
-    };
-
-    sendHeartbeat(); // 立即发送一次
-    heartbeatRef.current = setInterval(sendHeartbeat, 5000);
+    void sendHeartbeatNow(); // 立即发送一次
+    heartbeatRef.current = setInterval(() => { void sendHeartbeatNow(); }, 5000);
     return () => {
       if (heartbeatRef.current) clearInterval(heartbeatRef.current);
+      heartbeatRef.current = null;
     };
-  }, [phase, roomId, playerId]);
+  }, [phase, sendHeartbeatNow]);
 
   // 断线等待倒计时
   useEffect(() => {
@@ -1214,11 +1294,10 @@ export default function LanBattleScreen() {
       if (!data?.success) {
         myReadyRef.current = !next;
         setMyReady(!next); // 两次均失败才回滚
-        // 成员身份类拒绝（已被移出房间/房间不存在）：提示并返回大厅，避免卡在页面反复失败
+        // 成员身份类拒绝（已被移出房间/房间不存在）：切终态 UI 并给出返回大厅入口
         const msg = typeof data?.message === 'string' ? data.message : '';
-        if ((msg.includes('不在房间') || msg.includes('房间不存在')) && !roomGoneAlertedRef.current) {
-          roomGoneAlertedRef.current = true;
-          Alert.alert('提示', '你已不在该房间，请重新加入', [{ text: '确定', onPress: exitToLobby }]);
+        if (msg.includes('不在房间') || msg.includes('房间不存在')) {
+          handleSessionGone(msg.includes('房间不存在') ? 'room-closed' : 'removed');
         }
         return;
       }
@@ -1924,6 +2003,7 @@ export default function LanBattleScreen() {
     setSidePickResultMode(false);
     seenHistoryLenRef.current = 0;
     pendingSyncRef.current = null; // 清除走子乐观更新保护基线
+    selfDisconnectedRef.current = false; // 新一局重新计算断线状态（避免沿用上一局的断线判负文案）
     replaySavedRef.current = false; // 重新对局允许再次自动保存复盘
     // 求和协商状态重置
     drawPendingRef.current = false;
@@ -1961,11 +2041,10 @@ export default function LanBattleScreen() {
       const data = await response.json();
       if (!data.success) {
         console.error('重新对局被服务端拒绝:', data);
-        // 成员身份类拒绝（已被移出房间/房间不存在）：提示并返回大厅，避免卡在结算页
+        // 成员身份类拒绝（已被移出房间/房间不存在）：切终态 UI，避免卡在结算页点了没反应
         const msg = typeof data?.message === 'string' ? data.message : '';
-        if ((msg.includes('不在房间') || msg.includes('房间不存在')) && !roomGoneAlertedRef.current) {
-          roomGoneAlertedRef.current = true;
-          Alert.alert('提示', '你已不在该房间，请重新加入', [{ text: '确定', onPress: exitToLobby }]);
+        if (msg.includes('不在房间') || msg.includes('房间不存在')) {
+          handleSessionGone(msg.includes('房间不存在') ? 'room-closed' : 'removed');
         }
         return;
       }
@@ -2362,6 +2441,21 @@ export default function LanBattleScreen() {
               onPlayAgain={handleRematch}
               onGoHome={handleBack}
             />
+          )}
+
+          {/* 会话终结浮层：房间已销毁 / 本人已被移出 / 断线判负后房间解散。
+              服务端已无该房间（404 或成员列表无本人），结算数据不可再获取，
+              因此只给可见的终态说明 + 返回大厅入口，杜绝「房间没了但 UI 还停在棋盘」。 */}
+          {sessionGone && (
+            <View style={styles.overlay}>
+              <View style={styles.disconnectCard}>
+                <Text style={styles.disconnectTitle}>{sessionGone.title}</Text>
+                <Text style={styles.disconnectHint}>{sessionGone.hint}</Text>
+                <TouchableOpacity style={styles.sessionGoneButton} onPress={handleBack} activeOpacity={0.85}>
+                  <Text style={styles.sessionGoneButtonText}>返回大厅</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
           )}
           </View>
         </View>
@@ -3105,6 +3199,19 @@ const styles = StyleSheet.create({
   disconnectSubHint: {
     fontSize: 13,
     color: COLORS.textLight,
+  },
+  // 会话终结卡片（房间已销毁/已被移出/断线判负）的主操作按钮
+  sessionGoneButton: {
+    marginTop: 8,
+    paddingHorizontal: 32,
+    paddingVertical: 12,
+    borderRadius: 999,
+    backgroundColor: COLORS.primary,
+  },
+  sessionGoneButtonText: {
+    fontSize: 16,
+    fontWeight: 'bold',
+    color: '#FFFFFF',
   },
   // 棋盘
   // 标题行下方内容宿主：被吃棋子抽屉（绝对定位）锚定于此容器顶部

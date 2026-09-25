@@ -26528,6 +26528,22 @@ router.use((req, _res, next) => {
 });
 var DISCONNECT_TIMEOUT = 6e4;
 var HEARTBEAT_TIMEOUT = 1e4;
+// 后台标签页保护：浏览器会节流隐藏页面的定时器（Chrome 最长约 1 分钟触发一次，甚至冻结页面），
+// 若仍按 HEARTBEAT_TIMEOUT 判定连接死活，切后台即被误判为断线并最终判负。
+// 客户端在心跳中上报 hidden 标记：只要最近仍有心跳且连续后台时长未超上限，就暂不判定断线。
+// 后台心跳宽容窗口（覆盖分钟级节流；超过则视为真失联）
+var HIDDEN_HEARTBEAT_GRACE = 9e4;
+// 单次连续后台的保护上限（超过后恢复常规判负，避免对局被无限挂起）
+var HIDDEN_MAX_DURATION = 18e4;
+// 后台连接的 WS 空闲上限（避免被 30s 空闲清扫提前断开）
+var HIDDEN_SOCKET_IDLE_TIMEOUT = 9e4;
+// 后台标签页宽容判定：客户端处于后台（hidden）、最近仍有心跳、且连续后台时长未超上限时，
+// 不把该玩家判定为断线（浏览器定时器节流导致心跳间隔被拉长是正常现象，而非真断线）。
+function isHiddenTolerated(player, now) {
+  if (!player || !player.hidden) return false;
+  if (!player.hiddenSince || now - player.hiddenSince > HIDDEN_MAX_DURATION) return false;
+  return now - (player.lastHeartbeat || 0) <= HIDDEN_HEARTBEAT_GRACE;
+}
 var UNDO_REQUEST_TTL = 3e4;
 var UNDO_RESULT_TTL = 15e3;
 var MAX_NEGOTIATION_REFUSALS = 2;
@@ -26646,6 +26662,19 @@ function detectDisconnect(room) {
   let changed = false;
   const now = Date.now();
   for (const player of room.players) {
+    // 后台标签页（浏览器节流心跳）在保护窗口内不判定断线；若已被标记则立即撤销等待
+    if (isHiddenTolerated(player, now)) {
+      if (!player.connected) {
+        player.connected = true;
+        changed = true;
+      }
+      if (room.disconnectedPlayerId === player.id) {
+        room.disconnectedPlayerId = null;
+        room.disconnectTime = null;
+        changed = true;
+      }
+      continue;
+    }
     if (now - player.lastHeartbeat > HEARTBEAT_TIMEOUT && player.connected) {
       player.connected = false;
       changed = true;
@@ -26655,9 +26684,20 @@ function detectDisconnect(room) {
       }
     }
   }
-  if (room.disconnectedPlayerId && room.disconnectTime && now - room.disconnectTime > DISCONNECT_TIMEOUT) {
+  if (room.disconnectedPlayerId && room.disconnectTime) {
     const disconnectedPlayer = room.players.find((p) => p.id === room.disconnectedPlayerId);
-    if (disconnectedPlayer) {
+    if (!disconnectedPlayer) {
+      // 断线成员已不在房间（被移出/房间自愈）：等待状态无意义，直接清空
+      room.disconnectedPlayerId = null;
+      room.disconnectTime = null;
+      changed = true;
+    } else if (disconnectedPlayer.connected || isHiddenTolerated(disconnectedPlayer, now)) {
+      // 玩家已回到对局（心跳/WS 重连恢复）：撤销断线等待。
+      // 否则 disconnectTime 仍是旧值，60s 后即使玩家一直在线也会被按旧计时判负。
+      room.disconnectedPlayerId = null;
+      room.disconnectTime = null;
+      changed = true;
+    } else if (now - room.disconnectTime > DISCONNECT_TIMEOUT) {
       room.winner = disconnectedPlayer.side === "red" ? "black" : "red";
       room.endReason = "disconnect";
       room.phase = "ended";
@@ -26794,7 +26834,7 @@ function healStaleEndedRoom(room) {
   }
   if (now - since < ENDED_STALE_GRACE_MS) return false;
   const active = room.players.filter(
-    (p) => socketLivenessProbe(room.id, p.id) || now - p.lastWsAt <= ENDED_STALE_GRACE_MS
+    (p) => socketLivenessProbe(room.id, p.id) || now - p.lastWsAt <= ENDED_STALE_GRACE_MS || isHiddenTolerated(p, now)
   );
   if (active.length > 1) return false;
   const activeIds = new Set(active.map((p) => p.id));
@@ -27754,16 +27794,31 @@ router.post("/rooms/:roomId/emoji", (req, res) => {
   respondAction(res, req.params.roomId, actEmoji(req.params.roomId, req.body));
 });
 function actHeartbeat(roomId, body) {
-  const { playerId } = body;
+  const { playerId, hidden } = body;
   const room = rooms.get(roomId);
   if (!room) {
     return { status: 404, body: { error: "\u623F\u95F4\u4E0D\u5B58\u5728" } };
   }
   const player = room.players.find((p) => p.id === playerId);
   if (player) {
-    player.lastHeartbeat = Date.now();
+    const now = Date.now();
+    player.lastHeartbeat = now;
+    // 可见性上报：后台标签页（浏览器节流定时器）由服务端宽容判定，避免切后台被误判断线。
+    // hiddenSince 只在「进入后台」的那一刻记录，用于限制单次连续后台的保护时长。
+    if (hidden === true) {
+      if (!player.hidden) player.hiddenSince = now;
+      player.hidden = true;
+    } else if (hidden === false) {
+      player.hidden = false;
+      player.hiddenSince = 0;
+    }
     if (!player.connected) {
       player.connected = true;
+    }
+    // 心跳恢复即视为回到对局：撤销断线等待，避免「已上线却仍按旧计时判负」
+    if (room.disconnectedPlayerId === playerId) {
+      room.disconnectedPlayerId = null;
+      room.disconnectTime = null;
     }
   }
   room.lastActivity = Date.now();
@@ -27785,6 +27840,9 @@ router.post("/rooms/:roomId/reconnect", (req, res) => {
   }
   player.connected = true;
   player.lastHeartbeat = Date.now();
+  // 显式重连即代表玩家回到前台对局：清除后台标记，恢复正常判定
+  player.hidden = false;
+  player.hiddenSince = 0;
   if (room.disconnectedPlayerId === playerId) {
     room.disconnectedPlayerId = null;
     room.disconnectTime = null;
@@ -28428,6 +28486,9 @@ function handleDisconnect(ws) {
   if (playerHasActiveSocket(roomId, playerId, ws)) return;
   const player = room.players.find((p) => p.id === playerId);
   if (player && player.connected) {
+    // 后台标签页的连接被节流/回收不代表玩家离开：保护窗口内不标记断线、不启动判负倒计时，
+    // 连接会在客户端回到前台时自愈（重连 + 显式 reconnect），保护窗口结束后仍按常规判负
+    if (isHiddenTolerated(player, Date.now())) return;
     player.connected = false;
     if (room.phase === "playing" && room.disconnectedPlayerId !== playerId) {
       room.disconnectedPlayerId = playerId;
@@ -28454,6 +28515,8 @@ function handleMessage(ws, raw) {
   const type = typeof msg.type === "string" ? msg.type : "";
   const reqId = msg.reqId;
   if (type === "heartbeat") {
+    // 记录本条连接的可见性：后台标签页的连接不应被 30s 空闲清扫提前回收
+    if (typeof msg.hidden === "boolean") meta.hidden = msg.hidden;
     if (role === "spectator") {
       if (spectatorId) {
         pruneSpectators(room);
@@ -28461,7 +28524,7 @@ function handleMessage(ws, raw) {
         if (existing) existing.lastSeen = Date.now();
       }
     } else {
-      actHeartbeat(roomId, { playerId });
+      actHeartbeat(roomId, { playerId, hidden: typeof msg.hidden === "boolean" ? msg.hidden : undefined });
     }
     return;
   }
@@ -28588,6 +28651,9 @@ function attachBattleWebSocket(server2) {
       player.connected = true;
       player.lastHeartbeat = Date.now();
       player.lastWsAt = Date.now();
+      // 新连接建立：清掉上一次的后台标记（随后客户端心跳会按真实可见性重新上报）
+      player.hidden = false;
+      player.hiddenSince = 0;
       room.lastActivity = Date.now();
       sendJson(ws, { type: "welcome", data: buildGameStatePayload(room) });
       broadcastRoom(room);
@@ -28610,7 +28676,9 @@ function attachBattleWebSocket(server2) {
           socks.delete(ws);
           continue;
         }
-        if (now - meta.lastActivity > SOCKET_IDLE_TIMEOUT) {
+        // 后台标签页的连接没有活跃消息不代表离线：放宽空闲上限，避免切后台即被清扫断开（进而误判断线）
+        const idleLimit = meta.hidden ? HIDDEN_SOCKET_IDLE_TIMEOUT : SOCKET_IDLE_TIMEOUT;
+        if (now - meta.lastActivity > idleLimit) {
           try {
             ws.terminate();
           } catch {
