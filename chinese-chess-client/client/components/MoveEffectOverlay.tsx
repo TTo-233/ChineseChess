@@ -56,7 +56,8 @@ interface KindConfig {
 
 const KIND_CONFIG: Record<MoveEffectKind, KindConfig> = {
   capture: {
-    sizeRatio: 0.32,
+    // 特效宽度 = 棋盘宽度 × 40%（高度按素材宽高比等比换算）
+    sizeRatio: 0.40,
     aspect: CAPTURE_ASPECT,
     peakOpacity: 1,
     fadeInMs: 160,
@@ -65,7 +66,8 @@ const KIND_CONFIG: Record<MoveEffectKind, KindConfig> = {
     fadeOutMs: 300,
   },
   check: {
-    sizeRatio: 0.32,
+    // 特效宽度 = 棋盘宽度 × 40%（高度按素材宽高比等比换算）
+    sizeRatio: 0.40,
     aspect: CHECK_ASPECT,
     peakOpacity: 1,
     fadeInMs: 190,
