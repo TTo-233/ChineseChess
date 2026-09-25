@@ -22,6 +22,7 @@ import { useSafeRouter, useSafeSearchParams } from '@/hooks/useSafeRouter';
 import { useFocusEffect } from 'expo-router';
 import { FontAwesome6 } from '@expo/vector-icons';
 import { createInitialState, applyHandicap, cloneGameState, getValidMoves, makeMove, undoMove, getWinnerSideTag, type GameState } from '@/utils/chess/GameEngine';
+import { isMoveBanned } from '@/utils/chess/RuleEngine';
 import { HandicapBoard } from '@/components/HandicapBoard';
 import { RED_SIDE, BLACK_SIDE } from '@/utils/chess/types';
 import ChessBoard, { CapturedPiecesDrawer } from '@/components/ChessBoard';
@@ -1317,6 +1318,18 @@ export default function LanBattleScreen() {
       return;
     }
 
+    // 长将长捉禁着拦截（方案 10.3：禁着期间客户端不得提交禁着）：
+    // 客户端拦截为主，服务端二次校验兜底（绕过客户端直接提交禁着时由服务端计数判负）
+    if (isMoveBanned(gameState, selectedPieceId, toCol, toRow)) {
+      const rs = gameState.ruleState!;
+      const banLabel = rs.banReason === 'LONG_CHECK' ? '长将'
+        : rs.banReason === 'LONG_CHASE' ? '长捉' : '将捉';
+      setSelectedPieceId(null);
+      setValidMoves(null);
+      Alert.alert('禁着提示', `${banLabel}禁着，请变招（连续坚持禁着 3 次将判负）`);
+      return;
+    }
+
     const result = makeMove(gameState, selectedPieceId, toCol, toRow);
 
     // 吃子/将军特效（终局时不播，由绝杀特效接管）
@@ -1343,7 +1356,16 @@ export default function LanBattleScreen() {
       toRow,
     });
 
-    // 检查是否绝杀/困毙/重复局面裁决（长将判负/长捉判负/不变作和）/将帅被吃
+    // 规则提示（接近阈值"请尽快变招"等，方案 10.3 / 12）
+    if (result.newState.ruleState?.notice) {
+      Alert.alert('规则提示', result.newState.ruleState.notice);
+    }
+
+    // 服务端权威走子上报（方案 0.2.5 / P0）：只发着法，服务端以同一规则引擎
+    // 裁决（含长将长捉判定与终局）；本地结果为乐观展示，随后被服务端广播覆盖
+    sendPlayerMove({ pieceId: selectedPieceId, toCol, toRow });
+
+    // 检查是否绝杀/困毙/长将长捉规则终局/将帅被吃（本地乐观结算，服务端广播为准）
     if (result.isGameOver) {
       const isDraw = result.newState.gameStatus === 'draw';
       setJueShaVisible(true);
@@ -1351,8 +1373,6 @@ export default function LanBattleScreen() {
       // 绝杀/困毙 → 播放绝杀特效；长将/长捉判负、和棋等规则终局 → 仅文字结算
       setGameEndReason(isDraw ? 'draw' : 'checkmate');
       if (isDraw) {
-        // 双方不变作和：无胜负方，同步 'draw'
-        syncGameState(result.newState, true, 'draw');
         setGameResult({
           winner: null,
           isWin: false,
@@ -1366,8 +1386,6 @@ export default function LanBattleScreen() {
         // 引擎判定真实胜方（长将/长捉判负时走棋方可能为败方，不能默认走棋方获胜）
         const winnerSide: 'red' | 'black' = getWinnerSideTag(result.newState) === RED_SIDE ? 'red' : 'black';
         const isWin = winnerSide === mySide;
-        // 同步到服务器（含游戏结束信息）
-        syncGameState(result.newState, true, winnerSide);
         setGameResult({
           winner: winnerSide,
           isWin,
@@ -1378,9 +1396,6 @@ export default function LanBattleScreen() {
         });
       }
       setPhase('ended');
-    } else {
-      // 同步到服务器
-      syncGameState(result.newState);
     }
     // 重置限时计时器
     // eslint-disable-next-line react-hooks/purity -- 事件回调中重置计时起点
@@ -1388,7 +1403,25 @@ export default function LanBattleScreen() {
     setTurnTimeLeft(turnTimeLimit);
   };
 
-  // 同步游戏状态
+  // 服务端权威走子上报（方案 P0「服务端权威裁决」）：只发着法，
+  // 服务端负责校验（轮次/合法/禁着）并以同一规则引擎 makeMove 裁决与广播
+  const sendPlayerMove = async (move: { pieceId: number; toCol: number; toRow: number }) => {
+    // 优先走 WebSocket 实时通道；未连接时回退 HTTP
+    const sentViaWs = battleSocketRef.current?.send('move', { move }) ?? false;
+    if (sentViaWs) return;
+    try {
+      const base = await getOnlineServerUrl();
+      await fetch(`${base}/api/v1/lan/rooms/${roomId}/gameState`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ playerId, move }),
+      });
+    } catch (error) {
+      console.error('上传走子失败:', error);
+    }
+  };
+
+  // 同步游戏状态（初始局面上传专用：走子走 sendPlayerMove）
   const syncGameState = async (state: GameState, gameOver?: boolean, winner?: string) => {
     // 优先走 WebSocket 实时通道；未连接时回退 HTTP
     const sentViaWs = battleSocketRef.current?.send('move', { gameState: state, gameOver, winner }) ?? false;
@@ -1410,7 +1443,7 @@ export default function LanBattleScreen() {
     if (!gameState) return;
 
     const mySideTag = sideStringToTag(mySide);
-    // 收集所有己方棋子的合法走法
+    // 收集所有己方棋子的合法走法（排除长将长捉禁着，方案 10.3）
     const allMoves: { pieceId: number; col: number; row: number }[] = [];
     for (const piece of gameState.pieces) {
       if (!piece.alive) continue;
@@ -1420,7 +1453,7 @@ export default function LanBattleScreen() {
       const moves = getValidMoves(gameState, piece.id);
       for (let c = 0; c < 9; c++) {
         for (let r = 0; r < 10; r++) {
-          if (moves[c]?.[r]) {
+          if (moves[c]?.[r] && !isMoveBanned(gameState, piece.id, c, r)) {
             allMoves.push({ pieceId: piece.id, col: c, row: r });
           }
         }
@@ -1459,14 +1492,16 @@ export default function LanBattleScreen() {
       toRow: randomMove.row,
     });
 
-    // 检查是否绝杀/困毙/重复局面裁决（长将判负/长捉判负/不变作和）/将帅被吃
+    // 服务端权威走子上报（同手动走棋）
+    sendPlayerMove({ pieceId: randomMove.pieceId, toCol: randomMove.col, toRow: randomMove.row });
+
+    // 检查是否绝杀/困毙/长将长捉规则终局/将帅被吃（本地乐观结算，服务端广播为准）
     if (result.isGameOver) {
       const isDraw = result.newState.gameStatus === 'draw';
       setJueShaVisible(true);
       setGameOverReason(result.gameOverReason);
       setGameEndReason(isDraw ? 'draw' : 'checkmate');
       if (isDraw) {
-        syncGameState(result.newState, true, 'draw');
         setGameResult({
           winner: null,
           isWin: false,
@@ -1479,7 +1514,6 @@ export default function LanBattleScreen() {
         // 引擎判定真实胜方（长将/长捉判负时走棋方为败方）
         const winnerSide: 'red' | 'black' = getWinnerSideTag(result.newState) === RED_SIDE ? 'red' : 'black';
         const isWin = winnerSide === mySide;
-        syncGameState(result.newState, true, winnerSide);
         setGameResult({
           winner: winnerSide,
           isWin,
@@ -1489,8 +1523,6 @@ export default function LanBattleScreen() {
         });
       }
       setPhase('ended');
-    } else {
-      syncGameState(result.newState);
     }
     lastMoveTimeRef.current = Date.now();
     setTurnTimeLeft(turnTimeLimit);
@@ -2159,6 +2191,13 @@ export default function LanBattleScreen() {
               maxBoardHeight={maxBoardHeight}
               capturedStripOffset={30}
               moveEffect={moveEffect}
+              banMoves={
+                gameState?.ruleState?.banActive &&
+                gameState.ruleState.banSide === sideStringToTag(mySide) &&
+                gameState.sideTag === sideStringToTag(mySide)
+                  ? gameState.ruleState.banMoves
+                  : null
+              }
               onBoardLayout={setBoardSize}
               ghostPieces={ghostPieces}
             />
@@ -2292,12 +2331,19 @@ export default function LanBattleScreen() {
                 gameEndReason === 'checkmate' &&
                 gameOverReason !== 'changjiang' &&
                 gameOverReason !== 'changzhuo' &&
-                gameOverReason !== 'repetition'
+                gameResult?.isDraw !== true
               }
               resultText={
                 gameResult
                   ? gameResult.isDraw
-                    ? '和棋'
+                    ? (
+                      gameOverReason === 'mutual_long_check' ? '双方长将，判和！'
+                      : gameOverReason === 'mutual_long_chase' ? '双方长捉，判和！'
+                      : gameOverReason === 'natural_limit' ? '自然限招，判和！'
+                      : gameOverReason === 'total_limit' ? '达到总步数上限，判和！'
+                      : gameOverReason === 'no_attacking' ? '双方无进攻子力，判和！'
+                      : '双方不变，和棋！'
+                    )
                     : gameOverReason === 'changjiang'
                       ? (gameResult.isWin ? '对手长将判负，你获胜！' : '你方长将判负')
                       : gameOverReason === 'changzhuo'

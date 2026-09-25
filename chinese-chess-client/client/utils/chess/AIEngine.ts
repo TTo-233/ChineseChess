@@ -15,6 +15,7 @@
 import { type GameState, type PieceState } from './GameEngine';
 import { getPathPoints } from './MoveCheck';
 import { RED_SIDE, BLACK_SIDE, type SideTag, type MoveRecord } from './types';
+import { isMoveBanned } from './RuleEngine';
 
 // ======================== 棋子价值 ========================
 
@@ -904,8 +905,17 @@ async function searchWithTimeBudget(
   yieldIntervalMs = 0
 ): Promise<AIMoveResult | null> {
   const isMaximizing = state.sideTag === RED_SIDE;
-  const moves = generatePseudoMoves(state);
+  let moves = generatePseudoMoves(state);
   if (moves.length === 0) return null;
+
+  // 长将长捉禁着过滤（方案 10.3：禁着期间不得提交禁着）：
+  // 当前走棋方为被禁方时，根节点直接剔除一切禁着着法（将军着/捉目标着/将捉组合着）
+  if (state.ruleState?.banActive && state.ruleState.banSide === state.sideTag) {
+    const legal = moves.filter(m => !isMoveBanned(state, m.pieceId, m.toCol, m.toRow));
+    // 全部着法被禁在规则上不可达（引擎 banMoves 仅覆盖将/捉着，必有变招着存在）；
+    // 防御性兜底：若过滤后为空则退回原列表（由校验层兜底）
+    if (legal.length > 0) moves = legal;
+  }
 
   const startTime = Date.now();
   searchDeadline = startTime + timeBudget;

@@ -60,6 +60,85 @@ export interface MoveRecord {
   capturedPieceId: number; // -1 表示没有吃子
 }
 
+// 棋子运行时状态
+export interface PieceState {
+  id: number;
+  col: number;
+  row: number;
+  alive: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// 长将长捉规则状态类型（定义于 types 以避免 GameEngine <-> RuleEngine 循环依赖，
+// 实现见 utils/chess/RuleEngine.ts，规则见《象棋长将长捉规则开发方案》）
+// ---------------------------------------------------------------------------
+export type BanReason = 'LONG_CHECK' | 'LONG_CHASE' | 'CHECK_CHASE';
+
+export interface BanMove {
+  pieceId: number;
+  fromCol: number;
+  fromRow: number;
+  toCol: number;
+  toRow: number;
+  reason: BanReason;
+}
+
+/** 单方计数器（按方维护以支持互相长将/长捉判和） */
+export interface SideRuleCounters {
+  /** 该方连续将军着数 */
+  jiangCount: number;
+  /** 参与连续将军的棋子（去重），用于确定阈值档位（1/2/3+ 子） */
+  jiangPieceIds: number[];
+  /** 该方连续捉对方各子的次数（key=被捉子 pieceId，字符串以兼容 JSON 序列化） */
+  zhuoCounts: Record<string, number>;
+  /** 该方连续将/捉着法数（将捉交替循环） */
+  jiangZhuoLoop: number;
+  /** 参与将捉交替的棋子（去重） */
+  jiangZhuoPieceIds: number[];
+  /** 该方连续将军期间对方是否还过将（二将一还检测） */
+  opponentCheckedDuringRun: boolean;
+}
+
+export interface RuleState {
+  red: SideRuleCounters;
+  black: SideRuleCounters;
+  /** 历史局面指纹（含初始局面，走完每步 push），用于非将非捉重复判和 */
+  positionKeys: string[];
+  /** 自最后一次吃子起双方累计着数（自然限招） */
+  naturalMoveCounter: number;
+  /** 自然限招窗口内将军累计着数 */
+  checkCounterInWindow: number;
+  /** 禁着是否激活 */
+  banActive: boolean;
+  /** 被禁着方（下一次走子受限的一方） */
+  banSide: SideTag | null;
+  banReason: BanReason | null;
+  /** 长捉禁着的目标子（触发阈值时被连续捉的子） */
+  banChaseTargets: number[];
+  /** 禁着列表（仅对 banSide 的下一手有效，随状态下发） */
+  banMoves: BanMove[];
+  /** 双方坚持禁着的连续违规次数（3 次判负/双方均满判和） */
+  banViolations: Record<string, number>;
+  /** 本步产生的提示文案（接近阈值/达到阈值） */
+  notice: string | null;
+  /** 提示去重键（如 'red-jiang-5'），UI 据此避免重复弹出 */
+  noticeKey: string | null;
+}
+
+// 游戏状态
+export interface GameState {
+  qiPan: number[][]; // 9x10, -1 表示空位
+  pieces: PieceState[]; // 32 个棋子状态
+  sideTag: SideTag; // 当前走棋方
+  moveHistory: MoveRecord[];
+  gameStatus: GameStatus;
+  isCheck: boolean; // 当前是否被将军
+  checkMessage: string;
+  zobristHash: number; // Zobrist 哈希值（用于重复局面检测）
+  /** 长将长捉规则状态（计数器/禁着列表），随状态序列化；makeMove 首步惰性初始化 */
+  ruleState?: RuleState;
+}
+
 // 游戏状态
 export type GameStatus = 'playing' | 'red_win' | 'black_win' | 'draw';
 

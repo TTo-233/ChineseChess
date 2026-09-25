@@ -26512,6 +26512,9 @@ import http from "http";
 
 // src/routes/lanGame.ts
 var import_express = __toESM(require_express2(), 1);
+// 长将长捉规则引擎（服务端权威裁决，方案 P0）：与客户端共享同一份源码，
+// 由 client/utils/chess/ruleEngine.bundle.ts 经 esbuild 编译为 ../ruleEngine.cjs
+var ruleEngine = require("../ruleEngine.cjs");
 var router = import_express.default.Router();
 router.use((req, _res, next) => {
   const match = req.path.match(/^\/rooms\/([^/]+)/);
@@ -27332,11 +27335,81 @@ router.post("/rooms/:roomId/start", (req, res) => {
   respondAction(res, req.params.roomId, actStart(req.params.roomId, req.body));
 });
 function actMove(roomId, body) {
-  const { gameState, gameOver, winner } = body;
   const room = rooms.get(roomId);
   if (!room) {
     return { status: 404, body: { error: "\u623F\u95F4\u4E0D\u5B58\u5728" } };
   }
+  // ---- \u65B0\u534F\u8BAE\uFF1A\u670D\u52A1\u7AEF\u6743\u5A01\u8D70\u5B50\u88C1\u51B3\uFF08\u65B9\u6848 P0\uFF0C\u5BA2\u6237\u7AEF\u53EA\u53D1\u7740\u6CD5 {playerId, move}\uFF09 ----
+  if (body && body.move && typeof body.move === "object") {
+    const { playerId, move } = body;
+    if (room.phase !== "playing" || !room.gameState) {
+      return { status: 400, body: { success: false, message: "\u5BF9\u5C40\u672A\u5728\u8FDB\u884C\u4E2D" } };
+    }
+    const player = room.players.find((p) => p.id === playerId);
+    if (!player || !player.side) {
+      return { status: 400, body: { success: false, message: "\u73A9\u5BB6\u4E0D\u5728\u623F\u95F4\u4E2D\u6216\u672A\u5206\u914D\u9635\u8425" } };
+    }
+    const mySide = player.side;
+    const state = room.gameState;
+    const stateSideIsRed = state.sideTag === true || state.sideTag === "red";
+    if (stateSideIsRed !== (mySide === "red")) {
+      return { status: 400, body: { success: false, message: "\u4E0D\u662F\u4F60\u7684\u56DE\u5408" } };
+    }
+    const { pieceId, toCol, toRow } = move;
+    if (!Number.isInteger(pieceId) || !Number.isInteger(toCol) || !Number.isInteger(toRow)) {
+      return { status: 400, body: { success: false, message: "\u7740\u6CD5\u683C\u5F0F\u9519\u8BEF" } };
+    }
+    // \u8D70\u6CD5\u5408\u6CD5\u6027\u6821\u9A8C\uFF08\u542B\u738B\u5B89\u5168\u8FC7\u6EE4\uFF09\uFF0C\u675C\u7EDD\u5BA2\u6237\u7AEF\u4F2A\u9020\u7740\u6CD5
+    const valid = ruleEngine.getValidMoves(state, pieceId);
+    if (!valid[toCol] || !valid[toCol][toRow]) {
+      return { status: 400, body: { success: false, message: "\u975E\u6CD5\u8D70\u6CD5" } };
+    }
+    // \u957F\u5C06\u957F\u6349\u7981\u7740\u4E8C\u6B21\u6821\u9A8C\uFF08\u65B9\u6848 10.3\uFF09\uFF1A\u8FDE\u7EED 3 \u6B21\u575A\u6301\u7981\u7740\u81EA\u52A8\u5224\u8D1F\uFF08\u65B9\u6848 10.1\uFF09
+    if (ruleEngine.isMoveBanned(state, pieceId, toCol, toRow)) {
+      const rs = state.ruleState;
+      if (rs) {
+        const verdict = ruleEngine.recordBanViolation(rs, stateSideIsRed);
+        if (verdict === "lose" || verdict === "draw") {
+          room.phase = "ended";
+          if (verdict === "draw") {
+            room.winner = null;
+            room.endReason = "draw";
+          } else {
+            room.winner = mySide === "red" ? "black" : "red";
+            room.endReason = "checkmate";
+          }
+          return { status: 200, body: { success: false, gameOver: true, violation: verdict } };
+        }
+      }
+      const violationCount = rs?.banViolations?.[mySide] ?? 0;
+      return { status: 400, body: { success: false, message: "\u7981\u7740\uFF0C\u8BF7\u53D8\u62DB", violations: violationCount } };
+    }
+    // \u670D\u52A1\u7AEF\u6743\u5A01\u88C1\u51B3\uFF1A\u4E0E\u5BA2\u6237\u7AEF\u540C\u4E00\u89C4\u5219\u5F15\u64CE\u6267\u884C\u8D70\u5B50\uFF08\u542B\u957F\u5C06\u957F\u6349\u5224\u5B9A\u4E0E\u7EC8\u5C40\uFF09
+    const result = ruleEngine.makeMove(state, pieceId, toCol, toRow);
+    if (room.clocks && room.lastMoveTime) {
+      const elapsed = (room.clockPausedAt ?? Date.now()) - room.lastMoveTime;
+      room.clocks[mySide] = Math.max(0, room.clocks[mySide] - elapsed) + room.settings.incrementSeconds * 1e3;
+    }
+    room.gameState = result.newState;
+    room.lastMoveTime = Date.now();
+    room.clockPausedAt = null;
+    room.lastActivity = Date.now();
+    room.pendingUndo = null;
+    room.pendingDraw = null;
+    if (result.isGameOver) {
+      room.phase = "ended";
+      if (result.newState.gameStatus === "draw") {
+        room.winner = null;
+        room.endReason = "draw";
+      } else {
+        room.winner = result.newState.gameStatus === "red_win" ? "red" : "black";
+        room.endReason = "checkmate";
+      }
+    }
+    return { status: 200, body: { success: true } };
+  }
+  // ---- \u65E7\u534F\u8BAE\uFF08\u521D\u59CB\u5C40\u9762\u4E0A\u4F20/\u517C\u5BB9\uFF09\uFF1A\u5BA2\u6237\u7AEF\u4E0A\u4F20\u5B8C\u6574\u72B6\u6001\uFF0C\u76F4\u63A5\u5B58\u50A8 ----
+  const { gameState, gameOver, winner } = body;
   const prevMoveCount = Array.isArray(room.gameState?.moveHistory) ? room.gameState.moveHistory.length : 0;
   const nextMoveCount = Array.isArray(gameState?.moveHistory) ? gameState.moveHistory.length : 0;
   if (room.clocks && nextMoveCount > prevMoveCount && room.lastMoveTime) {
@@ -28408,7 +28481,14 @@ function handleMessage(ws, raw) {
       result = actStart(roomId, { playerId });
       break;
     case "move":
-      result = actMove(roomId, { gameState: msg.gameState, gameOver: msg.gameOver, winner: msg.winner });
+      // \u65B0\u534F\u8BAE\uFF08\u53D1\u7740\u6CD5\uFF0C\u670D\u52A1\u7AEF\u6743\u5A01\u88C1\u51B3\uFF09\u4E0E\u65E7\u534F\u8BAE\uFF08\u5B8C\u6574\u72B6\u6001\uFF0C\u521D\u59CB\u5C40\u9762\u4E0A\u4F20\uFF09\u53CC\u517C
+      result = actMove(roomId, {
+        playerId,
+        move: msg.move,
+        gameState: msg.gameState,
+        gameOver: msg.gameOver,
+        winner: msg.winner,
+      });
       break;
     case "surrender":
       result = actSurrender(roomId, { playerId });

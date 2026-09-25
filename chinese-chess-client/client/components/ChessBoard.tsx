@@ -22,7 +22,7 @@ import { useBoardStyle } from '@/utils/chess/boardStyleStore';
 import { gridSpacingX, gridSpacingY } from '@/utils/chess/boardStyles';
 import { RED_SIDE, BLACK_SIDE } from '@/utils/chess/types';
 import MoveEffectOverlay, { type MoveEffect } from '@/components/MoveEffectOverlay';
-import Svg, { Circle } from 'react-native-svg';
+import Svg, { Circle, Line } from 'react-native-svg';
 
 interface ChessBoardProps {
   gameState: GameState;
@@ -52,6 +52,9 @@ interface ChessBoardProps {
   capturedStripOffset?: number;
   /** 吃子/将军特效（seq 变化时重播），null/不传表示无特效 */
   moveEffect?: MoveEffect | null;
+  /** 长将长捉禁着列表（方案 10.1）：被禁方的禁着落点以红色禁止标记高亮，
+   *  仅供当前走子方为被禁方时传入；null/不传表示无禁着 */
+  banMoves?: { pieceId: number; toCol: number; toRow: number }[] | null;
   /** 棋盘容器实际渲染尺寸（缩放后的宽/高）回调：供父级做浮层对齐（如绝杀特效锁定棋盘中心）。
    *  注意：外层容器宽度恒为屏宽，此回调返回的才是棋盘本体的真实宽度。 */
   onBoardLayout?: (size: { width: number; height: number }) => void;
@@ -222,6 +225,7 @@ export default function ChessBoard({
   maxBoardHeight,
   capturedStripOffset = 0,
   moveEffect = null,
+  banMoves = null,
   onBoardLayout,
 }: ChessBoardProps) {
   const screenWidth = Dimensions.get('window').width;
@@ -597,6 +601,55 @@ export default function ChessBoard({
     ];
   }, [hintMove, gameState.pieces, getPos, pieceSize, unitScale]);
 
+  // 渲染长将长捉禁着标记（方案 10.1「棋盘上高亮被禁止的着法」）：
+  // 被禁着落点绘制红色禁止符号（圆环 + 对角斜杠），与提示落点同样不拦截触摸
+  const banMarkers = useMemo(() => {
+    if (!banMoves || banMoves.length === 0) return null;
+    const markSize = Math.max(18, pieceSize * 0.6);
+    const r = markSize / 2 - 1;
+    const cross = r * 0.62; // 斜杠半径（略小于圆环，留出边距）
+    return banMoves.map((m, i) => {
+      const pos = getPos(m.toCol, m.toRow);
+      return (
+        <Svg
+          key={`ban-${i}-${m.pieceId}-${m.toCol}-${m.toRow}`}
+          width={markSize}
+          height={markSize}
+          pointerEvents="none"
+          style={[
+            styles.movedPieceRing,
+            { left: pos.x - markSize / 2, top: pos.y - markSize / 2 },
+          ]}
+        >
+          <Circle
+            cx={markSize / 2}
+            cy={markSize / 2}
+            r={r}
+            stroke="#D32F2F"
+            strokeWidth={Math.max(1.5, markSize * 0.07)}
+            fill="none"
+          />
+          <Line
+            x1={markSize / 2 - cross}
+            y1={markSize / 2 - cross}
+            x2={markSize / 2 + cross}
+            y2={markSize / 2 + cross}
+            stroke="#D32F2F"
+            strokeWidth={Math.max(1.5, markSize * 0.07)}
+          />
+          <Line
+            x1={markSize / 2 - cross}
+            y1={markSize / 2 + cross}
+            x2={markSize / 2 + cross}
+            y2={markSize / 2 - cross}
+            stroke="#D32F2F"
+            strokeWidth={Math.max(1.5, markSize * 0.07)}
+          />
+        </Svg>
+      );
+    });
+  }, [banMoves, getPos, pieceSize]);
+
   const boardImage = isFlipped ? boardStyle.flippedImage : boardStyle.normalImage;
 
   return (
@@ -701,6 +754,7 @@ export default function ChessBoard({
 
         {/* 提示标记（最优解：橙色描边 + 橙色落点） */}
         {hintMarker}
+        {banMarkers}
 
         {/* 让子幽灵标记：被让出的棋子原位半透明展示 + 红色「让」角标。
             渲染在真实棋子下层，交叉点被占据后自动隐藏，不拦截任何触摸 */}
