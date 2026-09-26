@@ -246,6 +246,8 @@ export default function LanGameScreen() {
       roomId: room.id,
       playerId,
       playerName: getActualName(),
+      // 断线重连时 activeRoom 已带房间名，首帧即显示真实标题
+      roomName: room.name,
       side: room.mySide ?? 'red',
       isHost: false,
     });
@@ -318,6 +320,8 @@ export default function LanGameScreen() {
           roomId: data.roomId,
           playerId,
           playerName: name,
+          // 一并带上服务端最终的房间名（含留空时自动生成的「房间N」），进入对局页首帧即可显示
+          roomName: data.room?.name,
           side: 'red',
           isHost: true,
         });
@@ -341,11 +345,11 @@ export default function LanGameScreen() {
       setJoinError('');
       return;
     }
-    doJoinRoom(room.id, '');
+    doJoinRoom(room.id, '', room.name);
   };
 
-  // 执行加入请求
-  const doJoinRoom = async (roomId: string, password: string) => {
+  // 执行加入请求（roomName 为大厅列表中的房间名，用于进入对局页首帧即显示标题）
+  const doJoinRoom = async (roomId: string, password: string, roomName?: string) => {
     const name = getActualName();
     if (!name || !playerId) {
       setActionError('昵称加载中，请稍候再试');
@@ -369,6 +373,8 @@ export default function LanGameScreen() {
           roomId,
           playerId,
           playerName: name,
+          // 房间名取自大厅列表项（加入前即已知），避免对局页首帧显示兜底文案
+          roomName: data.room?.name ?? roomName,
           side: 'black',
           isHost: false,
         });
@@ -396,7 +402,7 @@ export default function LanGameScreen() {
       setJoinError('请输入房间密码');
       return;
     }
-    doJoinRoom(passwordRoom.id, joinPassword.trim());
+    doJoinRoom(passwordRoom.id, joinPassword.trim(), passwordRoom.name);
   };
 
   // 返回

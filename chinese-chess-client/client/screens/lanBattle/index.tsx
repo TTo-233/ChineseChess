@@ -34,6 +34,8 @@ import { getOnlineServerUrl } from '@/utils/serverConfig';
 import { BattleSocket } from '@/utils/battleSocket';
 import { saveReplay } from '@/utils/replayStorage';
 import { useBoardLayoutBudget } from '@/utils/chess/capturedDrawerMetrics';
+import { nameRowAlignmentStyle } from '@/utils/chess/boardContentWidth';
+import { useBoardStyle } from '@/utils/chess/boardStyleStore';
 import {
   SettingSelect,
   formStyles,
@@ -162,6 +164,8 @@ export default function LanBattleScreen() {
     roomId: string;
     playerId: string;
     playerName: string;
+    /** 房间名：由大厅创建/加入时随路由带入，保证首帧标题即为真实房间名（无需等轮询回填） */
+    roomName?: string;
     side: string;
     isHost: boolean;
   }>();
@@ -194,7 +198,9 @@ export default function LanBattleScreen() {
   // 引擎终局细分原因（juesha/kunbi/changjiang/changzhuo/repetition/red_win/black_win），用于结算文案与特效开关
   const [gameOverReason, setGameOverReason] = useState<string>('');
   // 准备阶段：房间名、选边与准备状态
-  const [roomName, setRoomName] = useState('');
+  // 房间名初值取路由带入的 roomName（大厅创建/加入时已知），避免首帧退化为「在线对局」兜底文案；
+  // 后续由房间轮询/改名接口回填覆盖为最新值
+  const [roomName, setRoomName] = useState(params.roomName || '');
   const [roomPassword, setRoomPassword] = useState<string | null>(null);
   const [hostId, setHostId] = useState('');
   const [sidePickVisible, setSidePickVisible] = useState(false); // 选边弹窗
@@ -286,6 +292,9 @@ export default function LanBattleScreen() {
   // 棋盘真实几何（相对主容器）：供绝杀特效锁定棋盘中心、把结算文字/按钮排到棋盘正下方
   const { containerRef, boardRef, boardFrame, measure: measureBoardFrame } = useBoardFrame();
 
+  // 当前棋盘样式：名称角标行宽度需按样式几何换算棋盘本体宽度（用户可在首页设置中切换样式）
+  const boardStyle = useBoardStyle();
+
   // 绝杀特效弹出前兜底重测：boardPadTop/maxBoardHeight 变化只挪动棋盘（相对父级布局不变，
   // 包裹层 onLayout 可能不触发），此处按绝对坐标重新测量，保证特效对齐的是最新棋盘位置
   useEffect(() => {
@@ -295,6 +304,13 @@ export default function LanBattleScreen() {
 
   // 棋盘本体真实尺寸（外层容器宽=屏宽，onBoardLayout 回报的才是棋盘宽），由 ChessBoard 回报
   const [boardSize, setBoardSize] = useState<{ width: number; height: number } | null>(null);
+
+  // 名称角标行宽度：取棋盘本体宽度并水平居中，使角标行左右边缘与棋盘边缘对齐
+  // （宽屏下棋盘因纵向预算被压缩居中，角标行若铺满整屏会贴到屏幕最左/最右）
+  const nameRowStyle = useMemo(
+    () => nameRowAlignmentStyle(screenWidth, boardStyle, maxBoardHeight ?? 0),
+    [screenWidth, boardStyle, maxBoardHeight]
+  );
 
   // 绝杀特效对齐用的棋盘框：测量框宽=屏宽（外层容器），按棋盘本体宽度在其中水平居中换算，
   // 得到棋盘本体的真实 x/宽，保证特效中心与按钮宽度口径都落在棋盘本体上
@@ -2201,7 +2217,7 @@ export default function LanBattleScreen() {
               顶部留白由预算控制：优先垂直居中，预留不足时整体下移贴住预留区 */}
           <View style={[styles.boardContainer, { paddingTop: boardPadTop }]}>
             {/* 对手名角标行：棋盘上方独立行，左对齐（未加入时显示等待提示） */}
-            <View style={[styles.nameRow, { width: screenWidth }]} pointerEvents="none">
+            <View style={[styles.nameRow, nameRowStyle]} pointerEvents="none">
               <View style={styles.nameChip}>
                 <View
                   style={[
@@ -2287,7 +2303,7 @@ export default function LanBattleScreen() {
                 ref 用于点按瞬间实测窗口坐标锚定下拉栏；onLayout 值仅作回退锚点 */}
             <View
               ref={myNameRowRef}
-              style={[styles.nameRow, styles.nameRowMe, { width: screenWidth, zIndex: 40 }]}
+              style={[styles.nameRow, styles.nameRowMe, nameRowStyle, { zIndex: 40 }]}
               pointerEvents="box-none"
               onLayout={(e) => {
                 const { y, height } = e.nativeEvent.layout;

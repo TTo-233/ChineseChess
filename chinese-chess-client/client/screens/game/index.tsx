@@ -42,6 +42,8 @@ import { saveGame, loadGame, deleteSave, type GameSave } from '@/utils/GameSave'
 import { saveReplay } from '@/utils/replayStorage';
 import { BUILTIN_ENDGAMES } from '@/utils/chess/endgames';
 import { useBoardLayoutBudget } from '@/utils/chess/capturedDrawerMetrics';
+import { nameRowAlignmentStyle } from '@/utils/chess/boardContentWidth';
+import { useBoardStyle } from '@/utils/chess/boardStyleStore';
 import {
   markLevelCompleted,
   markCustomCompleted,
@@ -358,6 +360,16 @@ export default function GameScreen() {
 
   // 棋盘真实几何（相对主容器）：供绝杀特效锁定棋盘中心、把结算文字/按钮排到棋盘正下方
   const { containerRef, boardRef, boardFrame, measure: measureBoardFrame } = useBoardFrame();
+
+  // 当前棋盘样式：AI 角标行宽度需按样式几何换算棋盘本体宽度（用户可在首页设置中切换样式）
+  const boardStyle = useBoardStyle();
+
+  // AI 角标行宽度：取棋盘本体宽度并水平居中，使角标行左右边缘与棋盘边缘对齐
+  // （宽屏下棋盘因纵向预算被压缩居中，角标行若铺满整屏会贴到屏幕最左/最右）
+  const nameRowStyle = useMemo(
+    () => nameRowAlignmentStyle(screenWidth, boardStyle, maxBoardHeight ?? 0),
+    [boardStyle, maxBoardHeight]
+  );
 
   // 绝杀特效弹出前兜底重测：boardPadTop/maxBoardHeight 变化只挪动棋盘（相对父级布局不变，
   // 包裹层 onLayout 可能不触发），此处按绝对坐标重新测量，保证特效对齐的是最新棋盘位置
@@ -1112,7 +1124,7 @@ export default function GameScreen() {
           <View style={[styles.boardContainer, { paddingTop: boardPadTop }]}>
             {/* AI 标识角标行：棋盘上方独立行，左对齐（参照联机对战对手名称角标样式），
                 实时指示当前 AI 引擎来源——绿色指示灯=云端皮卡鱼（含深度），灰色指示灯=本地AI（含难度） */}
-            <View style={[styles.aiNameRow, { width: screenWidth }]} pointerEvents="none">
+            <View style={[styles.aiNameRow, nameRowStyle]} pointerEvents="none">
               <View style={styles.aiNameChip}>
                 <View style={[styles.aiNameChipDot, aiIsOnline && styles.aiNameChipDotOnline]} />
                 <Text style={styles.aiNameChipText} numberOfLines={1}>

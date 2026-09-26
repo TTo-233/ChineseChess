@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useEffect, useRef } from 'react';
+import React, { useState, useCallback, useEffect, useRef, useMemo } from 'react';
 import {
   View,
   Text,
@@ -17,6 +17,8 @@ import { playJiangJunSound, playSound, preloadSounds, unloadAllSounds } from '@/
 import { getOnlineServerUrl } from '@/utils/serverConfig';
 import { BattleSocket } from '@/utils/battleSocket';
 import { useBoardLayoutBudget } from '@/utils/chess/capturedDrawerMetrics';
+import { nameRowAlignmentStyle } from '@/utils/chess/boardContentWidth';
+import { useBoardStyle } from '@/utils/chess/boardStyleStore';
 import { FONT } from '@/utils/typography';
 
 const COLORS = {
@@ -74,6 +76,8 @@ export default function SpectateScreen() {
   // 棋盘区域尺寸测算（与人机/在线对局一致的居中布局）
   const [boardAreaH, setBoardAreaH] = useState(0);
   const dynamicGap = Math.max(Math.round(screenWidth * 0.03), 8);
+  // 当前棋盘样式：角标行宽度需按样式几何换算棋盘本体宽度
+  const boardStyle = useBoardStyle();
   // 棋盘高度预算 + 垂直定位留白（二分求解，口径与抽屉真实尺寸一致）：
   // 条件 1 —— 棋盘顶边上方常驻预留「名称角标行(30) + 摘要条悬浮区(38+30) + 抽屉展开高度」，
   //           无论抽屉是否点开都预留，保证展开时底边不压棋盘、不与摘要条/角标重叠；
@@ -89,6 +93,13 @@ export default function SpectateScreen() {
     bottomFlowHeight: 30,
   });
   const maxBoardHeight = budgetBoardHeight ?? 0;
+
+  // 名称角标行宽度：取棋盘本体宽度并水平居中，使角标行左右边缘与棋盘边缘对齐
+  // （宽屏下棋盘因纵向预算被压缩居中，角标行若铺满整屏会贴到屏幕最左/最右）
+  const nameRowStyle = useMemo(
+    () => nameRowAlignmentStyle(screenWidth, boardStyle, maxBoardHeight),
+    [boardStyle, maxBoardHeight]
+  );
 
   const setPhaseSafe = useCallback((p: SpectatePhase) => {
     phaseRef.current = p;
@@ -321,7 +332,7 @@ export default function SpectateScreen() {
   const renderNameChip = (player: RoomPlayer | null, side: 'red' | 'black', align: 'left' | 'right') => {
     const isTurn = gameState ? (side === 'red' ? isRedTurn : !isRedTurn) : false;
     return (
-      <View style={[styles.nameRow, align === 'right' ? styles.nameRowMe : undefined, { width: screenWidth }]} pointerEvents="none">
+      <View style={[styles.nameRow, align === 'right' ? styles.nameRowMe : undefined, nameRowStyle]} pointerEvents="none">
         <View style={styles.nameChip}>
           {align === 'left' && (
             <View style={[styles.nameChipDot, { backgroundColor: side === 'red' ? COLORS.redPiece : COLORS.blackPiece }]} />
