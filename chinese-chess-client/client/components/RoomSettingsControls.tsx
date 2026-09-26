@@ -32,6 +32,7 @@ export const TURN_TIME_OPTIONS = [
   { value: 15, label: '15秒' },
   { value: 30, label: '30秒' },
   { value: 60, label: '60秒' },
+  { value: 90, label: '90秒' },
   { value: 120, label: '120秒' },
 ];
 export const INCREMENT_OPTIONS = [0, 2, 3, 5, 10, 15, 30].map(v => ({ value: v, label: v === 0 ? '关闭' : `${v}秒` }));
@@ -226,8 +227,8 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: 'rgba(139, 105, 20, 0.25)',
     padding: 6,
-    flexDirection: 'row',
-    flexWrap: 'wrap',
+    // 单列纵向列表：选项逐行排列，避免窄面板下折行成多列
+    flexDirection: 'column',
     gap: 6,
     shadowColor: '#422006',
     shadowOffset: { width: 0, height: 4 },
@@ -236,12 +237,13 @@ const styles = StyleSheet.create({
     elevation: 10,
   },
   selectOption: {
-    paddingVertical: 5,
+    paddingVertical: 7,
     paddingHorizontal: 10,
     borderRadius: 8,
     backgroundColor: COLORS.background,
     borderWidth: 1,
     borderColor: COLORS.border,
+    alignItems: 'center',
   },
   selectOptionActive: {
     backgroundColor: COLORS.primary,

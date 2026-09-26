@@ -72,6 +72,11 @@ const COLORS = {
 
 type Difficulty = 'easy' | 'medium' | 'hard';
 
+// 残局闯关每局限用次数：提示 3 次、悔棋 10 次。
+// 悔棋不参与金/银/铜冠评定——评级只统计提示次数（悔棋属于过程性辅助，不作为评级依据）
+const ENDGAME_HINT_LIMIT = 3;
+const ENDGAME_UNDO_LIMIT = 10;
+
 export default function GameScreen() {
   const router = useSafeRouter();
   const params = useSafeSearchParams<{
@@ -274,7 +279,8 @@ export default function GameScreen() {
           setCapturedRed(save.capturedRed);
           setCapturedBlack(save.capturedBlack);
           setLastMove(save.lastMove);
-          setEndgameHintLeft(3); // 恢复残局存档时重置提示次数
+          setEndgameHintLeft(ENDGAME_HINT_LIMIT); // 恢复残局存档时重置提示次数
+          setEndgameUndoLeft(ENDGAME_UNDO_LIMIT); // 同时重置悔棋次数
         }
         setLoaded(true);
         setBoardKey(k => k + 1); // 强制 ChessBoard 重新挂载
@@ -309,8 +315,9 @@ export default function GameScreen() {
   const [showBackConfirm, setShowBackConfirm] = useState(false);
   // 残局"说明"弹窗（不使用全局 alert —— 其在 Release 构建中不可用，调用会导致卡死）
   const [endgameInfoVisible, setEndgameInfoVisible] = useState(false);
-  // 残局闯关：每局限 3 次提示，用完按钮禁用（重开/下一关/恢复存档时重置）
-  const [endgameHintLeft, setEndgameHintLeft] = useState(3);
+  // 残局闯关：每局限 3 次提示 + 10 次悔棋，用完按钮禁用（重开/下一关/恢复存档时重置）
+  const [endgameHintLeft, setEndgameHintLeft] = useState(ENDGAME_HINT_LIMIT);
+  const [endgameUndoLeft, setEndgameUndoLeft] = useState(ENDGAME_UNDO_LIMIT);
   // 被吃棋子明细抽屉展开的一侧（null=收起），抽屉渲染在顶部标题行正下方
   const [capturedDrawerSide, setCapturedDrawerSide] = useState<'opponent' | 'mine' | null>(null);
   // 棋盘可用纵向空间实测（宽屏/纵向空间不足时限制棋盘尺寸，避免挤占标题行与底部操作栏）
@@ -711,14 +718,15 @@ export default function GameScreen() {
       if (isEndgame && currentEndgame) {
         if (playerWon) {
           // 残局闯关：玩家获胜 → 标记过关并解锁下一关，仅清除残局局内存档（不动人机存档）
-          // 同时记录本局使用的提示次数（取历史最佳），用于选关页金/银/铜冠评级
+          // 同时记录本局使用的提示次数（取历史最佳），用于选关页金/银/铜冠评级；
+          // 悔棋次数不参与评级（仅统计提示），故此处只取提示消耗量
           endgameResultRef.current = 'win';
           deleteEndgameBattle();
           if (currentEndgame.levelIndex >= 0) {
-            markLevelCompleted(currentEndgame.levelIndex, 3 - endgameHintLeft);
+            markLevelCompleted(currentEndgame.levelIndex, ENDGAME_HINT_LIMIT - endgameHintLeft);
           } else if (currentEndgame.customId) {
             // 自定义残局：同样按提示次数记录金/银/铜冠评级
-            markCustomCompleted(currentEndgame.customId, 3 - endgameHintLeft);
+            markCustomCompleted(currentEndgame.customId, ENDGAME_HINT_LIMIT - endgameHintLeft);
           }
         } else {
           // 残局闯关：玩家走棋被判负（如长将未变招）或和棋 → 挑战失败
@@ -742,9 +750,11 @@ export default function GameScreen() {
     scheduleAIMove(newState, aiDelay);
   }, [gameState, triggerAIMove, clearHint, isEndgame, currentEndgame, endgameHintLeft, triggerMoveEffect, savePveReplay, playerSideTag, scheduleAIMove, showRuleNotice, currentPlayerSide]);
 
-  // 悔棋（仅人机对战；残局闯关已改为提示，不提供悔棋）
+  // 悔棋（人机对战不限次数；残局闯关每局限 ENDGAME_UNDO_LIMIT 次，且不计入金/银/铜冠评定）
   const handleUndo = useCallback(() => {
     if (aiThinking) return;
+    // 残局闯关：悔棋额度用尽后不再提供（按钮同步禁用，双保险）
+    if (isEndgame && endgameUndoLeft <= 0) return;
     invalidatePendingAI(); // 取消延时中/计算中的 AI 走子，防止旧走子覆盖悔棋后的局面
 
     if (gameState.moveHistory.length < 2) return;
@@ -761,6 +771,10 @@ export default function GameScreen() {
     }
     const undone = gameState.moveHistory.length - state.moveHistory.length;
 
+    // 残局闯关：成功悔棋才消耗一次额度（无历史可悔时已提前返回，不扣次）；
+    // 评级只看提示次数，此处扣减悔棋额度不影响金/银/铜冠判定
+    if (isEndgame) setEndgameUndoLeft(prev => Math.max(0, prev - 1));
+
     setGameState(state);
     setSelectedPieceId(null);
     setValidMoves(null);
@@ -773,7 +787,7 @@ export default function GameScreen() {
       // 空盘且 AI 先手：让 AI 重新走开局第一步
       scheduleAIMove(state, 500);
     }
-  }, [gameState, aiThinking, clearHint, playerSideTag, invalidatePendingAI, scheduleAIMove]);
+  }, [gameState, aiThinking, clearHint, playerSideTag, invalidatePendingAI, scheduleAIMove, isEndgame, endgameUndoLeft]);
 
   // 换边翻转（交换执棋方 + 先后手 + 棋盘方向）
   const handleFlip = useCallback(() => {
@@ -828,7 +842,8 @@ export default function GameScreen() {
     setGameOverReason(null);
     endgameResultRef.current = null;
     replaySavedRef.current = false; // 新一局允许再次自动保存复盘
-    setEndgameHintLeft(3); // 残局提示次数重置
+    setEndgameHintLeft(ENDGAME_HINT_LIMIT); // 残局提示次数重置
+    setEndgameUndoLeft(ENDGAME_UNDO_LIMIT); // 残局悔棋次数同步重置
 
     if (aiFirst) {
       scheduleAIMove(newState, 500);
@@ -923,7 +938,8 @@ export default function GameScreen() {
     setJueShaVisible(false);
     endgameResultRef.current = null;
     replaySavedRef.current = false; // 新一局允许再次自动保存复盘
-    setEndgameHintLeft(3); // 残局提示次数重置
+    setEndgameHintLeft(ENDGAME_HINT_LIMIT); // 残局提示次数重置
+    setEndgameUndoLeft(ENDGAME_UNDO_LIMIT); // 残局悔棋次数同步重置
     if (aiFirst) {
       scheduleAIMove(newState, 500);
     } else {
@@ -962,7 +978,8 @@ export default function GameScreen() {
     setJueShaVisible(false);
     endgameResultRef.current = null;
     replaySavedRef.current = false; // 新一局允许再次自动保存复盘
-    setEndgameHintLeft(3); // 残局提示次数重置
+    setEndgameHintLeft(ENDGAME_HINT_LIMIT); // 残局提示次数重置
+    setEndgameUndoLeft(ENDGAME_UNDO_LIMIT); // 残局悔棋次数同步重置
     setBoardKey(k => k + 1);
     // 下一关 FEN 若为黑先（AI 先走），自动触发 AI
     if (next.fen.trim().split(/\s+/)[1] === 'b') {
@@ -977,6 +994,10 @@ export default function GameScreen() {
   // 残局闯关：提示可用条件（每局限 3 次，次数用完按钮禁用；需轮到玩家、非思考中且无提示在算）
   const canEndgameHint = isEndgame && endgameHintLeft > 0 && isPlayerTurn && !aiThinking &&
                          gameState.gameStatus === 'playing' && !hintLoading;
+
+  // 残局闯关：悔棋可用条件（每局限 10 次；需有可悔的历史着法、非思考中、对局进行中且未进入结算特效）
+  const canEndgameUndo = isEndgame && endgameUndoLeft > 0 && gameState.moveHistory.length >= 2 &&
+                         !aiThinking && gameState.gameStatus === 'playing' && !jueShaVisible;
 
   // 提示：为玩家计算当前最优解（橙色描边 + 橙色落点，长久显示，点击任意棋子后消失）
   const canHint = isPlayerTurn && !aiThinking && gameState.gameStatus === 'playing' && !hintLoading;
@@ -1035,11 +1056,24 @@ export default function GameScreen() {
           </View>
 
           <View style={styles.gameInfo}>
-            <Text style={styles.gameTitle} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.75}>
-              {isEndgame && currentEndgame
-                ? (currentEndgame.levelIndex >= 0 ? `残局闯关 · 第${currentEndgame.levelIndex + 1}关` : '残局闯关 · 自定义')
-                : '人机对战'}
-            </Text>
+            {/* 标题行：标题 + 标题右侧紧邻的玩法说明标识（残局闯关专用，样式与选关页标题行一致） */}
+            <View style={styles.gameTitleRow}>
+              <Text style={styles.gameTitle} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.75}>
+                {isEndgame && currentEndgame
+                  ? (currentEndgame.levelIndex >= 0 ? `残局闯关 · 第${currentEndgame.levelIndex + 1}关` : '残局闯关 · 自定义')
+                  : '人机对战'}
+              </Text>
+              {isEndgame && currentEndgame && (
+                <TouchableOpacity
+                  onPress={() => setEndgameInfoVisible(true)}
+                  accessibilityLabel="玩法说明"
+                  accessibilityRole="button"
+                  hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                >
+                  <FontAwesome6 name="circle-info" size={14} color={COLORS.primary} />
+                </TouchableOpacity>
+              )}
+            </View>
             <Text style={styles.gameSubtitle}>
               {isEndgame && currentEndgame
                 ? `${currentEndgame.name} · 大师难度\n第 ${Math.ceil(moveCount / 2) + 1} 回合`
@@ -1128,7 +1162,8 @@ export default function GameScreen() {
             </View>
 
           {/* 底部操作栏（绝杀特效显示时隐藏但保持占位，防止棋盘位置移动）
-              残局闯关规则：不允许翻转；每局限 3 次提示（走皮卡鱼），保留"说明"与"重开" */}
+              残局闯关规则：不允许翻转；每局限 3 次提示（走皮卡鱼）+ 10 次悔棋，
+              剩余次数以按钮右上角数字角标展示；「说明」已移至标题行右侧标识 */}
           <View
             style={[styles.bottomBar, { width: screenWidth, marginTop: dynamicGap }, jueShaVisible && { opacity: 0 }]}
             pointerEvents={jueShaVisible ? 'none' : 'auto'}
@@ -1136,14 +1171,6 @@ export default function GameScreen() {
           >
             {isEndgame ? (
               <>
-                <TouchableOpacity
-                  style={styles.actionButton}
-                  onPress={() => setEndgameInfoVisible(true)}
-                >
-                  <FontAwesome6 name="circle-info" size={16} color={COLORS.text} />
-                  <Text style={styles.actionButtonText}>说明</Text>
-                </TouchableOpacity>
-
                 <TouchableOpacity
                   style={[styles.actionButton, !canEndgameHint && styles.actionButtonDisabled]}
                   onPress={handleHint}
@@ -1159,8 +1186,31 @@ export default function GameScreen() {
                     )}
                   </View>
                   <Text style={[styles.actionButtonText, !canEndgameHint && { color: COLORS.textMuted }]}>
-                    提示×{endgameHintLeft}
+                    提示
                   </Text>
+                  {/* 剩余提示次数：按钮右上角数字角标（样式同棋盘棋子数量角标） */}
+                  <View style={styles.countBadge}>
+                    <Text style={styles.countBadgeText}>{endgameHintLeft}</Text>
+                  </View>
+                </TouchableOpacity>
+
+                <TouchableOpacity
+                  style={[styles.actionButton, !canEndgameUndo && styles.actionButtonDisabled]}
+                  onPress={handleUndo}
+                  disabled={!canEndgameUndo}
+                >
+                  <FontAwesome6
+                    name="rotate-left"
+                    size={16}
+                    color={canEndgameUndo ? COLORS.text : COLORS.textMuted}
+                  />
+                  <Text style={[styles.actionButtonText, !canEndgameUndo && { color: COLORS.textMuted }]}>
+                    悔棋
+                  </Text>
+                  {/* 剩余悔棋次数：按钮右上角数字角标（悔棋不参与金/银/铜冠评定） */}
+                  <View style={styles.countBadge}>
+                    <Text style={styles.countBadgeText}>{endgameUndoLeft}</Text>
+                  </View>
                 </TouchableOpacity>
 
                 <TouchableOpacity style={styles.actionButton} onPress={handleRestart}>
@@ -1422,6 +1472,12 @@ const styles = StyleSheet.create({
     flex: 1,
     alignItems: 'center',
   },
+  // 标题行：标题 + 紧邻其右侧的玩法说明标识（残局闯关；与选关页 headerTitleRow 同款）
+  gameTitleRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
   gameTitle: {
     fontSize: 16,
     fontWeight: '700',
@@ -1560,6 +1616,28 @@ const styles = StyleSheet.create({
     fontSize: 14,
     fontWeight: '600',
     color: COLORS.text,
+  },
+  // 次数角标：按钮右上角红色圆形数字标识（样式与棋盘/摆子栏的棋子数量角标一致：
+  // 红底白字 + 白细边），略微越出按钮边缘形成叠加感；数字为剩余可用次数
+  countBadge: {
+    position: 'absolute',
+    top: -6,
+    right: -6,
+    minWidth: 17,
+    height: 17,
+    borderRadius: 9,
+    paddingHorizontal: 3,
+    backgroundColor: '#C62828',
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.85)',
+  },
+  countBadgeText: {
+    color: '#FFFFFF',
+    fontSize: 10,
+    fontWeight: '700',
+    lineHeight: 13,
   },
   gameOverOverlay: {
     position: 'absolute',
