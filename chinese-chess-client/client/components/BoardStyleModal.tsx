@@ -9,15 +9,12 @@ import React from 'react';
 import {
   View,
   Text,
-  Modal,
   TouchableOpacity,
   StyleSheet,
   Image,
-  TouchableWithoutFeedback,
-  Keyboard,
-  Platform,
 } from 'react-native';
 import { FontAwesome6 } from '@expo/vector-icons';
+import { AppModal, ModalButton, modalButtonRowStyle } from '@/components/Modal';
 import { BOARD_STYLES, type BoardStyle } from '@/utils/chess/boardStyles';
 import { useBoardStyle, setBoardStyleId } from '@/utils/chess/boardStyleStore';
 import { FONT } from '@/utils/typography';
@@ -83,67 +80,47 @@ export default function BoardStyleModal({ visible, onClose }: BoardStyleModalPro
   };
 
   return (
-    <Modal visible={visible} transparent animationType="fade">
-      <TouchableWithoutFeedback onPress={Keyboard.dismiss} disabled={Platform.OS === 'web'}>
-        <View style={styles.mask}>
-          <View style={styles.panel}>
-            {/* Header */}
-            <View style={styles.header}>
-              <View style={styles.headerIcon}>
-                <FontAwesome6 name="chess-board" size={16} color={COLORS.primary} />
-              </View>
-              <View style={styles.headerTexts}>
-                <Text style={styles.title}>棋盘样式</Text>
-                <Text style={styles.subtitle}>所选样式将应用于对局、复盘与摆棋棋盘</Text>
-              </View>
-              <TouchableOpacity style={styles.closeBtn} onPress={onClose} activeOpacity={0.7}>
-                <FontAwesome6 name="xmark" size={15} color={COLORS.textMuted} />
-              </TouchableOpacity>
-            </View>
+    <AppModal
+      visible={visible}
+      onClose={onClose}
+      title="棋盘样式"
+      showCloseBtn
+      cardStyle={styles.widePanel}
+      bodyStyle={styles.body}
+    >
+      <Text style={styles.subtitle}>所选样式将应用于对局、复盘与摆棋棋盘</Text>
 
-            {/* 样式卡片 */}
-            <View style={styles.cardRow}>
-              {BOARD_STYLES.map((s) => (
-                <StyleCard
-                  key={s.id}
-                  style={s}
-                  selected={s.id === current.id}
-                  onSelect={handleSelect}
-                />
-              ))}
-            </View>
+      {/* 样式卡片 */}
+      <View style={styles.cardRow}>
+        {BOARD_STYLES.map((s) => (
+          <StyleCard
+            key={s.id}
+            style={s}
+            selected={s.id === current.id}
+            onSelect={handleSelect}
+          />
+        ))}
+      </View>
 
-            {/* Footer */}
-            <TouchableOpacity style={styles.doneBtn} onPress={onClose} activeOpacity={0.8}>
-              <Text style={styles.doneBtnText}>完成</Text>
-            </TouchableOpacity>
-          </View>
-        </View>
-      </TouchableWithoutFeedback>
-    </Modal>
+      {/* Footer */}
+      <View style={[modalButtonRowStyle, styles.footer]}>
+        <ModalButton label="完成" onPress={onClose} />
+      </View>
+    </AppModal>
   );
 }
 
 const styles = StyleSheet.create({
-  mask: {
-    flex: 1,
-    backgroundColor: 'rgba(30, 20, 10, 0.45)',
-    justifyContent: 'center',
-    alignItems: 'center',
-    padding: 24,
-  },
-  panel: {
-    width: '100%',
+  /**
+   * 样式选择弹窗是全应用最宽的一张卡片（缩略图一行并排），
+   * 在 AppModal 默认的 SIZES.modalMaxWidth(360) 基础上放宽一档。
+   */
+  widePanel: {
     maxWidth: 420,
-    backgroundColor: COLORS.bgCard,
-    borderRadius: 20,
-    padding: 20,
-    boxShadow: '0px 12px 32px rgba(62, 39, 35, 0.25)',
   },
-  header: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    marginBottom: 16,
+  body: {
+    paddingHorizontal: 20,
+    paddingBottom: 20,
   },
   headerIcon: {
     width: 36,
@@ -154,30 +131,19 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     marginRight: 10,
   },
-  headerTexts: {
-    flex: 1,
-  },
-  title: {
-    fontSize: FONT.title,
-    fontWeight: '700',
-    color: COLORS.text,
-  },
   subtitle: {
     fontSize: FONT.caption,
     color: COLORS.textMuted,
     marginTop: 2,
-  },
-  closeBtn: {
-    width: 32,
-    height: 32,
-    borderRadius: 10,
-    backgroundColor: COLORS.bg,
-    alignItems: 'center',
-    justifyContent: 'center',
+    marginBottom: 14,
+    textAlign: 'center',
   },
   cardRow: {
     flexDirection: 'row',
     gap: 10,
+  },
+  footer: {
+    marginTop: 18,
   },
   card: {
     flex: 1,
@@ -232,20 +198,5 @@ const styles = StyleSheet.create({
     fontSize: FONT.micro,
     color: COLORS.textMuted,
     textAlign: 'center',
-  },
-  doneBtn: {
-    marginTop: 18,
-    height: 44,
-    borderRadius: 12,
-    backgroundColor: COLORS.primary,
-    alignItems: 'center',
-    justifyContent: 'center',
-    boxShadow: '0px 6px 14px rgba(139, 105, 20, 0.3)',
-  },
-  doneBtnText: {
-    color: '#FFF8F0',
-    fontSize: FONT.control,
-    fontWeight: '700',
-    letterSpacing: 2,
   },
 });

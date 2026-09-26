@@ -1,7 +1,6 @@
 import { Stack } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
 import { LogBox, Text, TextInput } from 'react-native';
-import Toast from 'react-native-toast-message';
 import { Provider } from '@/components/Provider';
 
 import '../global.css';
@@ -47,7 +46,6 @@ export default function RootLayout() {
         <Stack.Screen name="replay" options={{ title: "历史对局" }} />
         <Stack.Screen name="replayPlayer" options={{ title: "复盘" }} />
       </Stack>
-      <Toast />
     </Provider>
   );
 }

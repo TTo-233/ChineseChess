@@ -11,12 +11,12 @@ import {
   StyleSheet,
   Dimensions,
   Animated,
-  Modal,
   Image,
   ActivityIndicator,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Screen } from '@/components/Screen';
+import { AppDialog } from '@/components/Modal';
 import { useSafeRouter, useSafeSearchParams } from '@/hooks/useSafeRouter';
 import { useNavigation } from 'expo-router';
 import { FontAwesome6 } from '@expo/vector-icons';
@@ -1365,94 +1365,39 @@ export default function GameScreen() {
       </View>
 
       {/* 残局说明弹窗 */}
-      <Modal
+      <AppDialog
         visible={endgameInfoVisible}
-        transparent
-        animationType="fade"
-        statusBarTranslucent
-        onRequestClose={() => setEndgameInfoVisible(false)}
-      >
-        <View style={styles.modalOverlay}>
-          <View style={styles.modalCard}>
-            <Text style={styles.modalTitle}>
-              {currentEndgame
-                ? `${currentEndgame.customId ? '自定义残局' : `第${currentEndgame.levelIndex + 1}关`} · ${currentEndgame.name}`
-                : '残局说明'}
-            </Text>
-            <Text style={styles.modalMessage}>
-              {currentEndgame?.comment?.trim() ? currentEndgame.comment : '本关无特别说明，将杀对方即获胜。'}
-            </Text>
-            <View style={styles.modalButtons}>
-              <TouchableOpacity
-                style={styles.modalButton}
-                onPress={() => setEndgameInfoVisible(false)}
-              >
-                <Text style={styles.modalButtonText}>知道了</Text>
-              </TouchableOpacity>
-            </View>
-          </View>
-        </View>
-      </Modal>
+        title={
+          currentEndgame
+            ? `${currentEndgame.customId ? '自定义残局' : `第${currentEndgame.levelIndex + 1}关`} · ${currentEndgame.name}`
+            : '残局说明'
+        }
+        message={currentEndgame?.comment?.trim() ? currentEndgame.comment : '本关无特别说明，将杀对方即获胜。'}
+        confirmText="知道了"
+        onConfirm={() => setEndgameInfoVisible(false)}
+      />
 
       {/* 重开确认弹窗 */}
-      <Modal
+      <AppDialog
         visible={showRestartConfirm}
-        transparent
-        animationType="fade"
-        statusBarTranslucent
-        onRequestClose={() => setShowRestartConfirm(false)}
-      >
-        <View style={styles.modalOverlay}>
-          <View style={styles.modalCard}>
-            <Text style={styles.modalTitle}>确认重开</Text>
-            <Text style={styles.modalMessage}>当前对局将丢失，确定要重新开始吗？</Text>
-            <View style={styles.modalButtons}>
-              <TouchableOpacity
-                style={[styles.modalButton, styles.modalButtonSecondary]}
-                onPress={() => setShowRestartConfirm(false)}
-              >
-                <Text style={styles.modalButtonSecondaryText}>取消</Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                style={styles.modalButton}
-                onPress={confirmRestart}
-              >
-                <Text style={styles.modalButtonText}>确定</Text>
-              </TouchableOpacity>
-            </View>
-          </View>
-        </View>
-      </Modal>
+        title="确认重开"
+        message="当前对局将丢失，确定要重新开始吗？"
+        cancelText="取消"
+        confirmText="确定"
+        onCancel={() => setShowRestartConfirm(false)}
+        onConfirm={confirmRestart}
+      />
 
       {/* 返回确认弹窗 */}
-      <Modal
+      <AppDialog
         visible={showBackConfirm}
-        transparent
-        animationType="fade"
-        statusBarTranslucent
-        onRequestClose={() => setShowBackConfirm(false)}
-      >
-        <View style={styles.modalOverlay}>
-          <View style={styles.modalCard}>
-            <Text style={styles.modalTitle}>保存对局</Text>
-            <Text style={styles.modalMessage}>是否保存当前对局，以便下次继续？</Text>
-            <View style={styles.modalButtons}>
-              <TouchableOpacity
-                style={[styles.modalButton, styles.modalButtonSecondary]}
-                onPress={confirmBackWithoutSave}
-              >
-                <Text style={styles.modalButtonSecondaryText}>不保存</Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                style={styles.modalButton}
-                onPress={confirmBackWithSave}
-              >
-                <Text style={styles.modalButtonText}>保存</Text>
-              </TouchableOpacity>
-            </View>
-          </View>
-        </View>
-      </Modal>
+        title="保存对局"
+        message="是否保存当前对局，以便下次继续？"
+        cancelText="不保存"
+        confirmText="保存"
+        onCancel={confirmBackWithoutSave}
+        onConfirm={confirmBackWithSave}
+      />
     </Screen>
   );
 }
@@ -1592,27 +1537,6 @@ const styles = StyleSheet.create({
     color: COLORS.text,
     flexShrink: 1,
   },
-  capturedBar: {
-    flexDirection: 'row',
-    justifyContent: 'space-around',
-    width: '100%',
-    paddingHorizontal: 24,
-    marginBottom: 8,
-  },
-  capturedSide: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 6,
-  },
-  capturedLabel: {
-    fontSize: FONT.caption,
-    fontWeight: '500',
-  },
-  capturedCount: {
-    fontSize: FONT.body,
-    fontWeight: '700',
-    color: COLORS.text,
-  },
   // 标题行下方内容宿主：被吃棋子抽屉（绝对定位）锚定于此容器顶部
   capturedDrawerHost: {
     flex: 1,
@@ -1681,113 +1605,6 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     lineHeight: 13,
   },
-  gameOverOverlay: {
-    position: 'absolute',
-    top: 0,
-    left: 0,
-    right: 0,
-    bottom: 0,
-    backgroundColor: 'rgba(0,0,0,0.5)',
-    justifyContent: 'center',
-    alignItems: 'center',
-    zIndex: 100,
-  },
-  gameOverCard: {
-    backgroundColor: COLORS.bgCard,
-    borderRadius: 20,
-    padding: 32,
-    marginHorizontal: 40,
-    alignItems: 'center',
-    borderWidth: 1,
-    borderColor: COLORS.border,
-  },
-  gameOverTitle: {
-    fontSize: FONT.displayLg,
-    fontWeight: '700',
-    color: COLORS.text,
-    marginBottom: 8,
-  },
-  gameOverMessage: {
-    fontSize: FONT.body,
-    color: COLORS.textMuted,
-    marginBottom: 24,
-  },
-  gameOverButtons: {
-    flexDirection: 'row',
-    gap: 12,
-  },
-  gameOverButton: {
-    backgroundColor: COLORS.primary,
-    paddingHorizontal: 24,
-    paddingVertical: 12,
-    borderRadius: 12,
-  },
-  gameOverButtonSecondary: {
-    backgroundColor: 'transparent',
-    borderWidth: 1,
-    borderColor: COLORS.primary,
-  },
-  gameOverButtonText: {
-    fontSize: FONT.control,
-    fontWeight: '600',
-    color: '#FFFFFF',
-  },
-  gameOverButtonSecondaryText: {
-    color: COLORS.primary,
-  },
-  modalOverlay: {
-    flex: 1,
-    backgroundColor: 'rgba(0,0,0,0.5)',
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  modalCard: {
-    backgroundColor: COLORS.bgCard,
-    borderRadius: 20,
-    padding: 24,
-    marginHorizontal: 40,
-    alignItems: 'center',
-    borderWidth: 1,
-    borderColor: COLORS.border,
-    minWidth: 280,
-  },
-  modalTitle: {
-    fontSize: FONT.title,
-    fontWeight: '700',
-    color: COLORS.text,
-    marginBottom: 12,
-  },
-  modalMessage: {
-    fontSize: FONT.body,
-    color: COLORS.textMuted,
-    marginBottom: 24,
-    textAlign: 'center',
-  },
-  modalButtons: {
-    flexDirection: 'row',
-    gap: 12,
-    width: '100%',
-  },
-  modalButton: {
-    flex: 1,
-    backgroundColor: COLORS.primary,
-    paddingVertical: 12,
-    borderRadius: 12,
-    alignItems: 'center',
-  },
-  modalButtonSecondary: {
-    backgroundColor: 'transparent',
-    borderWidth: 1,
-    borderColor: COLORS.border,
-  },
-  modalButtonText: {
-    fontSize: FONT.control,
-    fontWeight: '600',
-    color: '#FFFFFF',
-  },
-  modalButtonSecondaryText: {
-    fontSize: FONT.body,
-    fontWeight: '600',
-    color: COLORS.text,
-  },
+  // 弹窗遮罩/卡片/按钮样式已收敛到 @/components/Modal（AppModal / AppDialog / ModalButton），
+  // 尺寸与配色统一走 @/constants/modal 的 Design Tokens。
 });

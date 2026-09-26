@@ -4,12 +4,10 @@ import {
   Text,
   TextInput,
   TouchableOpacity,
-  Modal,
   StyleSheet,
   Animated,
   Easing,
   Image,
-  Alert,
   Dimensions,
   BackHandler,
   AppState,
@@ -28,6 +26,7 @@ import { HandicapBoard } from '@/components/HandicapBoard';
 import { RED_SIDE, BLACK_SIDE } from '@/utils/chess/types';
 import ChessBoard, { CapturedPiecesDrawer } from '@/components/ChessBoard';
 import JueShaOverlay from '@/components/JueShaOverlay';
+import { AppDialog, AppModal, GameNotice, ModalButton, modalButtonRowStyle, type GameNoticeItem } from '@/components/Modal';
 import { useMoveEffect } from '@/hooks/useMoveEffect';
 import { useBoardFrame } from '@/hooks/useBoardFrame';
 import { playJiangJunSound, playSound, preloadSounds, unloadAllSounds } from '@/utils/SoundManager';
@@ -427,6 +426,19 @@ export default function LanBattleScreen() {
   const undoBlockedRef = useRef(false);
   const [drawBlocked, setDrawBlocked] = useState(false);
   const drawBlockedRef = useRef(false);
+
+  // ===== 对局内低干扰提示条（GameNotice）=====
+  // 重构前这 10 处反馈全部走 `Alert.alert`：react-native-web 未实现它，
+  // 导致「禁着提示」「网络异常」等关键提示在 Web 端完全无显示。
+  // 现统一改为覆盖在棋盘上的 GameNotice（3s 自动淡出，不阻塞落子）。
+  const [notice, setNotice] = useState<GameNoticeItem | null>(null);
+  const noticeSeqRef = useRef(0);
+  const showNotice = useCallback((text: string, detail?: string, duration?: number) => {
+    // key 自增：即使用户连点触发同一文案，也保证重新计时
+    noticeSeqRef.current += 1;
+    setNotice({ key: `notice-${noticeSeqRef.current}`, text, detail, duration });
+  }, []);
+  const hideNotice = useCallback(() => setNotice(null), []);
 
   // 计算被吃掉的棋子
   const getCapturedPieces = () => {
@@ -861,7 +873,7 @@ export default function LanBattleScreen() {
           const refusedMsg = undoBlockedRef.current
             ? '对方拒绝了悔棋请求，本局不能再发起悔棋'
             : '对方拒绝了悔棋请求';
-          Alert.alert('提示', data.undoResult.reason === 'timeout' ? '对方未响应，悔棋请求已取消' : refusedMsg);
+          showNotice(data.undoResult.reason === 'timeout' ? '对方未响应，悔棋请求已取消' : refusedMsg);
         }
         // 同意时局面已通过上方同步，无需额外操作
       } else if (!data.pendingUndo && undoPendingRef.current) {
@@ -881,7 +893,7 @@ export default function LanBattleScreen() {
           const refusedMsg = drawBlockedRef.current
             ? '对方拒绝了求和请求，本局不能再发起求和'
             : '对方拒绝了求和请求';
-          Alert.alert('提示', data.drawResult.reason === 'timeout' ? '对方未响应，求和请求已取消' : refusedMsg);
+          showNotice(data.drawResult.reason === 'timeout' ? '对方未响应，求和请求已取消' : refusedMsg);
         }
         // 同意时通过下方 phase === 'ended'（无胜负方）同步和棋结算
       } else if (!data.pendingDraw && drawPendingRef.current) {
@@ -1443,7 +1455,7 @@ export default function LanBattleScreen() {
         : rs.banReason === 'LONG_CHASE' ? '长捉' : '将捉';
       setSelectedPieceId(null);
       setValidMoves(null);
-      Alert.alert('禁着提示', `${banLabel}禁着，请变招（连续坚持禁着 3 次将判负）`);
+      showNotice(`${banLabel}禁着，请变招`, '连续坚持禁着 3 次将判负', 3600);
       return;
     }
 
@@ -1475,7 +1487,7 @@ export default function LanBattleScreen() {
 
     // 规则提示（接近阈值"请尽快变招"等，方案 10.3 / 12）
     if (result.newState.ruleState?.notice) {
-      Alert.alert('规则提示', result.newState.ruleState.notice);
+      showNotice(result.newState.ruleState.notice);
     }
 
     // 服务端权威走子上报（方案 0.2.5 / P0）：只发着法，服务端以同一规则引擎
@@ -1780,7 +1792,7 @@ export default function LanBattleScreen() {
   const handleUndo = async () => {
     if (!isMyTurn || gameState.moveHistory.length < 2 || undoPendingRef.current) return;
     if (undoBlockedRef.current) {
-      Alert.alert('提示', '对方已连续拒绝 2 次，本局不能再发起悔棋');
+      showNotice('对方已连续拒绝 2 次，本局不能再发起悔棋');
       return;
     }
 
@@ -1810,11 +1822,11 @@ export default function LanBattleScreen() {
         undoPendingRef.current = true;
         setUndoPending(true);
       } else {
-        Alert.alert('提示', data.message || '悔棋请求失败');
+        showNotice(data.message || '悔棋请求失败');
       }
     } catch (error) {
       console.error('悔棋失败:', error);
-      Alert.alert('提示', '网络异常，悔棋请求发送失败');
+      showNotice('网络异常，悔棋请求发送失败');
     }
   };
 
@@ -1840,7 +1852,7 @@ export default function LanBattleScreen() {
   const handleDrawRequest = async () => {
     if (drawPendingRef.current || phase !== 'playing') return;
     if (drawBlockedRef.current) {
-      Alert.alert('提示', '对方已连续拒绝 2 次，本局不能再发起求和');
+      showNotice('对方已连续拒绝 2 次，本局不能再发起求和');
       return;
     }
 
@@ -1865,11 +1877,11 @@ export default function LanBattleScreen() {
         drawPendingRef.current = true;
         setDrawPending(true);
       } else {
-        Alert.alert('提示', data.message || '求和请求失败');
+        showNotice(data.message || '求和请求失败');
       }
     } catch (error) {
       console.error('求和失败:', error);
-      Alert.alert('提示', '网络异常，求和请求发送失败');
+      showNotice('网络异常，求和请求发送失败');
     }
   };
 
@@ -2495,6 +2507,10 @@ export default function LanBattleScreen() {
               </View>
             </View>
           )}
+
+          {/* 对局内低干扰提示条（替代重构前的 10 处 Alert.alert，Web 端此前完全不显示）：
+              绝对定位在棋盘中心上方、pointerEvents="box-none" 不阻塞落子，3s 后自动淡出 */}
+          <GameNotice notice={notice} onHide={hideNotice} />
           </View>
         </View>
 
@@ -2531,11 +2547,14 @@ export default function LanBattleScreen() {
           </View>
         )}
 
-        {/* 选边弹窗（双方均准备后开启；双方选定前可自由更改） */}
-        <Modal visible={sidePickVisible} transparent animationType="fade" statusBarTranslucent onRequestClose={() => undefined}>
-          <View style={styles.modalOverlay}>
-            <View style={styles.modalContent}>
-              {sidePickResultMode ? (
+        {/* 选边弹窗（双方均准备后开启；双方选定前可自由更改）。
+            强交互场景：blockBackButton 阻断 Android 物理返回键，避免误退出弹窗留下未落地的状态 */}
+        <AppModal
+          visible={sidePickVisible}
+          onClose={() => undefined}
+          blockBackButton
+        >
+          {sidePickResultMode ? (
                 /* 选边结果公示：选边结束后弹窗保持不动，内容以动画切换为执棋结果，3 秒后开局 */
                 <Animated.View
                   style={[
@@ -2640,15 +2659,16 @@ export default function LanBattleScreen() {
                   </Text>
                 </>
               )}
-            </View>
-          </View>
-        </Modal>
+        </AppModal>
 
-        {/* 房间信息/设置弹窗（顶栏齿轮打开；房主在等待阶段可修改；布局与大厅创建房间弹窗一致） */}
-        <Modal visible={settingsVisible} transparent animationType="fade" statusBarTranslucent>
-          <View style={styles.modalOverlay}>
-            <View style={styles.settingsModalContent}>
-              <ScrollView style={{ flexGrow: 0 }} showsVerticalScrollIndicator={false}>
+        {/* 房间信息/设置弹窗（顶栏齿轮打开；房主在等待阶段可修改；布局与大厅创建房间弹窗一致）。
+            设置类弹窗允许物理返回键关闭（AppModal 默认行为） */}
+        <AppModal
+          visible={settingsVisible}
+          onClose={() => setSettingsVisible(false)}
+          title="房间设置"
+        >
+          <ScrollView style={{ flexGrow: 0 }} showsVerticalScrollIndicator={false} keyboardShouldPersistTaps="handled">
               {(() => {
                 const canEdit = phase === 'waiting' && hostId === playerId;
                 // 展示值：编辑模式取编辑态，查看模式取房间实际值
@@ -2664,7 +2684,7 @@ export default function LanBattleScreen() {
                         <View style={formStyles.selectBackdrop} />
                       </TouchableWithoutFeedback>
                     )}
-                    <Text style={[styles.modalTitle, { marginBottom: 16 }]}>房间设置</Text>
+
                     {/* 房间号（分享用，只读） */}
                     <View style={formStyles.fieldRowInline}>
                       <View style={formStyles.fieldCol}>
@@ -2776,111 +2796,68 @@ export default function LanBattleScreen() {
                     {!canEdit && phase === 'waiting' && (
                       <Text style={styles.modalHint}>仅房主可修改房间信息与设置</Text>
                     )}
-                    <View style={[styles.modalButtons, { marginTop: 20 }]}>
-                      <TouchableOpacity
-                        style={styles.settingsBtnCancel}
+                    <View style={[modalButtonRowStyle, styles.settingsFooter]}>
+                      <ModalButton
+                        label={canEdit ? '取消' : '关闭'}
+                        variant="secondary"
                         onPress={() => setSettingsVisible(false)}
-                      >
-                        <Text style={styles.settingsBtnCancelText}>{canEdit ? '取消' : '关闭'}</Text>
-                      </TouchableOpacity>
+                      />
                       {canEdit && (
-                        <TouchableOpacity
-                          style={[styles.settingsBtnConfirm, { opacity: savingSettings || !editName.trim() ? 0.5 : 1 }]}
+                        <ModalButton
+                          label="保存"
                           onPress={handleSaveSettings}
-                          disabled={savingSettings || !editName.trim()}
-                        >
-                          <Text style={styles.settingsBtnConfirmText}>{savingSettings ? '保存中…' : '保存'}</Text>
-                        </TouchableOpacity>
+                          loading={savingSettings}
+                          disabled={!editName.trim()}
+                        />
                       )}
                     </View>
                   </>
                 );
               })()}
               </ScrollView>
-            </View>
-          </View>
-        </Modal>
+        </AppModal>
 
-        {/* 认输确认弹窗 */}
-        <Modal visible={showSurrenderModal} transparent animationType="fade"
-        statusBarTranslucent>
-          <View style={styles.modalOverlay}>
-            <View style={styles.modalContent}>
-              <Text style={styles.modalTitle}>确认认输</Text>
-              <Text style={styles.modalText}>
-                确定要认输吗？认输后对手将获胜。
-              </Text>
-              <View style={styles.modalButtons}>
-                <TouchableOpacity
-                  style={styles.modalButtonCancel}
-                  onPress={() => setShowSurrenderModal(false)}
-                >
-                  <Text style={styles.modalButtonTextCancel}>取消</Text>
-                </TouchableOpacity>
-                <TouchableOpacity
-                  style={[styles.modalButtonCancel, { backgroundColor: COLORS.danger }]}
-                  onPress={handleSurrender}
-                >
-                  <Text style={styles.modalButtonTextConfirm}>确认认输</Text>
-                </TouchableOpacity>
-              </View>
-            </View>
-          </View>
-        </Modal>
+        {/* 认输确认弹窗：强交互场景，阻断物理返回键（danger 变体替代原内联背景色覆盖） */}
+        <AppDialog
+          visible={showSurrenderModal}
+          title="确认认输"
+          message="确定要认输吗？认输后对手将获胜。"
+          cancelText="取消"
+          confirmText="确认认输"
+          danger
+          blockBackButton
+          onCancel={() => setShowSurrenderModal(false)}
+          onConfirm={handleSurrender}
+        />
 
-        {/* 对方悔棋请求确认弹窗 */}
-        <Modal visible={undoRequestFromOpponent} transparent animationType="fade"
-        statusBarTranslucent>
-          <View style={styles.modalOverlay}>
-            <View style={styles.modalContent}>
-              <Text style={styles.modalTitle}>悔棋请求</Text>
-              <Text style={styles.modalText}>
-                对方请求悔棋（撤销双方各一步），是否同意？
-              </Text>
-              <View style={styles.modalButtons}>
-                <TouchableOpacity
-                  style={styles.modalButtonCancel}
-                  onPress={() => handleUndoResponse(false)}
-                >
-                  <Text style={styles.modalButtonTextCancel}>拒绝</Text>
-                </TouchableOpacity>
-                <TouchableOpacity
-                  style={[styles.modalButtonCancel, { backgroundColor: COLORS.primary }]}
-                  onPress={() => handleUndoResponse(true)}
-                >
-                  <Text style={styles.modalButtonTextConfirm}>同意</Text>
-                </TouchableOpacity>
-              </View>
-            </View>
-          </View>
-        </Modal>
+        {/* 对方悔棋请求：低干扰呈现（placement="bottom" 贴底悬浮卡片，不遮挡棋盘中心），
+            强交互场景阻断物理返回键 */}
+        <AppDialog
+          visible={undoRequestFromOpponent}
+          title="悔棋请求"
+          message="对方请求悔棋（撤销双方各一步），是否同意？"
+          cancelText="拒绝"
+          confirmText="同意"
+          confirmVariant="success"
+          placement="bottom"
+          blockBackButton
+          onCancel={() => handleUndoResponse(false)}
+          onConfirm={() => handleUndoResponse(true)}
+        />
 
-        {/* 对方求和请求确认弹窗 */}
-        <Modal visible={drawRequestFromOpponent} transparent animationType="fade"
-        statusBarTranslucent>
-          <View style={styles.modalOverlay}>
-            <View style={styles.modalContent}>
-              <Text style={styles.modalTitle}>求和请求</Text>
-              <Text style={styles.modalText}>
-                对方请求和棋，同意后本局以和棋结束，是否同意？
-              </Text>
-              <View style={styles.modalButtons}>
-                <TouchableOpacity
-                  style={styles.modalButtonCancel}
-                  onPress={() => handleDrawResponse(false)}
-                >
-                  <Text style={styles.modalButtonTextCancel}>拒绝</Text>
-                </TouchableOpacity>
-                <TouchableOpacity
-                  style={[styles.modalButtonCancel, { backgroundColor: COLORS.primary }]}
-                  onPress={() => handleDrawResponse(true)}
-                >
-                  <Text style={styles.modalButtonTextConfirm}>同意</Text>
-                </TouchableOpacity>
-              </View>
-            </View>
-          </View>
-        </Modal>
+        {/* 对方求和请求：同悔棋，贴底悬浮卡片不遮挡棋盘 */}
+        <AppDialog
+          visible={drawRequestFromOpponent}
+          title="求和请求"
+          message="对方请求和棋，同意后本局以和棋结束，是否同意？"
+          cancelText="拒绝"
+          confirmText="同意"
+          confirmVariant="success"
+          placement="bottom"
+          blockBackButton
+          onCancel={() => handleDrawResponse(false)}
+          onConfirm={() => handleDrawResponse(true)}
+        />
 
       </View>
     </Screen>
@@ -2970,45 +2947,7 @@ const styles = StyleSheet.create({
     zIndex: 100,
     elevation: 100,
   },
-  waitingCard: {
-    backgroundColor: COLORS.card,
-    borderRadius: 16,
-    padding: 32,
-    alignItems: 'center',
-    width: '100%',
-    maxWidth: 340,
-    borderWidth: 1,
-    borderColor: COLORS.border,
-  },
   // 等待阶段：准备/选边简化按钮（基于底部按钮风格）
-  // 公示浮层：双方状态行
-  playersRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    alignSelf: 'stretch',
-    marginBottom: 20,
-    gap: 10,
-  },
-  playerChip: {
-    flex: 1,
-    backgroundColor: COLORS.background,
-    borderRadius: 12,
-    paddingVertical: 10,
-    paddingHorizontal: 8,
-    alignItems: 'center',
-    gap: 4,
-  },
-  playerChipName: {
-    fontSize: FONT.body,
-    fontWeight: '700',
-    color: COLORS.textPrimary,
-    maxWidth: '100%',
-  },
-  vsText: {
-    fontSize: FONT.caption,
-    fontWeight: '800',
-    color: COLORS.textLight,
-  },
   // 选边弹窗：选边按钮行
   sidePickRow: {
     flexDirection: 'row',
@@ -3122,89 +3061,18 @@ const styles = StyleSheet.create({
     color: COLORS.textLight,
     marginTop: 14,
   },
-  // 房间设置弹窗（布局与大厅创建房间弹窗一致：表单网格样式见共享组件 RoomSettingsControls 的 formStyles）
-  modalHint: {
-    fontSize: FONT.caption,
-    color: COLORS.textLight,
-    textAlign: 'center',
-    marginTop: 2,
-    marginBottom: 4,
+  // 房间设置弹窗（卡片壳子与遮罩已收敛到 AppModal；表单网格样式见共享组件
+  // RoomSettingsControls 的 formStyles）。内边距由 AppModal 的 body 统一提供，
+  // 这里不再覆盖 paddingHorizontal —— 否则表单标签会贴到卡片边框上。
+  settingsFooter: {
+    marginTop: 20,
   },
-  // 设置弹窗容器（比通用弹窗更宽，容纳双列下拉网格与让子棋盘）
-  settingsModalContent: {
-    backgroundColor: COLORS.card,
-    borderRadius: 16,
-    padding: 24,
-    width: '85%',
-    maxWidth: 360,
-    maxHeight: '88%',
-  },
-  // 设置弹窗按钮（与大厅创建房间弹窗同款：圆角 10 + 15 号字）
-  settingsBtnCancel: {
-    flex: 1,
-    backgroundColor: COLORS.background,
-    borderRadius: 10,
-    padding: 12,
-    alignItems: 'center',
-  },
-  settingsBtnCancelText: {
-    color: COLORS.textSecondary,
-    fontSize: FONT.body,
-  },
-  settingsBtnConfirm: {
-    flex: 1,
-    backgroundColor: COLORS.primary,
-    borderRadius: 10,
-    padding: 12,
-    alignItems: 'center',
-  },
-  settingsBtnConfirmText: {
-    color: '#fff',
-    fontSize: FONT.control,
-    fontWeight: '600',
-  },
-  // 执棋结果公示
-  revealTitle: {
-    fontSize: FONT.display,
-    fontWeight: 'bold',
-    color: COLORS.textPrimary,
-    marginBottom: 20,
-  },
-  revealSideText: {
-    fontSize: FONT.control,
-    fontWeight: '700',
-    marginTop: 2,
-  },
+  // 执棋结果公示：仅剩颜色角色（字号由使用处的 FONT.* 决定）
   revealSideRed: {
     color: COLORS.primary,
   },
   revealSideBlack: {
     color: '#3C2A1E',
-  },
-  revealRandomHint: {
-    fontSize: FONT.caption,
-    color: COLORS.textLight,
-  },
-  // 倒计时卡片
-  countdownCard: {
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  countdownSideText: {
-    fontSize: FONT.display,
-    fontWeight: '600',
-    color: COLORS.textPrimary,
-    marginBottom: 24,
-  },
-  countdownNumber: {
-    fontSize: FONT.countdown,
-    fontWeight: 'bold',
-    color: COLORS.primary,
-    marginBottom: 16,
-  },
-  countdownHint: {
-    fontSize: FONT.body,
-    color: COLORS.textSecondary,
   },
   // 断线等待卡片
   disconnectCard: {
@@ -3429,52 +3297,20 @@ const styles = StyleSheet.create({
     fontWeight: '600',
     color: COLORS.textPrimary,
   },
-  // 弹窗
-  modalOverlay: {
-    flex: 1,
-    backgroundColor: 'rgba(0,0,0,0.5)',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  modalContent: {
-    backgroundColor: COLORS.card,
-    borderRadius: 16,
-    padding: 24,
-    width: '80%',
-    maxWidth: 320,
-  },
+  // 弹窗遮罩/卡片/标题/按钮样式已收敛到 @/components/Modal
+  // （AppModal 提供遮罩+卡片壳子，AppDialog 提供标题+正文+按钮，ModalButton 提供按钮变体），
+  // 尺寸与配色统一走 @/constants/modal 的 Design Tokens。
   modalTitle: {
     fontSize: FONT.title,
     fontWeight: 'bold',
     color: COLORS.textPrimary,
-    marginBottom: 12,
     textAlign: 'center',
   },
-  modalText: {
-    fontSize: FONT.body,
-    color: COLORS.textSecondary,
+  modalHint: {
+    fontSize: FONT.caption,
+    color: COLORS.textLight,
     textAlign: 'center',
-    marginBottom: 20,
-    lineHeight: 20,
-  },
-  modalButtons: {
-    flexDirection: 'row',
-    gap: 12,
-  },
-  modalButtonCancel: {
-    flex: 1,
-    backgroundColor: COLORS.background,
-    borderRadius: 8,
-    padding: 12,
-    alignItems: 'center',
-  },
-  modalButtonTextCancel: {
-    color: COLORS.textSecondary,
-    fontSize: FONT.body,
-  },
-  modalButtonTextConfirm: {
-    color: '#fff',
-    fontSize: FONT.control,
-    fontWeight: '600',
+    marginTop: 2,
+    marginBottom: 4,
   },
 });

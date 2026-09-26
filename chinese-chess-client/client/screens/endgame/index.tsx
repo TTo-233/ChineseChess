@@ -12,16 +12,12 @@ import {
   TouchableOpacity,
   StyleSheet,
   ScrollView,
-  Modal,
   TextInput,
-  KeyboardAvoidingView,
-  Platform,
-  Keyboard,
-  TouchableWithoutFeedback,
   useWindowDimensions,
   LayoutChangeEvent,
 } from 'react-native';
 import { Screen } from '@/components/Screen';
+import { AppModal, ModalButton, modalButtonRowStyle } from '@/components/Modal';
 import { useSafeRouter } from '@/hooks/useSafeRouter';
 import { useFocusEffect } from 'expo-router';
 import { FontAwesome6 } from '@expo/vector-icons';
@@ -480,148 +476,115 @@ export default function EndgameScreen() {
         </ScrollView>
 
         {/* 添加自定义残局方式选择弹窗 */}
-        <Modal visible={addChoiceVisible} transparent animationType="fade"
-        statusBarTranslucent onRequestClose={() => setAddChoiceVisible(false)}>
-          <View style={styles.modalOverlay}>
-            <View style={styles.modalCard}>
-              <View style={styles.modalHeader}>
-                <Text style={styles.modalTitle}>添加自定义残局</Text>
-                <TouchableOpacity onPress={() => setAddChoiceVisible(false)}>
-                  <FontAwesome6 name="xmark" size={18} color={COLORS.textMuted} />
-                </TouchableOpacity>
+        <AppModal
+          visible={addChoiceVisible}
+          onClose={() => setAddChoiceVisible(false)}
+          title="添加自定义残局"
+          showCloseBtn
+        >
+          <View style={styles.choiceBody}>
+            <TouchableOpacity
+              style={styles.choiceRow}
+              activeOpacity={0.8}
+              onPress={() => {
+                setAddChoiceVisible(false);
+                router.push('/endgameEdit', { customId: '', name: '', comment: '', fen: '' });
+              }}
+            >
+              <View style={styles.choiceIcon}>
+                <FontAwesome6 name="chess-board" size={18} color={COLORS.primary} />
               </View>
-              <View style={styles.choiceBody}>
-                <TouchableOpacity
-                  style={styles.choiceRow}
-                  activeOpacity={0.8}
-                  onPress={() => {
-                    setAddChoiceVisible(false);
-                    router.push('/endgameEdit', { customId: '', name: '', comment: '', fen: '' });
-                  }}
-                >
-                  <View style={styles.choiceIcon}>
-                    <FontAwesome6 name="chess-board" size={18} color={COLORS.primary} />
-                  </View>
-                  <View style={styles.choiceInfo}>
-                    <Text style={styles.choiceTitle}>棋盘自由摆棋</Text>
-                    <Text style={styles.choiceSubtitle}>在棋盘上摆放棋子，校验合规后保存</Text>
-                  </View>
-                  <FontAwesome6 name="chevron-right" size={14} color={COLORS.textMuted} />
-                </TouchableOpacity>
-                <TouchableOpacity
-                  style={styles.choiceRow}
-                  activeOpacity={0.8}
-                  onPress={() => {
-                    setAddChoiceVisible(false);
-                    setImportVisible(true);
-                  }}
-                >
-                  <View style={styles.choiceIcon}>
-                    <FontAwesome6 name="file-import" size={18} color={COLORS.primary} />
-                  </View>
-                  <View style={styles.choiceInfo}>
-                    <Text style={styles.choiceTitle}>FEN 文本导入</Text>
-                    <Text style={styles.choiceSubtitle}>粘贴 FEN 局面串，识别校验后保存</Text>
-                  </View>
-                  <FontAwesome6 name="chevron-right" size={14} color={COLORS.textMuted} />
-                </TouchableOpacity>
+              <View style={styles.choiceInfo}>
+                <Text style={styles.choiceTitle}>棋盘自由摆棋</Text>
+                <Text style={styles.choiceSubtitle}>在棋盘上摆放棋子，校验合规后保存</Text>
               </View>
-            </View>
+              <FontAwesome6 name="chevron-right" size={14} color={COLORS.textMuted} />
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={styles.choiceRow}
+              activeOpacity={0.8}
+              onPress={() => {
+                setAddChoiceVisible(false);
+                setImportVisible(true);
+              }}
+            >
+              <View style={styles.choiceIcon}>
+                <FontAwesome6 name="file-import" size={18} color={COLORS.primary} />
+              </View>
+              <View style={styles.choiceInfo}>
+                <Text style={styles.choiceTitle}>FEN 文本导入</Text>
+                <Text style={styles.choiceSubtitle}>粘贴 FEN 局面串，识别校验后保存</Text>
+              </View>
+              <FontAwesome6 name="chevron-right" size={14} color={COLORS.textMuted} />
+            </TouchableOpacity>
           </View>
-        </Modal>
+        </AppModal>
 
         {/* 导入自定义残局弹窗 */}
-        <Modal visible={importVisible} transparent animationType="fade"
-        statusBarTranslucent onRequestClose={() => setImportVisible(false)}>
-          <TouchableWithoutFeedback onPress={Keyboard.dismiss} disabled={Platform.OS === 'web'}>
-            <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
-              <View style={styles.modalOverlay}>
-                <View style={styles.modalCard}>
-                  <View style={styles.modalHeader}>
-                    <Text style={styles.modalTitle}>导入自定义残局</Text>
-                    <TouchableOpacity onPress={() => setImportVisible(false)}>
-                      <FontAwesome6 name="xmark" size={18} color={COLORS.textMuted} />
-                    </TouchableOpacity>
-                  </View>
-
-                  <ScrollView style={styles.modalBody} keyboardShouldPersistTaps="handled">
-                    <Text style={styles.fieldLabel}>名称</Text>
-                    <TextInput
-                      style={styles.input}
-                      value={importName}
-                      onChangeText={setImportName}
-                      placeholder="例如：七星聚会"
-                      placeholderTextColor={COLORS.textMuted}
-                      maxLength={20}
-                    />
-                    <Text style={styles.fieldLabel}>FEN 局面串</Text>
-                    <TextInput
-                      style={[styles.input, styles.inputMultiline]}
-                      value={importFen}
-                      onChangeText={(t) => { setImportFen(t); setImportError(''); }}
-                      placeholder="如：2b1ka3/4aP3/4b1N2/9/9/7R1/9/6r1B/2ppA2n1/2BAK4 w"
-                      placeholderTextColor={COLORS.textMuted}
-                      multiline
-                      autoCapitalize="none"
-                      autoCorrect={false}
-                    />
-                    <Text style={styles.fieldHint}>小写=黑方，大写=红方，数字=连续空格，行以 / 分隔；末尾可附 w（红先，默认）或 b（黑先）</Text>
-                    <Text style={styles.fieldLabel}>说明（可选）</Text>
-                    <TextInput
-                      style={styles.input}
-                      value={importComment}
-                      onChangeText={setImportComment}
-                      placeholder="杀法要点备注"
-                      placeholderTextColor={COLORS.textMuted}
-                      maxLength={100}
-                    />
-                    {importError ? <Text style={styles.errorText}>{importError}</Text> : null}
-                  </ScrollView>
-
-                  <View style={styles.modalFooter}>
-                    <TouchableOpacity
-                      style={[styles.modalButton, styles.modalButtonSecondary]}
-                      onPress={() => setImportVisible(false)}
-                    >
-                      <Text style={styles.modalButtonSecondaryText}>取消</Text>
-                    </TouchableOpacity>
-                    <TouchableOpacity style={styles.modalButton} onPress={handleImportSave}>
-                      <Text style={styles.modalButtonText}>识别并保存</Text>
-                    </TouchableOpacity>
-                  </View>
-                </View>
-              </View>
-            </KeyboardAvoidingView>
-          </TouchableWithoutFeedback>
-        </Modal>
+        <AppModal
+          visible={importVisible}
+          onClose={() => setImportVisible(false)}
+          title="导入自定义残局"
+          showCloseBtn
+          avoidKeyboard
+        >
+          <ScrollView style={styles.modalBody} keyboardShouldPersistTaps="handled">
+            <Text style={styles.fieldLabel}>名称</Text>
+            <TextInput
+              style={styles.input}
+              value={importName}
+              onChangeText={setImportName}
+              placeholder="例如：七星聚会"
+              placeholderTextColor={COLORS.textMuted}
+              maxLength={20}
+            />
+            <Text style={styles.fieldLabel}>FEN 局面串</Text>
+            <TextInput
+              style={[styles.input, styles.inputMultiline]}
+              value={importFen}
+              onChangeText={(t) => { setImportFen(t); setImportError(''); }}
+              placeholder="如：2b1ka3/4aP3/4b1N2/9/9/7R1/9/6r1B/2ppA2n1/2BAK4 w"
+              placeholderTextColor={COLORS.textMuted}
+              multiline
+              autoCapitalize="none"
+              autoCorrect={false}
+            />
+            <Text style={styles.fieldHint}>小写=黑方，大写=红方，数字=连续空格，行以 / 分隔；末尾可附 w（红先，默认）或 b（黑先）</Text>
+            <Text style={styles.fieldLabel}>说明（可选）</Text>
+            <TextInput
+              style={styles.input}
+              value={importComment}
+              onChangeText={setImportComment}
+              placeholder="杀法要点备注"
+              placeholderTextColor={COLORS.textMuted}
+              maxLength={100}
+            />
+            {importError ? <Text style={styles.errorText}>{importError}</Text> : null}
+          </ScrollView>
+          <View style={[modalButtonRowStyle, styles.importModalFooter]}>
+            <ModalButton label="取消" variant="secondary" onPress={() => setImportVisible(false)} />
+            <ModalButton label="识别并保存" onPress={handleImportSave} />
+          </View>
+        </AppModal>
 
         {/* 玩法说明弹窗 */}
-        <Modal visible={ruleVisible} transparent animationType="fade"
-        statusBarTranslucent onRequestClose={() => setRuleVisible(false)}>
-          <View style={styles.modalOverlay}>
-            <View style={styles.modalCard}>
-              <View style={styles.modalHeader}>
-                <Text style={styles.modalTitle}>玩法说明</Text>
-                <TouchableOpacity onPress={() => setRuleVisible(false)}>
-                  <FontAwesome6 name="xmark" size={18} color={COLORS.textMuted} />
-                </TouchableOpacity>
-              </View>
-              <View style={styles.ruleModalBody}>
-                {RULE_LINES.map(line => (
-                  <View key={line} style={styles.ruleLineRow}>
-                    <View style={styles.ruleLineDot} />
-                    <Text style={styles.ruleLineText}>{line}</Text>
-                  </View>
-                ))}
-              </View>
-              <View style={styles.modalFooter}>
-                <TouchableOpacity style={styles.modalButton} onPress={() => setRuleVisible(false)}>
-                  <Text style={styles.modalButtonText}>知道了</Text>
-                </TouchableOpacity>
-              </View>
+        <AppModal
+          visible={ruleVisible}
+          onClose={() => setRuleVisible(false)}
+          title="玩法说明"
+          showCloseBtn
+          bodyStyle={styles.ruleModalBody}
+        >
+          {RULE_LINES.map(line => (
+            <View key={line} style={styles.ruleLineRow}>
+              <View style={styles.ruleLineDot} />
+              <Text style={styles.ruleLineText}>{line}</Text>
             </View>
+          ))}
+          <View style={[modalButtonRowStyle, styles.ruleModalFooter]}>
+            <ModalButton label="知道了" onPress={() => setRuleVisible(false)} />
           </View>
-        </Modal>
+        </AppModal>
       </View>
     </Screen>
   );
@@ -949,32 +912,19 @@ const styles = StyleSheet.create({
     color: COLORS.textMuted,
     marginTop: 2,
   },
-  modalOverlay: {
-    flex: 1,
-    backgroundColor: 'rgba(0,0,0,0.45)',
-    justifyContent: 'center',
-    padding: 24,
+  // 弹窗遮罩/卡片/标题/按钮样式已收敛到 @/components/Modal（AppModal / ModalButton），
+  // 尺寸与配色统一走 @/constants/modal 的 Design Tokens。
+  // 内边距（左右 24 / 上 20 / 下 24）由 AppModal 的 body 统一提供，
+  // 这里不再覆盖 paddingHorizontal —— 否则标签与输入框会贴到卡片边框上。
+  // 只保留按钮行与上一个区块之间的间距。
+  importModalFooter: {
+    marginTop: 16,
   },
-  modalCard: {
-    backgroundColor: COLORS.bgCard,
-    borderRadius: 16,
-    maxHeight: '88%',
-  },
-  modalHeader: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    paddingHorizontal: 18,
-    paddingTop: 16,
-    paddingBottom: 8,
-  },
-  modalTitle: {
-    fontSize: FONT.title,
-    fontWeight: '700',
-    color: COLORS.text,
+  ruleModalFooter: {
+    marginTop: 18,
   },
   modalBody: {
-    paddingHorizontal: 18,
+    flexGrow: 0,
   },
   fieldLabel: {
     fontSize: FONT.body,
@@ -1007,33 +957,6 @@ const styles = StyleSheet.create({
     fontSize: FONT.caption,
     color: COLORS.accent,
     marginTop: 10,
-    fontWeight: '600',
-  },
-  modalFooter: {
-    flexDirection: 'row',
-    gap: 12,
-    padding: 18,
-  },
-  modalButton: {
-    flex: 1,
-    backgroundColor: COLORS.primary,
-    borderRadius: 10,
-    paddingVertical: 12,
-    alignItems: 'center',
-  },
-  modalButtonSecondary: {
-    backgroundColor: 'transparent',
-    borderWidth: 1,
-    borderColor: COLORS.border,
-  },
-  modalButtonText: {
-    color: '#FFFFFF',
-    fontSize: FONT.control,
-    fontWeight: '600',
-  },
-  modalButtonSecondaryText: {
-    color: COLORS.text,
-    fontSize: FONT.body,
     fontWeight: '600',
   },
 });

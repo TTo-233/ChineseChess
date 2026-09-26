@@ -5,6 +5,7 @@
 import React from 'react';
 import { StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import { FontAwesome6 } from '@expo/vector-icons';
+import { Z_INDEX, ELEVATION, SIZES } from '@/constants/modal';
 import { FONT } from '@/utils/typography';
 
 const COLORS = {
@@ -156,10 +157,21 @@ export const formStyles = StyleSheet.create({
     textAlign: 'center',
     marginTop: 6,
   },
-  // 面板展开时的透明遮罩：点击面板外任意处收起
+  // 面板展开时的透明遮罩：点击面板外任意处收起。
+  // 同样位于棋盘之上，需同时给 zIndex 与 elevation（Android 靠 elevation 参与堆叠）
+  //
+  // 负外边距：弹窗内容区有 24px 左右内边距（由 AppModal 的 body 统一提供），
+  // 而本遮罩是 ScrollView 的 absoluteFill 子元素。若不外扩，卡片左右两侧各 24px
+  // 会形成点不到的死区，展开的悬浮面板也只覆盖内边距以内的宽度。
+  // 这里向四周外扩 24px 抵消内边距，让遮罩真正铺满卡片。
   selectBackdrop: {
     ...StyleSheet.absoluteFillObject,
-    zIndex: 50,
+    top: -SIZES.modalPadding,
+    left: -SIZES.modalPadding,
+    right: -SIZES.modalPadding,
+    bottom: -SIZES.modalPadding,
+    zIndex: Z_INDEX.drawer,
+    elevation: ELEVATION.drawer,
   },
 });
 

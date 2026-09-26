@@ -14,12 +14,13 @@
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  View, Text, TouchableOpacity, StyleSheet, ScrollView, Modal, TextInput,
-  KeyboardAvoidingView, Platform, Keyboard, TouchableWithoutFeedback, Image, Dimensions, Animated,
+  View, Text, TouchableOpacity, StyleSheet, ScrollView, TextInput,
+  Image, Dimensions, Animated,
 } from 'react-native';
 import { FontAwesome6 } from '@expo/vector-icons';
 import * as Clipboard from 'expo-clipboard';
 import { Screen } from '@/components/Screen';
+import { AppModal, ModalButton, modalButtonRowStyle } from '@/components/Modal';
 import BoardEditor from '@/components/BoardEditor';
 import { useBoardStyle } from '@/utils/chess/boardStyleStore';
 import { useSafeRouter, useSafeSearchParams } from '@/hooks/useSafeRouter';
@@ -549,93 +550,66 @@ export default function EndgameEditScreen() {
         </View>
 
         {/* 保存命名弹窗 */}
-        <Modal visible={saveVisible} transparent animationType="fade" statusBarTranslucent onRequestClose={() => setSaveVisible(false)}>
-          <TouchableWithoutFeedback onPress={Keyboard.dismiss} disabled={Platform.OS === 'web'}>
-            <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
-              <View style={styles.modalOverlay}>
-                <View style={styles.modalCard}>
-                  <View style={styles.modalHeader}>
-                    <Text style={styles.modalTitle}>{isEdit ? '保存残局修改' : '保存为残局'}</Text>
-                    <TouchableOpacity onPress={() => setSaveVisible(false)}>
-                      <FontAwesome6 name="xmark" size={18} color={COLORS.textMuted} />
-                    </TouchableOpacity>
-                  </View>
-                  <View style={styles.modalBody}>
-                    <Text style={styles.fieldLabel}>名称</Text>
-                    <TextInput
-                      style={styles.input}
-                      value={saveName}
-                      onChangeText={setSaveName}
-                      placeholder="例如：七星聚会"
-                      placeholderTextColor={COLORS.textMuted}
-                      maxLength={20}
-                    />
-                    <Text style={styles.fieldLabel}>说明（可选）</Text>
-                    <TextInput
-                      style={[styles.input, styles.inputMultiline]}
-                      value={saveComment}
-                      onChangeText={setSaveComment}
-                      placeholder="残局出处或杀法说明"
-                      placeholderTextColor={COLORS.textMuted}
-                      maxLength={120}
-                      multiline
-                    />
-                    {!!saveError && <Text style={styles.errorText}>{saveError}</Text>}
-                  </View>
-                  <View style={styles.modalFooter}>
-                    <TouchableOpacity style={[styles.modalButton, styles.modalButtonCancel]} onPress={() => setSaveVisible(false)}>
-                      <Text style={styles.modalButtonCancelText}>取消</Text>
-                    </TouchableOpacity>
-                    <TouchableOpacity style={[styles.modalButton, styles.modalButtonConfirm]} onPress={handleConfirmSave}>
-                      <Text style={styles.modalButtonConfirmText}>保存</Text>
-                    </TouchableOpacity>
-                  </View>
-                </View>
-              </View>
-            </KeyboardAvoidingView>
-          </TouchableWithoutFeedback>
-        </Modal>
+        <AppModal
+          visible={saveVisible}
+          onClose={() => setSaveVisible(false)}
+          title={isEdit ? '保存残局修改' : '保存为残局'}
+          showCloseBtn
+          cardStyle={styles.wideModalCard}
+          avoidKeyboard
+        >
+          <Text style={styles.fieldLabel}>名称</Text>
+          <TextInput
+            style={styles.input}
+            value={saveName}
+            onChangeText={setSaveName}
+            placeholder="例如：七星聚会"
+            placeholderTextColor={COLORS.textMuted}
+            maxLength={20}
+          />
+          <Text style={styles.fieldLabel}>说明（可选）</Text>
+          <TextInput
+            style={[styles.input, styles.inputMultiline]}
+            value={saveComment}
+            onChangeText={setSaveComment}
+            placeholder="残局出处或杀法说明"
+            placeholderTextColor={COLORS.textMuted}
+            maxLength={120}
+            multiline
+          />
+          {!!saveError && <Text style={styles.errorText}>{saveError}</Text>}
+          <View style={[modalButtonRowStyle, styles.modalFooter]}>
+            <ModalButton label="取消" variant="secondary" onPress={() => setSaveVisible(false)} />
+            <ModalButton label="保存" onPress={handleConfirmSave} />
+          </View>
+        </AppModal>
 
         {/* 导出 FEN 弹窗（展示当前局面串，可复制；不合规时提示但不阻止导出） */}
-        <Modal visible={exportVisible} transparent animationType="fade" statusBarTranslucent onRequestClose={() => setExportVisible(false)}>
-          <TouchableWithoutFeedback onPress={Keyboard.dismiss} disabled={Platform.OS === 'web'}>
-            <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
-              <View style={styles.modalOverlay}>
-                <View style={styles.modalCard}>
-                  <View style={styles.modalHeader}>
-                    <Text style={styles.modalTitle}>导出当前局面</Text>
-                    <TouchableOpacity onPress={() => setExportVisible(false)}>
-                      <FontAwesome6 name="xmark" size={18} color={COLORS.textMuted} />
-                    </TouchableOpacity>
-                  </View>
-                  <View style={styles.modalBody}>
-                    <Text style={styles.fieldLabel}>FEN 局面串（红方先行，可直接用于导入）</Text>
-                    <TextInput
-                      style={[styles.input, styles.inputMultiline]}
-                      value={exportFen}
-                      editable={false}
-                      multiline
-                    />
-                    {exportErr ? (
-                      <Text style={styles.errorText}>当前局面未通过合规校验（{exportErr}），仍可复制后继续调整</Text>
-                    ) : (
-                      <Text style={styles.fenOkText}>当前局面已通过合规校验</Text>
-                    )}
-                    {copied && <Text style={styles.fenOkText}>已复制到剪贴板</Text>}
-                  </View>
-                  <View style={styles.modalFooter}>
-                    <TouchableOpacity style={[styles.modalButton, styles.modalButtonCancel]} onPress={() => setExportVisible(false)}>
-                      <Text style={styles.modalButtonCancelText}>关闭</Text>
-                    </TouchableOpacity>
-                    <TouchableOpacity style={[styles.modalButton, styles.modalButtonConfirm]} onPress={handleCopyFen}>
-                      <Text style={styles.modalButtonConfirmText}>{copied ? '已复制' : '复制'}</Text>
-                    </TouchableOpacity>
-                  </View>
-                </View>
-              </View>
-            </KeyboardAvoidingView>
-          </TouchableWithoutFeedback>
-        </Modal>
+        <AppModal
+          visible={exportVisible}
+          onClose={() => setExportVisible(false)}
+          title="导出当前局面"
+          showCloseBtn
+          cardStyle={styles.wideModalCard}
+        >
+          <Text style={styles.fieldLabel}>FEN 局面串（红方先行，可直接用于导入）</Text>
+          <TextInput
+            style={[styles.input, styles.inputMultiline]}
+            value={exportFen}
+            editable={false}
+            multiline
+          />
+          {exportErr ? (
+            <Text style={styles.errorText}>当前局面未通过合规校验（{exportErr}），仍可复制后继续调整</Text>
+          ) : (
+            <Text style={styles.fenOkText}>当前局面已通过合规校验</Text>
+          )}
+          {copied && <Text style={styles.fenOkText}>已复制到剪贴板</Text>}
+          <View style={[modalButtonRowStyle, styles.modalFooter]}>
+            <ModalButton label="关闭" variant="secondary" onPress={() => setExportVisible(false)} />
+            <ModalButton label={copied ? '已复制' : '复制'} onPress={handleCopyFen} />
+          </View>
+        </AppModal>
       </View>
     </Screen>
   );
@@ -811,38 +785,11 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     color: '#FFFFFF',
   },
-  modalOverlay: {
-    flex: 1,
-    backgroundColor: 'rgba(0,0,0,0.45)',
-    justifyContent: 'center',
-    alignItems: 'center',
-    padding: 24,
-  },
-  modalCard: {
-    width: '100%',
+  // 弹窗遮罩/卡片/标题/按钮样式已收敛到 @/components/Modal（AppModal / ModalButton），
+  // 尺寸与配色统一走 @/constants/modal 的 Design Tokens。
+  // 导出/保存弹窗仍保留 maxWidth:420（宽一档才放得下 FEN 局面串）这一处局部覆盖。
+  wideModalCard: {
     maxWidth: 420,
-    backgroundColor: COLORS.bgCard,
-    borderRadius: 16,
-    overflow: 'hidden',
-  },
-  modalHeader: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    paddingHorizontal: 16,
-    paddingVertical: 14,
-    borderBottomWidth: 1,
-    borderBottomColor: COLORS.border,
-  },
-  modalTitle: {
-    fontSize: FONT.title,
-    fontWeight: '700',
-    color: COLORS.text,
-  },
-  modalBody: {
-    paddingHorizontal: 16,
-    paddingTop: 12,
-    paddingBottom: 4,
   },
   fieldLabel: {
     fontSize: FONT.body,
@@ -874,32 +821,6 @@ const styles = StyleSheet.create({
     marginTop: 10,
   },
   modalFooter: {
-    flexDirection: 'row',
-    gap: 10,
-    padding: 16,
-  },
-  modalButton: {
-    flex: 1,
-    paddingVertical: 12,
-    borderRadius: 12,
-    alignItems: 'center',
-  },
-  modalButtonCancel: {
-    backgroundColor: COLORS.bg,
-    borderWidth: 1,
-    borderColor: COLORS.border,
-  },
-  modalButtonCancelText: {
-    fontSize: FONT.body,
-    color: COLORS.text,
-    fontWeight: '600',
-  },
-  modalButtonConfirm: {
-    backgroundColor: COLORS.primary,
-  },
-  modalButtonConfirmText: {
-    fontSize: FONT.control,
-    color: '#FFFFFF',
-    fontWeight: '700',
+    marginTop: 16,
   },
 });

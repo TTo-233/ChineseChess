@@ -7,11 +7,11 @@ import {
   FlatList,
   StyleSheet,
   ActivityIndicator,
-  Modal,
   ScrollView,
   TouchableWithoutFeedback,
 } from 'react-native';
 import { Screen } from '@/components/Screen';
+import { AppModal, ModalButton, modalButtonRowStyle } from '@/components/Modal';
 import { useSafeRouter } from '@/hooks/useSafeRouter';
 import { useFocusEffect } from 'expo-router';
 import { FontAwesome6 } from '@expo/vector-icons';
@@ -649,85 +649,73 @@ export default function LanGameScreen() {
         </ScrollView>
 
         {/* 服务器设置弹窗 */}
-        <Modal visible={showServerModal} transparent animationType="fade"
-        statusBarTranslucent>
-          <View style={styles.modalOverlay}>
-            <View style={styles.modalContent}>
-              <Text style={styles.modalTitle}>服务器设置</Text>
-              <TextInput
-                style={styles.serverInput}
-                value={serverInput}
-                onChangeText={(text) => {
-                  setServerInput(text);
-                  setTestResult(null);
-                }}
-                placeholder="https://服务器地址:端口"
-                placeholderTextColor={COLORS.textLight}
-                autoCapitalize="none"
-                autoCorrect={false}
-                keyboardType="url"
-              />
-              <View style={styles.testRow}>
-                <TouchableOpacity
-                  style={styles.testBtn}
-                  onPress={handleTestServer}
-                  disabled={testing}
-                >
-                  {testing ? (
-                    <ActivityIndicator size="small" color={COLORS.primary} />
-                  ) : (
-                    <Text style={styles.testBtnText}>测试连接</Text>
-                  )}
-                </TouchableOpacity>
-                {testResult && (
-                  <Text
-                    style={[
-                      styles.testResultText,
-                      testResult.startsWith('连接成功') ? styles.testOk : styles.testFail,
-                    ]}
-                  >
-                    {testResult}
-                  </Text>
-                )}
-              </View>
-              <View style={styles.modalButtons}>
-                <TouchableOpacity
-                  style={styles.modalButtonCancel}
-                  onPress={handleResetServer}
-                >
-                  <Text style={styles.modalButtonTextCancel}>恢复默认</Text>
-                </TouchableOpacity>
-                <TouchableOpacity
-                  style={styles.modalButtonConfirm}
-                  onPress={handleSaveServer}
-                >
-                  <Text style={styles.modalButtonTextConfirm}>保存</Text>
-                </TouchableOpacity>
-              </View>
-              <TouchableOpacity
-                style={styles.modalCloseBtn}
-                onPress={() => setShowServerModal(false)}
+        <AppModal
+          visible={showServerModal}
+          onClose={() => setShowServerModal(false)}
+          title="服务器设置"
+          showCloseBtn
+          closeBtnType="text"
+        >
+          <TextInput
+            style={styles.serverInput}
+            value={serverInput}
+            onChangeText={(text) => {
+              setServerInput(text);
+              setTestResult(null);
+            }}
+            placeholder="https://服务器地址:端口"
+            placeholderTextColor={COLORS.textLight}
+            autoCapitalize="none"
+            autoCorrect={false}
+            keyboardType="url"
+          />
+          <View style={styles.testRow}>
+            <TouchableOpacity
+              style={styles.testBtn}
+              onPress={handleTestServer}
+              disabled={testing}
+            >
+              {testing ? (
+                <ActivityIndicator size="small" color={COLORS.primary} />
+              ) : (
+                <Text style={styles.testBtnText}>测试连接</Text>
+              )}
+            </TouchableOpacity>
+            {testResult && (
+              <Text
+                style={[
+                  styles.testResultText,
+                  testResult.startsWith('连接成功') ? styles.testOk : styles.testFail,
+                ]}
               >
-                <Text style={styles.modalButtonTextCancel}>取消</Text>
-              </TouchableOpacity>
-            </View>
+                {testResult}
+              </Text>
+            )}
           </View>
-        </Modal>
+          <View style={[modalButtonRowStyle, styles.serverFooter]}>
+            <ModalButton label="恢复默认" variant="secondary" onPress={handleResetServer} />
+            <ModalButton label="保存" onPress={handleSaveServer} />
+          </View>
+        </AppModal>
 
         {/* 房间设置弹窗 */}
-        <Modal visible={showSettings} transparent animationType="fade"
-        statusBarTranslucent>
-          <View style={styles.modalOverlay}>
-            <View style={styles.modalContent}>
-              <ScrollView style={{ flexGrow: 0 }} showsVerticalScrollIndicator={false}>
-              {openSelect && (
-                <TouchableWithoutFeedback onPress={() => setOpenSelect(null)}>
-                  <View style={formStyles.selectBackdrop} />
-                </TouchableWithoutFeedback>
-              )}
-              <Text style={styles.modalTitle}>创建房间</Text>
+        <AppModal
+          visible={showSettings}
+          onClose={() => setShowSettings(false)}
+          title="创建房间"
+        >
+          <ScrollView
+            style={{ flexGrow: 0 }}
+            showsVerticalScrollIndicator={false}
+            keyboardShouldPersistTaps="handled"
+          >
+            {openSelect && (
+              <TouchableWithoutFeedback onPress={() => setOpenSelect(null)}>
+                <View style={formStyles.selectBackdrop} />
+              </TouchableWithoutFeedback>
+            )}
 
-              <View style={formStyles.fieldRowInline}>
+            <View style={formStyles.fieldRowInline}>
                 <View style={formStyles.fieldCol}>
                   <Text style={formStyles.fieldLabel}>房间名</Text>
                   <TextInput
@@ -809,78 +797,45 @@ export default function LanGameScreen() {
 
               {createError ? <Text style={styles.modalErrorText}>{createError}</Text> : null}
 
-              <View style={styles.modalButtons}>
-                <TouchableOpacity
-                  style={styles.modalButtonCancel}
-                  onPress={() => setShowSettings(false)}
-                >
-                  <Text style={styles.modalButtonTextCancel}>取消</Text>
-                </TouchableOpacity>
-                <TouchableOpacity
-                  style={styles.modalButtonConfirm}
-                  onPress={handleConfirmCreate}
-                  disabled={loading}
-                >
-                  {loading ? (
-                    <ActivityIndicator size="small" color="#fff" />
-                  ) : (
-                    <Text style={styles.modalButtonTextConfirm}>创建</Text>
-                  )}
-                </TouchableOpacity>
+              <View style={[modalButtonRowStyle, styles.settingsFooter]}>
+                <ModalButton label="取消" variant="secondary" onPress={() => setShowSettings(false)} />
+                <ModalButton label="创建" onPress={handleConfirmCreate} loading={loading} disabled={loading} />
               </View>
-              </ScrollView>
-            </View>
-          </View>
-        </Modal>
+          </ScrollView>
+        </AppModal>
 
         {/* 密码房间加入弹窗 */}
-        <Modal visible={!!passwordRoom} transparent animationType="fade"
-        statusBarTranslucent>
-          <View style={styles.modalOverlay}>
-            <View style={styles.modalContent}>
-              <Text style={styles.modalTitle}>加入房间</Text>
-              <Text style={styles.passwordRoomName} numberOfLines={1}>
-                {passwordRoom?.name ?? ''}
-              </Text>
-              <View style={styles.fieldRow}>
-                <Text style={formStyles.fieldLabel}>房间密码</Text>
-                <TextInput
-                  style={formStyles.fieldInput}
-                  value={joinPassword}
-                  onChangeText={(t) => {
-                    setJoinPassword(t.replace(/\D/g, ''));
-                    setJoinError('');
-                  }}
-                  placeholder="请输入房间密码"
-                  placeholderTextColor={COLORS.textLight}
-                  keyboardType="number-pad"
-                  autoFocus
-                  maxLength={6}
-                />
-              </View>
-              {joinError ? <Text style={styles.modalErrorText}>{joinError}</Text> : null}
-              <View style={styles.modalButtons}>
-                <TouchableOpacity
-                  style={styles.modalButtonCancel}
-                  onPress={() => setPasswordRoom(null)}
-                >
-                  <Text style={styles.modalButtonTextCancel}>取消</Text>
-                </TouchableOpacity>
-                <TouchableOpacity
-                  style={styles.modalButtonConfirm}
-                  onPress={handlePasswordJoin}
-                  disabled={loading}
-                >
-                  {loading ? (
-                    <ActivityIndicator size="small" color="#fff" />
-                  ) : (
-                    <Text style={styles.modalButtonTextConfirm}>加入</Text>
-                  )}
-                </TouchableOpacity>
-              </View>
-            </View>
+        <AppModal
+          visible={!!passwordRoom}
+          onClose={() => setPasswordRoom(null)}
+          title="加入房间"
+          avoidKeyboard
+        >
+          <Text style={styles.passwordRoomName} numberOfLines={1}>
+            {passwordRoom?.name ?? ''}
+          </Text>
+          <View style={styles.fieldRow}>
+            <Text style={formStyles.fieldLabel}>房间密码</Text>
+            <TextInput
+              style={formStyles.fieldInput}
+              value={joinPassword}
+              onChangeText={(t) => {
+                setJoinPassword(t.replace(/\D/g, ''));
+                setJoinError('');
+              }}
+              placeholder="请输入房间密码"
+              placeholderTextColor={COLORS.textLight}
+              keyboardType="number-pad"
+              autoFocus
+              maxLength={6}
+            />
           </View>
-        </Modal>
+          {joinError ? <Text style={styles.modalErrorText}>{joinError}</Text> : null}
+          <View style={[modalButtonRowStyle, styles.settingsFooter]}>
+            <ModalButton label="取消" variant="secondary" onPress={() => setPasswordRoom(null)} />
+            <ModalButton label="加入" onPress={handlePasswordJoin} loading={loading} disabled={loading} />
+          </View>
+        </AppModal>
       </View>
     </Screen>
   );
@@ -1275,27 +1230,16 @@ const styles = StyleSheet.create({
     fontSize: FONT.control,
     fontWeight: '700',
   },
-  // 弹窗样式
-  modalOverlay: {
-    flex: 1,
-    backgroundColor: 'rgba(0,0,0,0.5)',
-    alignItems: 'center',
-    justifyContent: 'center',
+  // 弹窗遮罩/卡片/标题/按钮样式已收敛到 @/components/Modal（AppModal / ModalButton），
+  // 尺寸与配色统一走 @/constants/modal 的 Design Tokens。
+  // 内边距（左右 24 / 上 20 / 下 24）由 AppModal 的 body 统一提供，
+  // 这里不再覆盖 paddingHorizontal —— 否则表单标签会贴到卡片边框上。
+  // 只保留按钮行与上一个区块之间的间距。
+  settingsFooter: {
+    marginTop: 20,
   },
-  modalContent: {
-    backgroundColor: COLORS.card,
-    borderRadius: 16,
-    padding: 24,
-    width: '85%',
-    maxWidth: 360,
-    maxHeight: '88%',
-  },
-  modalTitle: {
-    fontSize: FONT.title,
-    fontWeight: 'bold',
-    color: COLORS.textPrimary,
-    marginBottom: 16,
-    textAlign: 'center',
+  serverFooter: {
+    marginTop: 20,
   },
   serverInput: {
     backgroundColor: COLORS.background,
@@ -1333,38 +1277,5 @@ const styles = StyleSheet.create({
   },
   testFail: {
     color: COLORS.danger,
-  },
-  modalButtons: {
-    flexDirection: 'row',
-    gap: 12,
-    marginTop: 20,
-  },
-  modalButtonCancel: {
-    flex: 1,
-    backgroundColor: COLORS.background,
-    borderRadius: 10,
-    padding: 12,
-    alignItems: 'center',
-  },
-  modalButtonTextCancel: {
-    color: COLORS.textSecondary,
-    fontSize: FONT.body,
-  },
-  modalButtonConfirm: {
-    flex: 1,
-    backgroundColor: COLORS.primary,
-    borderRadius: 10,
-    padding: 12,
-    alignItems: 'center',
-  },
-  modalButtonTextConfirm: {
-    color: '#fff',
-    fontSize: FONT.control,
-    fontWeight: '600',
-  },
-  modalCloseBtn: {
-    marginTop: 10,
-    padding: 10,
-    alignItems: 'center',
   },
 });

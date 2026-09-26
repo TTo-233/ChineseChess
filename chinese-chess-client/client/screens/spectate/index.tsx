@@ -20,6 +20,7 @@ import { BattleSocket } from '@/utils/battleSocket';
 import { useBoardLayoutBudget, capHostHeightToViewport } from '@/utils/chess/capturedDrawerMetrics';
 import { boardAlignedRowStyle } from '@/utils/chess/boardContentWidth';
 import { useBoardStyle } from '@/utils/chess/boardStyleStore';
+import { Z_INDEX, ELEVATION } from '@/constants/modal';
 import { FONT } from '@/utils/typography';
 
 const COLORS = {
@@ -674,7 +675,9 @@ const styles = StyleSheet.create({
     backgroundColor: 'rgba(0, 0, 0, 0.45)',
     alignItems: 'center',
     justifyContent: 'center',
-    zIndex: 50,
+    // 棋盘内部存在 elevation 层，仅 zIndex 不足以盖住，需同时给 elevation
+    zIndex: Z_INDEX.drawer,
+    elevation: ELEVATION.drawer,
   },
   overlayCard: {
     width: '78%',

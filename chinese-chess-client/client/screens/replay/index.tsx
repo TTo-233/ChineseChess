@@ -14,9 +14,9 @@ import {
   TouchableOpacity,
   StyleSheet,
   FlatList,
-  Modal,
 } from 'react-native';
 import { Screen } from '@/components/Screen';
+import { AppDialog } from '@/components/Modal';
 import { useSafeRouter } from '@/hooks/useSafeRouter';
 import { useFocusEffect } from 'expo-router';
 import { FontAwesome6 } from '@expo/vector-icons';
@@ -382,30 +382,17 @@ export default function ReplayListScreen() {
         )}
 
         {/* 删除确认弹窗 */}
-        <Modal visible={confirmVisible} transparent animationType="fade">
-          <View style={styles.modalMask}>
-            <View style={styles.modalCard}>
-              <Text style={styles.modalTitle}>删除对局</Text>
-              <Text style={styles.modalMessage}>
-                确定删除选中的 {selectedIds.size} 局对局吗？{'\n'}收藏的对局不会被删除。
-              </Text>
-              <View style={styles.modalButtons}>
-                <TouchableOpacity
-                  style={[styles.modalButton, styles.modalCancelButton]}
-                  onPress={() => setConfirmVisible(false)}
-                >
-                  <Text style={styles.modalCancelText}>取消</Text>
-                </TouchableOpacity>
-                <TouchableOpacity
-                  style={[styles.modalButton, styles.modalDeleteButton]}
-                  onPress={handleConfirmDelete}
-                >
-                  <Text style={styles.modalDeleteText}>{deleting ? '删除中…' : '确认删除'}</Text>
-                </TouchableOpacity>
-              </View>
-            </View>
-          </View>
-        </Modal>
+        <AppDialog
+          visible={confirmVisible}
+          title="删除对局"
+          message={`确定删除选中的 ${selectedIds.size} 局对局吗？\n收藏的对局不会被删除。`}
+          cancelText="取消"
+          confirmText={deleting ? '删除中…' : '确认删除'}
+          danger
+          loading={deleting}
+          onCancel={() => setConfirmVisible(false)}
+          onConfirm={handleConfirmDelete}
+        />
       </View>
     </Screen>
   );
@@ -650,61 +637,6 @@ const styles = StyleSheet.create({
     fontWeight: '600',
     color: COLORS.text,
   },
-  modalMask: {
-    flex: 1,
-    backgroundColor: 'rgba(0,0,0,0.45)',
-    justifyContent: 'center',
-    alignItems: 'center',
-    padding: 32,
-  },
-  modalCard: {
-    width: '100%',
-    backgroundColor: COLORS.bgCard,
-    borderRadius: 16,
-    padding: 20,
-    borderWidth: 1,
-    borderColor: COLORS.border,
-  },
-  modalTitle: {
-    fontSize: FONT.title,
-    fontWeight: '700',
-    color: COLORS.text,
-    textAlign: 'center',
-  },
-  modalMessage: {
-    fontSize: FONT.body,
-    color: COLORS.textMuted,
-    textAlign: 'center',
-    lineHeight: 22,
-    marginTop: 10,
-  },
-  modalButtons: {
-    flexDirection: 'row',
-    gap: 10,
-    marginTop: 18,
-  },
-  modalButton: {
-    flex: 1,
-    paddingVertical: 11,
-    borderRadius: 12,
-    alignItems: 'center',
-  },
-  modalCancelButton: {
-    backgroundColor: COLORS.bg,
-    borderWidth: 1,
-    borderColor: COLORS.border,
-  },
-  modalCancelText: {
-    fontSize: FONT.body,
-    fontWeight: '600',
-    color: COLORS.text,
-  },
-  modalDeleteButton: {
-    backgroundColor: COLORS.danger,
-  },
-  modalDeleteText: {
-    fontSize: FONT.control,
-    fontWeight: '700',
-    color: '#FFF',
-  },
+  // 弹窗遮罩/卡片/标题/按钮样式已收敛到 @/components/Modal（AppDialog / ModalButton），
+  // 尺寸与配色统一走 @/constants/modal 的 Design Tokens。
 });

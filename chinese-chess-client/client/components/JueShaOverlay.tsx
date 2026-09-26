@@ -17,6 +17,7 @@
  */
 import React, { useEffect, useState } from 'react';
 import { Animated, Image, StyleSheet, Text, TouchableOpacity, useWindowDimensions, View } from 'react-native';
+import { COLORS as MODAL_COLORS, RADIUS } from '@/constants/modal';
 import { FONT } from '@/utils/typography';
 
 // 原项目素材尺寸（基于629x695棋盘网格区域）
@@ -280,11 +281,17 @@ export default function JueShaOverlay({
       </View>
       )}
 
-      {/* 结果文字 + 按钮区域：排到棋盘正下方 */}
-      <Animated.View style={[styles.buttonsArea, { opacity: buttonsOpacity, top: buttonsTop }]}>
+      {/* 结果提示条 + 按钮区域：结果文字以 GameNotice 样式（棋盘中央深色半透明条，
+          非全屏遮罩，棋盘仍然可辨认）呈现；操作按钮排在棋盘正下方 */}
+      <Animated.View style={[styles.noticeArea, { opacity: buttonsOpacity, top: boardCenterY }]}>
         {resultText ? (
-          <Text style={styles.resultText}>{resultText}</Text>
+          <View style={styles.resultBar}>
+            <Text style={styles.resultText}>{resultText}</Text>
+          </View>
         ) : null}
+      </Animated.View>
+
+      <Animated.View style={[styles.buttonsArea, { opacity: buttonsOpacity, top: buttonsTop }]}>
         <View style={styles.buttonsRow}>
           {onNextLevel && (
             <TouchableOpacity style={styles.buttonPrimary} onPress={onNextLevel}>
@@ -331,6 +338,24 @@ const styles = StyleSheet.create({
     width: '100%',
     height: '100%',
   },
+  noticeArea: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    alignItems: 'center',
+    transform: [{ translateY: '-50%' }],
+  },
+  /**
+   * 结果提示条：与对局内 GameNotice 同一视觉规范（@/constants/modal 的 COLORS.noticeBg /
+   * RADIUS.notice / 16-24 内边距），只是不自动消失——结算必须等用户选择去留。
+   */
+  resultBar: {
+    backgroundColor: MODAL_COLORS.noticeBg,
+    borderRadius: RADIUS.notice,
+    paddingVertical: 16,
+    paddingHorizontal: 24,
+    alignItems: 'center',
+  },
   buttonsArea: {
     position: 'absolute',
     left: 0,
@@ -338,13 +363,10 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   resultText: {
-    fontSize: FONT.display,
-    fontWeight: '600',
-    color: '#5D4037',
-    marginBottom: 8,
-    textShadowColor: 'rgba(255,255,255,0.8)',
-    textShadowOffset: { width: 0, height: 1 },
-    textShadowRadius: 4,
+    fontSize: FONT.control,
+    fontWeight: '700',
+    color: MODAL_COLORS.noticeText,
+    textAlign: 'center',
   },
   buttonsRow: {
     flexDirection: 'row',
