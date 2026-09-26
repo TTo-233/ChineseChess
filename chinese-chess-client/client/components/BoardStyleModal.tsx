@@ -20,6 +20,7 @@ import {
 import { FontAwesome6 } from '@expo/vector-icons';
 import { BOARD_STYLES, type BoardStyle } from '@/utils/chess/boardStyles';
 import { useBoardStyle, setBoardStyleId } from '@/utils/chess/boardStyleStore';
+import { FONT } from '@/utils/typography';
 
 const COLORS = {
   primary: '#8B6914',
@@ -157,12 +158,12 @@ const styles = StyleSheet.create({
     flex: 1,
   },
   title: {
-    fontSize: 17,
+    fontSize: FONT.title,
     fontWeight: '700',
     color: COLORS.text,
   },
   subtitle: {
-    fontSize: 11,
+    fontSize: FONT.caption,
     color: COLORS.textMuted,
     marginTop: 2,
   },
@@ -218,7 +219,7 @@ const styles = StyleSheet.create({
   },
   cardName: {
     marginTop: 8,
-    fontSize: 14,
+    fontSize: FONT.body,
     fontWeight: '700',
     color: COLORS.text,
     textAlign: 'center',
@@ -228,7 +229,7 @@ const styles = StyleSheet.create({
   },
   cardDesc: {
     marginTop: 2,
-    fontSize: 10,
+    fontSize: FONT.micro,
     color: COLORS.textMuted,
     textAlign: 'center',
   },
@@ -243,7 +244,7 @@ const styles = StyleSheet.create({
   },
   doneBtnText: {
     color: '#FFF8F0',
-    fontSize: 15,
+    fontSize: FONT.control,
     fontWeight: '700',
     letterSpacing: 2,
   },

@@ -20,6 +20,7 @@ import { hasSave, loadGame, resolveFirstMover } from '@/utils/GameSave';
 import { loadProgress } from '@/utils/EndgameProgress';
 import { BUILTIN_ENDGAMES } from '@/utils/chess/endgames';
 import { preloadChessAssets } from '@/utils/preloadAssets';
+import { FONT } from '@/utils/typography';
 
 // 主题色 - 浅色复古系
 const COLORS = {
@@ -234,7 +235,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   titleChinese: {
-    fontSize: 36,
+    fontSize: FONT.hero,
     fontWeight: '900',
     color: COLORS.text,
     letterSpacing: 8,
@@ -246,7 +247,7 @@ const styles = StyleSheet.create({
     marginVertical: 12,
   },
   titleEnglish: {
-    fontSize: 12,
+    fontSize: FONT.caption,
     color: COLORS.textMuted,
     letterSpacing: 4,
     fontWeight: '500',
@@ -276,12 +277,12 @@ const styles = StyleSheet.create({
     flex: 1,
   },
   entryTitle: {
-    fontSize: 17,
+    fontSize: FONT.title,
     fontWeight: '700',
     color: COLORS.text,
   },
   entryDescription: {
-    fontSize: 12,
+    fontSize: FONT.caption,
     color: COLORS.textMuted,
     marginTop: 3,
   },
@@ -291,7 +292,7 @@ const styles = StyleSheet.create({
     gap: 4,
   },
   footerText: {
-    fontSize: 12,
+    fontSize: FONT.caption,
     color: COLORS.textMuted,
     opacity: 0.6,
   },

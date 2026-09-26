@@ -23,6 +23,7 @@ import { gridSpacingX, gridSpacingY } from '@/utils/chess/boardStyles';
 import { RED_SIDE, BLACK_SIDE } from '@/utils/chess/types';
 import MoveEffectOverlay, { type MoveEffect } from '@/components/MoveEffectOverlay';
 import Svg, { Circle, Line } from 'react-native-svg';
+import { FONT } from '@/utils/typography';
 
 interface ChessBoardProps {
   gameState: GameState;
@@ -1089,7 +1090,7 @@ const styles = StyleSheet.create({
     // 间距通过 capturedPieceItem 的 marginHorizontal 实现。
   },
   capturedTitle: {
-    fontSize: 14,
+    fontSize: FONT.body,
     color: '#666',
   },
   capturedPieceItem: {

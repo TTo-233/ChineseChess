@@ -32,6 +32,7 @@ import {
   updateCustomEndgame,
   markPendingFocusCustomTab,
 } from '@/utils/EndgameProgress';
+import { FONT } from '@/utils/typography';
 
 // 主题色（与残局选关页一致）
 const COLORS = {
@@ -676,7 +677,7 @@ const styles = StyleSheet.create({
     gap: 8,
   },
   headerTitle: {
-    fontSize: 17,
+    fontSize: FONT.title,
     fontWeight: '700',
     color: COLORS.text,
   },
@@ -704,7 +705,7 @@ const styles = StyleSheet.create({
     backgroundColor: 'rgba(139, 105, 20, 0.12)',
   },
   selectHalfText: {
-    fontSize: 14,
+    fontSize: FONT.body,
     color: '#666',
   },
   selectHalfTextActive: {
@@ -764,7 +765,7 @@ const styles = StyleSheet.create({
     backgroundColor: 'rgba(139, 105, 20, 0.14)',
   },
   hintText: {
-    fontSize: 12,
+    fontSize: FONT.caption,
     color: COLORS.textMuted,
     textAlign: 'center',
     marginTop: 10,
@@ -793,7 +794,7 @@ const styles = StyleSheet.create({
   },
   boardErrorText: {
     flex: 1,
-    fontSize: 12,
+    fontSize: FONT.caption,
     color: COLORS.accent,
   },
   saveButton: {
@@ -806,7 +807,7 @@ const styles = StyleSheet.create({
     paddingVertical: 13,
   },
   saveButtonText: {
-    fontSize: 15,
+    fontSize: FONT.control,
     fontWeight: '700',
     color: '#FFFFFF',
   },
@@ -834,7 +835,7 @@ const styles = StyleSheet.create({
     borderBottomColor: COLORS.border,
   },
   modalTitle: {
-    fontSize: 16,
+    fontSize: FONT.title,
     fontWeight: '700',
     color: COLORS.text,
   },
@@ -844,7 +845,7 @@ const styles = StyleSheet.create({
     paddingBottom: 4,
   },
   fieldLabel: {
-    fontSize: 12,
+    fontSize: FONT.body,
     color: COLORS.textMuted,
     marginBottom: 6,
     marginTop: 8,
@@ -854,7 +855,7 @@ const styles = StyleSheet.create({
     borderRadius: 12,
     paddingHorizontal: 12,
     paddingVertical: 10,
-    fontSize: 14,
+    fontSize: FONT.control,
     color: COLORS.text,
   },
   inputMultiline: {
@@ -862,13 +863,13 @@ const styles = StyleSheet.create({
     textAlignVertical: 'top',
   },
   errorText: {
-    fontSize: 12,
+    fontSize: FONT.caption,
     color: COLORS.accent,
     marginTop: 10,
   },
   // 导出弹窗内的正常提示（校验通过 / 已复制）
   fenOkText: {
-    fontSize: 12,
+    fontSize: FONT.caption,
     color: '#3E7C4F',
     marginTop: 10,
   },
@@ -889,7 +890,7 @@ const styles = StyleSheet.create({
     borderColor: COLORS.border,
   },
   modalButtonCancelText: {
-    fontSize: 14,
+    fontSize: FONT.body,
     color: COLORS.text,
     fontWeight: '600',
   },
@@ -897,7 +898,7 @@ const styles = StyleSheet.create({
     backgroundColor: COLORS.primary,
   },
   modalButtonConfirmText: {
-    fontSize: 14,
+    fontSize: FONT.control,
     color: '#FFFFFF',
     fontWeight: '700',
   },

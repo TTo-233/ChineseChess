@@ -5,6 +5,7 @@
 import React from 'react';
 import { StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import { FontAwesome6 } from '@expo/vector-icons';
+import { FONT } from '@/utils/typography';
 
 const COLORS = {
   background: '#F5EFE6',
@@ -100,7 +101,7 @@ export const formStyles = StyleSheet.create({
     flex: 1,
   },
   fieldLabel: {
-    fontSize: 13,
+    fontSize: FONT.body,
     color: COLORS.textSecondary,
     marginBottom: 6,
   },
@@ -109,7 +110,7 @@ export const formStyles = StyleSheet.create({
     borderRadius: 10,
     paddingVertical: 10,
     paddingHorizontal: 12,
-    fontSize: 15,
+    fontSize: FONT.control,
     color: COLORS.textPrimary,
   },
   // 只读值展示框（非房主/对局阶段查看模式，与输入框同款视觉）
@@ -121,11 +122,11 @@ export const formStyles = StyleSheet.create({
     justifyContent: 'center',
   },
   fieldValueText: {
-    fontSize: 15,
+    fontSize: FONT.control,
     color: COLORS.textPrimary,
   },
   settingsSectionTitle: {
-    fontSize: 15,
+    fontSize: FONT.control,
     fontWeight: '700',
     color: COLORS.textPrimary,
     marginTop: 14,
@@ -144,13 +145,13 @@ export const formStyles = StyleSheet.create({
     elevation: 10,
   },
   selectHint: {
-    fontSize: 12,
+    fontSize: FONT.caption,
     color: COLORS.textLight,
     marginTop: 2,
     marginBottom: 4,
   },
   hcSummary: {
-    fontSize: 12,
+    fontSize: FONT.caption,
     color: COLORS.textSecondary,
     textAlign: 'center',
     marginTop: 6,
@@ -178,7 +179,7 @@ const styles = StyleSheet.create({
     gap: 6,
   },
   selectLabel: {
-    fontSize: 14,
+    fontSize: FONT.body,
     fontWeight: '600',
     color: COLORS.textSecondary,
     width: 30,
@@ -200,7 +201,7 @@ const styles = StyleSheet.create({
   },
   selectPillText: {
     flex: 1,
-    fontSize: 13,
+    fontSize: FONT.control,
     fontWeight: '600',
     color: COLORS.textSecondary,
   },
@@ -250,7 +251,7 @@ const styles = StyleSheet.create({
     borderColor: COLORS.primary,
   },
   selectOptionText: {
-    fontSize: 12,
+    fontSize: FONT.control,
     color: COLORS.textSecondary,
   },
   selectOptionTextActive: {

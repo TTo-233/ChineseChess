@@ -50,6 +50,7 @@ import {
   deleteEndgameBattle,
   type EndgameLaunchParams,
 } from '@/utils/EndgameProgress';
+import { FONT } from '@/utils/typography';
 
 const { width: SCREEN_WIDTH, height: SCREEN_HEIGHT } = Dimensions.get('window');
 
@@ -524,9 +525,9 @@ export default function GameScreen() {
             if (!aiWon && currentEndgame) {
               // AI 被判负等同玩家过关：同样记录通关与评级（本路径玩家未消耗提示）
               if (currentEndgame.levelIndex >= 0) {
-                markLevelCompleted(currentEndgame.levelIndex, 3 - endgameHintLeft);
+                markLevelCompleted(currentEndgame.levelIndex, ENDGAME_HINT_LIMIT - endgameHintLeft);
               } else if (currentEndgame.customId) {
-                markCustomCompleted(currentEndgame.customId, 3 - endgameHintLeft);
+                markCustomCompleted(currentEndgame.customId, ENDGAME_HINT_LIMIT - endgameHintLeft);
               }
             }
             deleteEndgameBattle(); // 残局终局：清除残局局内存档（不动人机存档）
@@ -1432,7 +1433,7 @@ const styles = StyleSheet.create({
     maxWidth: '92%',
   },
   ruleNoticeText: {
-    fontSize: 13,
+    fontSize: FONT.body,
     color: '#8a5a00',
     flexShrink: 1,
   },
@@ -1479,12 +1480,12 @@ const styles = StyleSheet.create({
     gap: 6,
   },
   gameTitle: {
-    fontSize: 16,
+    fontSize: FONT.title,
     fontWeight: '700',
     color: COLORS.text,
   },
   gameSubtitle: {
-    fontSize: 13,
+    fontSize: FONT.caption,
     color: COLORS.textMuted,
     marginTop: 2,
     textAlign: 'center',
@@ -1509,7 +1510,7 @@ const styles = StyleSheet.create({
     borderRadius: 4,
   },
   turnText: {
-    fontSize: 13,
+    fontSize: FONT.caption,
     color: COLORS.text,
     fontWeight: '600',
   },
@@ -1545,7 +1546,7 @@ const styles = StyleSheet.create({
     backgroundColor: '#2E7D32',
   },
   aiNameChipText: {
-    fontSize: 12,
+    fontSize: FONT.caption,
     fontWeight: '600',
     color: COLORS.text,
     flexShrink: 1,
@@ -1563,11 +1564,11 @@ const styles = StyleSheet.create({
     gap: 6,
   },
   capturedLabel: {
-    fontSize: 13,
+    fontSize: FONT.caption,
     fontWeight: '500',
   },
   capturedCount: {
-    fontSize: 14,
+    fontSize: FONT.body,
     fontWeight: '700',
     color: COLORS.text,
   },
@@ -1613,7 +1614,7 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   actionButtonText: {
-    fontSize: 14,
+    fontSize: FONT.body,
     fontWeight: '600',
     color: COLORS.text,
   },
@@ -1635,7 +1636,7 @@ const styles = StyleSheet.create({
   },
   countBadgeText: {
     color: '#FFFFFF',
-    fontSize: 10,
+    fontSize: FONT.micro,
     fontWeight: '700',
     lineHeight: 13,
   },
@@ -1660,13 +1661,13 @@ const styles = StyleSheet.create({
     borderColor: COLORS.border,
   },
   gameOverTitle: {
-    fontSize: 24,
+    fontSize: FONT.displayLg,
     fontWeight: '700',
     color: COLORS.text,
     marginBottom: 8,
   },
   gameOverMessage: {
-    fontSize: 16,
+    fontSize: FONT.body,
     color: COLORS.textMuted,
     marginBottom: 24,
   },
@@ -1686,7 +1687,7 @@ const styles = StyleSheet.create({
     borderColor: COLORS.primary,
   },
   gameOverButtonText: {
-    fontSize: 14,
+    fontSize: FONT.control,
     fontWeight: '600',
     color: '#FFFFFF',
   },
@@ -1710,13 +1711,13 @@ const styles = StyleSheet.create({
     minWidth: 280,
   },
   modalTitle: {
-    fontSize: 18,
+    fontSize: FONT.title,
     fontWeight: '700',
     color: COLORS.text,
     marginBottom: 12,
   },
   modalMessage: {
-    fontSize: 14,
+    fontSize: FONT.body,
     color: COLORS.textMuted,
     marginBottom: 24,
     textAlign: 'center',
@@ -1739,12 +1740,12 @@ const styles = StyleSheet.create({
     borderColor: COLORS.border,
   },
   modalButtonText: {
-    fontSize: 14,
+    fontSize: FONT.control,
     fontWeight: '600',
     color: '#FFFFFF',
   },
   modalButtonSecondaryText: {
-    fontSize: 14,
+    fontSize: FONT.body,
     fontWeight: '600',
     color: COLORS.text,
   },

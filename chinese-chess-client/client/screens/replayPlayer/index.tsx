@@ -26,6 +26,7 @@ import { RED_SIDE, BLACK_SIDE } from '@/utils/chess/types';
 import { getReplay, type ReplayGame } from '@/utils/replayStorage';
 import { useBoardLayoutBudget } from '@/utils/chess/capturedDrawerMetrics';
 import { playSound, playJiangJunSound, preloadSounds, unloadAllSounds } from '@/utils/SoundManager';
+import { FONT } from '@/utils/typography';
 
 // 主题色 - 浅色复古系（与人机对战一致）
 const COLORS = {
@@ -357,12 +358,12 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   topBarTitle: {
-    fontSize: 16,
+    fontSize: FONT.title,
     fontWeight: '700',
     color: COLORS.text,
   },
   topBarSubtitle: {
-    fontSize: 12,
+    fontSize: FONT.caption,
     color: COLORS.textMuted,
     marginTop: 2,
   },
@@ -375,7 +376,7 @@ const styles = StyleSheet.create({
     backgroundColor: COLORS.bgCard,
   },
   resultChipText: {
-    fontSize: 13,
+    fontSize: FONT.caption,
     fontWeight: '700',
   },
   boardArea: {
@@ -388,7 +389,7 @@ const styles = StyleSheet.create({
     gap: 14,
   },
   missingText: {
-    fontSize: 14,
+    fontSize: FONT.body,
     color: COLORS.textMuted,
   },
   missingBackButton: {
@@ -398,7 +399,7 @@ const styles = StyleSheet.create({
     backgroundColor: COLORS.primary,
   },
   missingBackText: {
-    fontSize: 14,
+    fontSize: FONT.control,
     fontWeight: '600',
     color: '#FFF',
   },
@@ -418,12 +419,12 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
   },
   progressText: {
-    fontSize: 14,
+    fontSize: FONT.body,
     fontWeight: '700',
     color: COLORS.text,
   },
   progressHint: {
-    fontSize: 12,
+    fontSize: FONT.caption,
     color: COLORS.textMuted,
   },
   slider: {
@@ -453,7 +454,7 @@ const styles = StyleSheet.create({
     opacity: 0.4,
   },
   actionButtonText: {
-    fontSize: 14,
+    fontSize: FONT.body,
     fontWeight: '600',
     color: COLORS.text,
   },

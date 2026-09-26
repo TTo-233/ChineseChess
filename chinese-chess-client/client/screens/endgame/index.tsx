@@ -43,6 +43,7 @@ import {
   type CustomEndgame,
   type EndgameLaunchParams,
 } from '@/utils/EndgameProgress';
+import { FONT } from '@/utils/typography';
 
 // 主题色 - 浅色复古系（与首页一致）
 const COLORS = {
@@ -662,12 +663,12 @@ const styles = StyleSheet.create({
     gap: 6,
   },
   headerTitle: {
-    fontSize: 17,
+    fontSize: FONT.title,
     fontWeight: '700',
     color: COLORS.text,
   },
   headerSubtitle: {
-    fontSize: 12,
+    fontSize: FONT.caption,
     color: COLORS.textMuted,
     marginTop: 2,
   },
@@ -699,7 +700,7 @@ const styles = StyleSheet.create({
   },
   ruleLineText: {
     flex: 1,
-    fontSize: 14,
+    fontSize: FONT.body,
     color: COLORS.text,
     lineHeight: 20,
   },
@@ -733,12 +734,12 @@ const styles = StyleSheet.create({
     flex: 1,
   },
   resumeTitle: {
-    fontSize: 15,
+    fontSize: FONT.title,
     fontWeight: '700',
     color: COLORS.text,
   },
   resumeSubtitle: {
-    fontSize: 12,
+    fontSize: FONT.caption,
     color: COLORS.textMuted,
     marginTop: 2,
   },
@@ -766,7 +767,7 @@ const styles = StyleSheet.create({
     borderColor: COLORS.primary,
   },
   tabButtonText: {
-    fontSize: 14,
+    fontSize: FONT.body,
     fontWeight: '600',
     color: COLORS.textMuted,
   },
@@ -810,12 +811,12 @@ const styles = StyleSheet.create({
     transform: [{ rotate: '32deg' }],
   },
   levelNumber: {
-    fontSize: 22,
+    fontSize: FONT.display,
     fontWeight: '800',
     color: COLORS.primary,
   },
   levelName: {
-    fontSize: 11,
+    fontSize: FONT.caption,
     color: COLORS.text,
     marginTop: 4,
     maxWidth: '100%',
@@ -824,7 +825,7 @@ const styles = StyleSheet.create({
     color: COLORS.textMuted,
   },
   emptyText: {
-    fontSize: 13,
+    fontSize: FONT.body,
     color: COLORS.textMuted,
     textAlign: 'center',
     paddingVertical: 16,
@@ -879,7 +880,7 @@ const styles = StyleSheet.create({
     marginBottom: 12,
   },
   deleteToolbarInfo: {
-    fontSize: 13,
+    fontSize: FONT.body,
     color: COLORS.textMuted,
     flexShrink: 1,
   },
@@ -894,7 +895,7 @@ const styles = StyleSheet.create({
     backgroundColor: COLORS.bg,
   },
   deleteToolbarBtnText: {
-    fontSize: 13,
+    fontSize: FONT.body,
     color: COLORS.text,
     fontWeight: '600',
   },
@@ -908,7 +909,7 @@ const styles = StyleSheet.create({
     borderColor: '#FFD9D9',
   },
   deleteToolbarBtnDangerText: {
-    fontSize: 13,
+    fontSize: FONT.body,
     color: '#FFFFFF',
     fontWeight: '600',
   },
@@ -939,12 +940,12 @@ const styles = StyleSheet.create({
     flex: 1,
   },
   choiceTitle: {
-    fontSize: 14,
+    fontSize: FONT.body,
     fontWeight: '700',
     color: COLORS.text,
   },
   choiceSubtitle: {
-    fontSize: 11,
+    fontSize: FONT.caption,
     color: COLORS.textMuted,
     marginTop: 2,
   },
@@ -968,7 +969,7 @@ const styles = StyleSheet.create({
     paddingBottom: 8,
   },
   modalTitle: {
-    fontSize: 16,
+    fontSize: FONT.title,
     fontWeight: '700',
     color: COLORS.text,
   },
@@ -976,7 +977,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: 18,
   },
   fieldLabel: {
-    fontSize: 13,
+    fontSize: FONT.body,
     fontWeight: '600',
     color: COLORS.text,
     marginTop: 10,
@@ -989,7 +990,7 @@ const styles = StyleSheet.create({
     borderColor: COLORS.border,
     paddingHorizontal: 12,
     paddingVertical: 10,
-    fontSize: 14,
+    fontSize: FONT.control,
     color: COLORS.text,
   },
   inputMultiline: {
@@ -997,13 +998,13 @@ const styles = StyleSheet.create({
     textAlignVertical: 'top',
   },
   fieldHint: {
-    fontSize: 11,
+    fontSize: FONT.caption,
     color: COLORS.textMuted,
     marginTop: 6,
     lineHeight: 16,
   },
   errorText: {
-    fontSize: 13,
+    fontSize: FONT.caption,
     color: COLORS.accent,
     marginTop: 10,
     fontWeight: '600',
@@ -1027,12 +1028,12 @@ const styles = StyleSheet.create({
   },
   modalButtonText: {
     color: '#FFFFFF',
-    fontSize: 15,
+    fontSize: FONT.control,
     fontWeight: '600',
   },
   modalButtonSecondaryText: {
     color: COLORS.text,
-    fontSize: 15,
+    fontSize: FONT.body,
     fontWeight: '600',
   },
 });

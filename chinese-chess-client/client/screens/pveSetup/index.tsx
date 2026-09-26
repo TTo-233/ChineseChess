@@ -16,6 +16,7 @@ import { useSafeRouter } from '@/hooks/useSafeRouter';
 import { useFocusEffect } from 'expo-router';
 import { FontAwesome6 } from '@expo/vector-icons';
 import { hasSave, loadGame, deleteSave, resolveFirstMover } from '@/utils/GameSave';
+import { FONT } from '@/utils/typography';
 
 const COLORS = {
   primary: '#8B6914',
@@ -271,7 +272,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   topTitle: {
-    fontSize: 17,
+    fontSize: FONT.title,
     fontWeight: '700',
     color: COLORS.text,
   },
@@ -279,7 +280,7 @@ const styles = StyleSheet.create({
     marginBottom: 20,
   },
   sectionLabel: {
-    fontSize: 13,
+    fontSize: FONT.caption,
     color: COLORS.textMuted,
     marginBottom: 10,
     fontWeight: '500',
@@ -310,7 +311,7 @@ const styles = StyleSheet.create({
     borderRadius: 6,
   },
   sideButtonText: {
-    fontSize: 15,
+    fontSize: FONT.control,
     color: COLORS.textMuted,
     fontWeight: '600',
   },
@@ -318,7 +319,7 @@ const styles = StyleSheet.create({
     color: COLORS.primary,
   },
   sectionHint: {
-    fontSize: 12,
+    fontSize: FONT.caption,
     color: COLORS.textMuted,
     marginTop: 8,
     opacity: 0.8,
@@ -343,7 +344,7 @@ const styles = StyleSheet.create({
     borderColor: COLORS.gold,
   },
   difficultyLabel: {
-    fontSize: 15,
+    fontSize: FONT.body,
     fontWeight: '700',
     color: COLORS.textMuted,
   },
@@ -351,13 +352,13 @@ const styles = StyleSheet.create({
     color: COLORS.gold,
   },
   difficultyDesc: {
-    fontSize: 12,
+    fontSize: FONT.caption,
     color: COLORS.textMuted,
     opacity: 0.7,
   },
   hybridHint: {
     marginTop: 12,
-    fontSize: 12,
+    fontSize: FONT.caption,
     lineHeight: 18,
     color: COLORS.textMuted,
     opacity: 0.65,
@@ -373,7 +374,7 @@ const styles = StyleSheet.create({
     marginBottom: 10,
   },
   continueTitle: {
-    fontSize: 14,
+    fontSize: FONT.body,
     fontWeight: '700',
     color: COLORS.text,
   },
@@ -381,7 +382,7 @@ const styles = StyleSheet.create({
     marginLeft: 'auto',
   },
   continueInfoText: {
-    fontSize: 12,
+    fontSize: FONT.caption,
     color: COLORS.textMuted,
   },
   continueButtons: {
@@ -399,7 +400,7 @@ const styles = StyleSheet.create({
     gap: 6,
   },
   continueButtonText: {
-    fontSize: 13,
+    fontSize: FONT.body,
     fontWeight: '700',
     color: '#FFFFFF',
   },
@@ -414,7 +415,7 @@ const styles = StyleSheet.create({
     gap: 4,
   },
   deleteSaveButtonText: {
-    fontSize: 13,
+    fontSize: FONT.body,
     color: COLORS.textMuted,
   },
   continueDivider: {
@@ -441,7 +442,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: 32,
   },
   startButtonText: {
-    fontSize: 18,
+    fontSize: FONT.control,
     fontWeight: '800',
     color: '#fff',
     letterSpacing: 2,

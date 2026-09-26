@@ -17,6 +17,7 @@ import { playJiangJunSound, playSound, preloadSounds, unloadAllSounds } from '@/
 import { getOnlineServerUrl } from '@/utils/serverConfig';
 import { BattleSocket } from '@/utils/battleSocket';
 import { useBoardLayoutBudget } from '@/utils/chess/capturedDrawerMetrics';
+import { FONT } from '@/utils/typography';
 
 const COLORS = {
   background: '#F5F0E8',
@@ -514,12 +515,12 @@ const styles = StyleSheet.create({
     paddingHorizontal: 4,
   },
   gameTitle: {
-    fontSize: 17,
+    fontSize: FONT.title,
     fontWeight: '700',
     color: COLORS.textPrimary,
   },
   gameSubtitle: {
-    fontSize: 12,
+    fontSize: FONT.caption,
     color: COLORS.textLight,
     marginTop: 2,
   },
@@ -560,7 +561,7 @@ const styles = StyleSheet.create({
     borderRadius: 4,
   },
   nameChipText: {
-    fontSize: 13,
+    fontSize: FONT.caption,
     fontWeight: '600',
     color: COLORS.textPrimary,
     flexShrink: 1,
@@ -576,7 +577,7 @@ const styles = StyleSheet.create({
     backgroundColor: 'rgba(46, 125, 50, 0.12)',
   },
   readyTagText: {
-    fontSize: 10,
+    fontSize: FONT.micro,
     fontWeight: '600',
   },
   readyTagTextOn: {
@@ -602,7 +603,7 @@ const styles = StyleSheet.create({
     borderColor: COLORS.borderSolid,
   },
   infoPillText: {
-    fontSize: 12,
+    fontSize: FONT.caption,
     color: COLORS.textSecondary,
     fontWeight: '600',
   },
@@ -621,7 +622,7 @@ const styles = StyleSheet.create({
     borderColor: COLORS.borderSolid,
   },
   loadingText: {
-    fontSize: 14,
+    fontSize: FONT.body,
     color: COLORS.textLight,
   },
   overlay: {
@@ -640,12 +641,12 @@ const styles = StyleSheet.create({
     gap: 10,
   },
   overlayTitle: {
-    fontSize: 18,
+    fontSize: FONT.title,
     fontWeight: '700',
     color: COLORS.textPrimary,
   },
   overlayDesc: {
-    fontSize: 13,
+    fontSize: FONT.caption,
     color: COLORS.textLight,
     textAlign: 'center',
   },
@@ -658,7 +659,7 @@ const styles = StyleSheet.create({
   },
   overlayBtnText: {
     color: '#FFFFFF',
-    fontSize: 14,
+    fontSize: FONT.control,
     fontWeight: '700',
   },
 });

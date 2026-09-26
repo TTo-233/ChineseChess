@@ -42,6 +42,7 @@ import {
   INCREMENT_OPTIONS,
   BYOYOMI_OPTIONS,
 } from '@/components/RoomSettingsControls';
+import { FONT } from '@/utils/typography';
 
 const COLORS = {
   background: '#F5F0E8',
@@ -2884,12 +2885,12 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   gameTitle: {
-    fontSize: 16,
+    fontSize: FONT.title,
     fontWeight: '700',
     color: COLORS.textPrimary,
   },
   gameSubtitle: {
-    fontSize: 13,
+    fontSize: FONT.caption,
     color: COLORS.textLight,
     marginTop: 2,
     textAlign: 'center',
@@ -2913,7 +2914,7 @@ const styles = StyleSheet.create({
     borderRadius: 4,
   },
   turnText: {
-    fontSize: 13,
+    fontSize: FONT.caption,
     color: COLORS.textSecondary,
   },
   // 浮层（覆盖在棋盘上方）
@@ -2961,13 +2962,13 @@ const styles = StyleSheet.create({
     gap: 4,
   },
   playerChipName: {
-    fontSize: 14,
+    fontSize: FONT.body,
     fontWeight: '700',
     color: COLORS.textPrimary,
     maxWidth: '100%',
   },
   vsText: {
-    fontSize: 13,
+    fontSize: FONT.caption,
     fontWeight: '800',
     color: COLORS.textLight,
   },
@@ -3011,7 +3012,7 @@ const styles = StyleSheet.create({
     backgroundColor: '#3C2A1E',
   },
   sidePickBtnText: {
-    fontSize: 15,
+    fontSize: FONT.control,
     fontWeight: '600',
     color: COLORS.textSecondary,
   },
@@ -3039,13 +3040,13 @@ const styles = StyleSheet.create({
     backgroundColor: COLORS.card,
   },
   sideBadgeTextSolid: {
-    fontSize: 10,
+    fontSize: FONT.micro,
     fontWeight: '700',
     color: '#FFFFFF',
     lineHeight: 13,
   },
   sideBadgeTextOutline: {
-    fontSize: 10,
+    fontSize: FONT.micro,
     fontWeight: '700',
     lineHeight: 13,
   },
@@ -3056,37 +3057,37 @@ const styles = StyleSheet.create({
     paddingVertical: 6,
   },
   sideResultMain: {
-    fontSize: 24,
+    fontSize: FONT.displayLg,
     fontWeight: 'bold',
     marginTop: 10,
     marginBottom: 6,
   },
   sideResultRandom: {
-    fontSize: 12,
+    fontSize: FONT.caption,
     color: COLORS.textLight,
     marginBottom: 4,
   },
   sideResultHandicap: {
-    fontSize: 15,
+    fontSize: FONT.control,
     fontWeight: '700',
     color: COLORS.primary,
     letterSpacing: 2,
     marginBottom: 10,
   },
   sideResultWish: {
-    fontSize: 15,
+    fontSize: FONT.body,
     fontWeight: '600',
     color: COLORS.textSecondary,
     marginTop: 4,
   },
   sideResultCountdown: {
-    fontSize: 13,
+    fontSize: FONT.caption,
     color: COLORS.textLight,
     marginTop: 14,
   },
   // 房间设置弹窗（布局与大厅创建房间弹窗一致：表单网格样式见共享组件 RoomSettingsControls 的 formStyles）
   modalHint: {
-    fontSize: 12,
+    fontSize: FONT.caption,
     color: COLORS.textLight,
     textAlign: 'center',
     marginTop: 2,
@@ -3111,7 +3112,7 @@ const styles = StyleSheet.create({
   },
   settingsBtnCancelText: {
     color: COLORS.textSecondary,
-    fontSize: 15,
+    fontSize: FONT.body,
   },
   settingsBtnConfirm: {
     flex: 1,
@@ -3122,18 +3123,18 @@ const styles = StyleSheet.create({
   },
   settingsBtnConfirmText: {
     color: '#fff',
-    fontSize: 15,
+    fontSize: FONT.control,
     fontWeight: '600',
   },
   // 执棋结果公示
   revealTitle: {
-    fontSize: 20,
+    fontSize: FONT.display,
     fontWeight: 'bold',
     color: COLORS.textPrimary,
     marginBottom: 20,
   },
   revealSideText: {
-    fontSize: 13,
+    fontSize: FONT.control,
     fontWeight: '700',
     marginTop: 2,
   },
@@ -3144,7 +3145,7 @@ const styles = StyleSheet.create({
     color: '#3C2A1E',
   },
   revealRandomHint: {
-    fontSize: 12,
+    fontSize: FONT.caption,
     color: COLORS.textLight,
   },
   // 倒计时卡片
@@ -3153,19 +3154,19 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   countdownSideText: {
-    fontSize: 20,
+    fontSize: FONT.display,
     fontWeight: '600',
     color: COLORS.textPrimary,
     marginBottom: 24,
   },
   countdownNumber: {
-    fontSize: 80,
+    fontSize: FONT.countdown,
     fontWeight: 'bold',
     color: COLORS.primary,
     marginBottom: 16,
   },
   countdownHint: {
-    fontSize: 16,
+    fontSize: FONT.body,
     color: COLORS.textSecondary,
   },
   // 断线等待卡片
@@ -3180,24 +3181,24 @@ const styles = StyleSheet.create({
     borderColor: COLORS.primary,
   },
   disconnectTitle: {
-    fontSize: 22,
+    fontSize: FONT.title,
     fontWeight: 'bold',
     color: COLORS.textPrimary,
     marginBottom: 8,
   },
   disconnectHint: {
-    fontSize: 14,
+    fontSize: FONT.body,
     color: COLORS.textSecondary,
     marginBottom: 16,
   },
   disconnectCountdown: {
-    fontSize: 48,
+    fontSize: FONT.countdownCard,
     fontWeight: 'bold',
     color: COLORS.primary,
     marginBottom: 8,
   },
   disconnectSubHint: {
-    fontSize: 13,
+    fontSize: FONT.caption,
     color: COLORS.textLight,
   },
   // 会话终结卡片（房间已销毁/已被移出/断线判负）的主操作按钮
@@ -3209,7 +3210,7 @@ const styles = StyleSheet.create({
     backgroundColor: COLORS.primary,
   },
   sessionGoneButtonText: {
-    fontSize: 16,
+    fontSize: FONT.control,
     fontWeight: 'bold',
     color: '#FFFFFF',
   },
@@ -3261,7 +3262,7 @@ const styles = StyleSheet.create({
     marginLeft: 'auto',
   },
   timerChipText: {
-    fontSize: 12,
+    fontSize: FONT.caption,
     fontWeight: '700',
     color: COLORS.textPrimary,
     fontVariant: ['tabular-nums'],
@@ -3290,7 +3291,7 @@ const styles = StyleSheet.create({
     backgroundColor: 'rgba(0, 0, 0, 0.04)',
   },
   readyTagText: {
-    fontSize: 10,
+    fontSize: FONT.micro,
     fontWeight: '600',
   },
   readyTagTextOn: {
@@ -3300,7 +3301,7 @@ const styles = StyleSheet.create({
     color: '#9E9E9E',
   },
   nameChipText: {
-    fontSize: 12,
+    fontSize: FONT.caption,
     fontWeight: '600',
     color: COLORS.textPrimary,
     flexShrink: 1,
@@ -3324,6 +3325,7 @@ const styles = StyleSheet.create({
     elevation: 3,
   },
   emojiBubbleText: {
+    // 表情为图形符号，字号随气泡尺寸微调，不套用正文字阶
     fontSize: 18,
     lineHeight: 22,
   },
@@ -3358,6 +3360,7 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   emojiDropdownCellText: {
+    // 表情为图形符号，字号随 44x44 单元格尺寸定，不套用正文字阶
     fontSize: 26,
     lineHeight: 32,
   },
@@ -3385,7 +3388,7 @@ const styles = StyleSheet.create({
     opacity: 0.4,
   },
   actionButtonText: {
-    fontSize: 14,
+    fontSize: FONT.body,
     fontWeight: '600',
     color: COLORS.textPrimary,
   },
@@ -3404,14 +3407,14 @@ const styles = StyleSheet.create({
     maxWidth: 320,
   },
   modalTitle: {
-    fontSize: 18,
+    fontSize: FONT.title,
     fontWeight: 'bold',
     color: COLORS.textPrimary,
     marginBottom: 12,
     textAlign: 'center',
   },
   modalText: {
-    fontSize: 14,
+    fontSize: FONT.body,
     color: COLORS.textSecondary,
     textAlign: 'center',
     marginBottom: 20,
@@ -3430,11 +3433,11 @@ const styles = StyleSheet.create({
   },
   modalButtonTextCancel: {
     color: COLORS.textSecondary,
-    fontSize: 14,
+    fontSize: FONT.body,
   },
   modalButtonTextConfirm: {
     color: '#fff',
-    fontSize: 14,
+    fontSize: FONT.control,
     fontWeight: '600',
   },
 });

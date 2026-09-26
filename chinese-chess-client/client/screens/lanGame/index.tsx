@@ -32,6 +32,7 @@ import {
   INCREMENT_OPTIONS,
   BYOYOMI_OPTIONS,
 } from '@/components/RoomSettingsControls';
+import { FONT } from '@/utils/typography';
 
 const COLORS = {
   background: '#F5F0E8',
@@ -916,7 +917,7 @@ const styles = StyleSheet.create({
     borderColor: COLORS.border,
   },
   topTitle: {
-    fontSize: 18,
+    fontSize: FONT.title,
     fontWeight: 'bold',
     color: COLORS.textPrimary,
   },
@@ -935,7 +936,7 @@ const styles = StyleSheet.create({
     backgroundColor: COLORS.textLight,
   },
   statusText: {
-    fontSize: 12,
+    fontSize: FONT.caption,
     fontWeight: '600',
     color: COLORS.textLight,
   },
@@ -944,7 +945,7 @@ const styles = StyleSheet.create({
     paddingBottom: 12,
   },
   nameLabel: {
-    fontSize: 14,
+    fontSize: FONT.body,
     color: COLORS.textSecondary,
     marginBottom: 8,
   },
@@ -952,7 +953,7 @@ const styles = StyleSheet.create({
     backgroundColor: COLORS.card,
     borderRadius: 12,
     padding: 14,
-    fontSize: 16,
+    fontSize: FONT.control,
     color: COLORS.textPrimary,
     borderWidth: 1,
     borderColor: COLORS.border,
@@ -972,7 +973,7 @@ const styles = StyleSheet.create({
   },
   createBtnText: {
     color: '#fff',
-    fontSize: 16,
+    fontSize: FONT.control,
     fontWeight: '600',
   },
   // 房间大厅标题行：标题居左、搜索框居右
@@ -997,7 +998,7 @@ const styles = StyleSheet.create({
   },
   searchInput: {
     flex: 1,
-    fontSize: 13,
+    fontSize: FONT.control,
     color: COLORS.textPrimary,
     paddingVertical: 0,
     height: '100%',
@@ -1010,7 +1011,7 @@ const styles = StyleSheet.create({
     paddingTop: 12,
   },
   sectionTitle: {
-    fontSize: 16,
+    fontSize: FONT.control,
     fontWeight: '600',
     color: COLORS.textPrimary,
     marginBottom: 12,
@@ -1020,12 +1021,12 @@ const styles = StyleSheet.create({
     paddingTop: 32,
   },
   emptyText: {
-    fontSize: 16,
+    fontSize: FONT.body,
     color: COLORS.textSecondary,
     marginBottom: 8,
   },
   emptySubtext: {
-    fontSize: 13,
+    fontSize: FONT.caption,
     color: COLORS.textLight,
   },
   roomCard: {
@@ -1041,14 +1042,14 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   roomHostName: {
-    fontSize: 15,
+    fontSize: FONT.body,
     fontWeight: '600',
     color: COLORS.textPrimary,
     flexShrink: 1,
   },
   // 房间号：卡片最右侧
   roomIdText: {
-    fontSize: 12,
+    fontSize: FONT.caption,
     color: COLORS.textLight,
     marginLeft: 'auto',
     flexShrink: 0,
@@ -1079,7 +1080,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: 8,
   },
   roomTagText: {
-    fontSize: 12,
+    fontSize: FONT.caption,
     color: COLORS.textLight,
   },
   roomTagHandicap: {
@@ -1096,7 +1097,7 @@ const styles = StyleSheet.create({
     marginRight: 4,
   },
   roomTagHandicapBadgeText: {
-    fontSize: 10,
+    fontSize: FONT.micro,
     color: '#FFFFFF',
     fontWeight: '700',
   },
@@ -1132,7 +1133,7 @@ const styles = StyleSheet.create({
     color: COLORS.textSecondary,
   },
   statusBadgeText: {
-    fontSize: 11,
+    fontSize: FONT.micro,
     fontWeight: '600',
   },
   // 操作失败内联提示条
@@ -1147,7 +1148,7 @@ const styles = StyleSheet.create({
     marginBottom: 12,
   },
   actionErrorText: {
-    fontSize: 13,
+    fontSize: FONT.caption,
     color: COLORS.danger,
     flexShrink: 1,
   },
@@ -1156,13 +1157,13 @@ const styles = StyleSheet.create({
     marginBottom: 14,
   },
   modalErrorText: {
-    fontSize: 13,
+    fontSize: FONT.caption,
     color: COLORS.danger,
     marginBottom: 10,
     textAlign: 'center',
   },
   passwordRoomName: {
-    fontSize: 14,
+    fontSize: FONT.body,
     color: COLORS.textSecondary,
     textAlign: 'center',
     marginBottom: 14,
@@ -1179,7 +1180,7 @@ const styles = StyleSheet.create({
   },
   joinBtnText: {
     color: '#fff',
-    fontSize: 14,
+    fontSize: FONT.body,
     fontWeight: '600',
   },
   // 观战按钮（对战中的房间，旁观者入口）
@@ -1194,7 +1195,7 @@ const styles = StyleSheet.create({
   },
   spectateBtnText: {
     color: '#fff',
-    fontSize: 13,
+    fontSize: FONT.body,
     fontWeight: '600',
   },
   // 回到对局按钮（本人所在的未结束房间）
@@ -1209,7 +1210,7 @@ const styles = StyleSheet.create({
   },
   rejoinBtnText: {
     color: '#fff',
-    fontSize: 13,
+    fontSize: FONT.body,
     fontWeight: '600',
   },
   // 断线重连提醒横幅（置顶于房间列表上方）
@@ -1248,13 +1249,13 @@ const styles = StyleSheet.create({
     flex: 1,
   },
   reconnectTitle: {
-    fontSize: 15,
+    fontSize: FONT.title,
     fontWeight: '700',
     color: COLORS.textPrimary,
     marginBottom: 2,
   },
   reconnectSub: {
-    fontSize: 12,
+    fontSize: FONT.caption,
     color: COLORS.textLight,
   },
   reconnectBtn: {
@@ -1265,7 +1266,7 @@ const styles = StyleSheet.create({
   },
   reconnectBtnText: {
     color: '#fff',
-    fontSize: 14,
+    fontSize: FONT.control,
     fontWeight: '700',
   },
   // 弹窗样式
@@ -1284,7 +1285,7 @@ const styles = StyleSheet.create({
     maxHeight: '88%',
   },
   modalTitle: {
-    fontSize: 18,
+    fontSize: FONT.title,
     fontWeight: 'bold',
     color: COLORS.textPrimary,
     marginBottom: 16,
@@ -1294,7 +1295,7 @@ const styles = StyleSheet.create({
     backgroundColor: COLORS.background,
     borderRadius: 10,
     padding: 12,
-    fontSize: 14,
+    fontSize: FONT.control,
     color: COLORS.textPrimary,
     borderWidth: 1,
     borderColor: COLORS.border,
@@ -1314,11 +1315,11 @@ const styles = StyleSheet.create({
   },
   testBtnText: {
     color: COLORS.primary,
-    fontSize: 13,
+    fontSize: FONT.body,
     fontWeight: '600',
   },
   testResultText: {
-    fontSize: 12,
+    fontSize: FONT.caption,
     flex: 1,
   },
   testOk: {
@@ -1341,7 +1342,7 @@ const styles = StyleSheet.create({
   },
   modalButtonTextCancel: {
     color: COLORS.textSecondary,
-    fontSize: 15,
+    fontSize: FONT.body,
   },
   modalButtonConfirm: {
     flex: 1,
@@ -1352,7 +1353,7 @@ const styles = StyleSheet.create({
   },
   modalButtonTextConfirm: {
     color: '#fff',
-    fontSize: 15,
+    fontSize: FONT.control,
     fontWeight: '600',
   },
   modalCloseBtn: {

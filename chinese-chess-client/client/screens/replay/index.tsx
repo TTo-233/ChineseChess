@@ -27,6 +27,7 @@ import {
   type ReplayGame,
   type ReplayMode,
 } from '@/utils/replayStorage';
+import { FONT } from '@/utils/typography';
 
 // 主题色 - 浅色复古系（与首页/人机对战一致）
 const COLORS = {
@@ -448,12 +449,12 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   topBarTitle: {
-    fontSize: 16,
+    fontSize: FONT.title,
     fontWeight: '700',
     color: COLORS.text,
   },
   topBarSubtitle: {
-    fontSize: 12,
+    fontSize: FONT.caption,
     color: COLORS.textMuted,
     marginTop: 2,
   },
@@ -469,7 +470,7 @@ const styles = StyleSheet.create({
     backgroundColor: COLORS.bgCard,
   },
   headerDeleteText: {
-    fontSize: 13,
+    fontSize: FONT.body,
     fontWeight: '600',
     color: COLORS.danger,
   },
@@ -496,7 +497,7 @@ const styles = StyleSheet.create({
     borderColor: COLORS.primary,
   },
   modeChipText: {
-    fontSize: 14,
+    fontSize: FONT.control,
     fontWeight: '600',
     color: COLORS.textMuted,
   },
@@ -523,7 +524,7 @@ const styles = StyleSheet.create({
     borderColor: COLORS.primary,
   },
   filterChipText: {
-    fontSize: 12,
+    fontSize: FONT.caption,
     fontWeight: '600',
     color: COLORS.textMuted,
   },
@@ -571,7 +572,7 @@ const styles = StyleSheet.create({
   },
   cardTitle: {
     flex: 1,
-    fontSize: 14,
+    fontSize: FONT.body,
     fontWeight: '700',
     color: COLORS.text,
   },
@@ -582,11 +583,11 @@ const styles = StyleSheet.create({
     paddingVertical: 1,
   },
   resultBadgeText: {
-    fontSize: 11,
+    fontSize: FONT.micro,
     fontWeight: '700',
   },
   cardSubtitle: {
-    fontSize: 12,
+    fontSize: FONT.caption,
     color: COLORS.textMuted,
   },
   starButton: {
@@ -617,7 +618,7 @@ const styles = StyleSheet.create({
     paddingBottom: 60,
   },
   emptyText: {
-    fontSize: 14,
+    fontSize: FONT.body,
     color: COLORS.textMuted,
     textAlign: 'center',
     lineHeight: 22,
@@ -645,7 +646,7 @@ const styles = StyleSheet.create({
     borderColor: COLORS.border,
   },
   actionButtonText: {
-    fontSize: 14,
+    fontSize: FONT.body,
     fontWeight: '600',
     color: COLORS.text,
   },
@@ -665,13 +666,13 @@ const styles = StyleSheet.create({
     borderColor: COLORS.border,
   },
   modalTitle: {
-    fontSize: 16,
+    fontSize: FONT.title,
     fontWeight: '700',
     color: COLORS.text,
     textAlign: 'center',
   },
   modalMessage: {
-    fontSize: 14,
+    fontSize: FONT.body,
     color: COLORS.textMuted,
     textAlign: 'center',
     lineHeight: 22,
@@ -694,7 +695,7 @@ const styles = StyleSheet.create({
     borderColor: COLORS.border,
   },
   modalCancelText: {
-    fontSize: 14,
+    fontSize: FONT.body,
     fontWeight: '600',
     color: COLORS.text,
   },
@@ -702,7 +703,7 @@ const styles = StyleSheet.create({
     backgroundColor: COLORS.danger,
   },
   modalDeleteText: {
-    fontSize: 14,
+    fontSize: FONT.control,
     fontWeight: '700',
     color: '#FFF',
   },

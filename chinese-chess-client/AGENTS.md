@@ -71,6 +71,28 @@ pnpm -w lint:server
 
 当前项目的**设计系统**基于 tailwindcss 实现，核心入口文件为 `client/global.css`，如果需要定制主题，应该**阅读并修改 `client/global.css` 文件**
 
+## 字体大小规范
+
+**字号字阶的唯一来源是 `client/utils/typography.ts` 导出的 `FONT` 常量**，颜色/圆角/边框等 token 才在 `client/global.css` 中定义。
+
+写任何文字样式时，`fontSize` 必须取自 `FONT.xxx`：
+
+| 角色 | 用途 |
+| --- | --- |
+| `FONT.micro` (10) | 角标、徽标、极小状态标签（数字角标、准备状态小标签、棋盘按比例缩放的角标除外） |
+| `FONT.caption` (12) | 说明文字、副标题、状态芯片、表单提示与错误提示 |
+| `FONT.body` (14) | 正文、列表主文本、按钮文字、表单标签、卡片标题 |
+| `FONT.control` (16) | 输入框文字与只读值、分区标题、主按钮 |
+| `FONT.title` (18) | 页面主标题、弹窗标题 |
+| `FONT.display` (20) | 结果标题、强调数字 |
+| `FONT.displayLg` (24) | 结算主结果 |
+| `FONT.hero` (36) | 首页品牌标题 |
+| `FONT.countdown` (80) / `FONT.countdownCard` (48) | 全屏揭示 / 卡片内倒计时数字（数字展示特例，不参与正文字阶） |
+
+禁止在 `StyleSheet` 中直接写 `fontSize: 14` 这类裸数字。新增或修改文字样式时先在 `FONT` 中确认是否有合适的角色，没有再新增并同步更新本表。
+
+两种例外：按棋盘尺寸等比缩放的动态字号（棋子/让子/被吃数量角标）由棋盘组件自行计算；表情等图形符号的字号按图形尺寸定。两者都需在样式旁注明原因。
+
 ## 路由及 Tab Bar 实现规范
 
 ### 方案一：无 Tab Bar（Stack 导航）

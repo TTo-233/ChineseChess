@@ -17,6 +17,7 @@
  */
 import React, { useEffect, useState } from 'react';
 import { Animated, Image, StyleSheet, Text, TouchableOpacity, useWindowDimensions, View } from 'react-native';
+import { FONT } from '@/utils/typography';
 
 // 原项目素材尺寸（基于629x695棋盘网格区域）
 const GRID_WIDTH = 631;
@@ -337,7 +338,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   resultText: {
-    fontSize: 18,
+    fontSize: FONT.display,
     fontWeight: '600',
     color: '#5D4037',
     marginBottom: 8,
@@ -359,7 +360,7 @@ const styles = StyleSheet.create({
   },
   buttonPrimaryText: {
     color: '#FFFFFF',
-    fontSize: 16,
+    fontSize: FONT.control,
     fontWeight: '600',
   },
   buttonSecondary: {
@@ -374,7 +375,7 @@ const styles = StyleSheet.create({
   },
   buttonSecondaryText: {
     color: '#5D4037',
-    fontSize: 16,
+    fontSize: FONT.body,
     fontWeight: '600',
   },
 });

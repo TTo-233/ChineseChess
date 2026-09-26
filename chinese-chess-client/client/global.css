@@ -8,6 +8,12 @@
   --snow: oklch(0.9911 0 0);
   --eclipse: oklch(0.2103 0.0059 285.89);
 
+  /*
+   * 字体大小不在此定义：全应用字号字阶的唯一来源是 `client/utils/typography.ts` 的
+   * FONT 常量（StyleSheet 的 fontSize 为 React Native 数值，无法直接消费 CSS 变量）。
+   * 新增或修改文字样式时必须引用 FONT.xxx，禁止再写裸数字，以免同一角色出现多种字号。
+   */
+
   /* Border */
   --border-width: 1px;
   --field-border-width: 0px;
