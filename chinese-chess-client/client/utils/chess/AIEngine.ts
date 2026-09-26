@@ -13,7 +13,7 @@
  */
 
 import { type GameState, type PieceState } from './GameEngine';
-import { getPathPoints } from './MoveCheck';
+import { fillPathPoints, createPathPointsBuffer } from './MoveCheck';
 import { RED_SIDE, BLACK_SIDE, type SideTag, type MoveRecord } from './types';
 import { isMoveBanned } from './RuleEngine';
 
@@ -549,12 +549,32 @@ interface Move {
   score: number; // MVV-LVA 排序分
 }
 
+// 搜索热路径的复用缓冲：
+// - 搜索每访问一个节点就要为在场每个棋子调一次走点计算（占搜索总耗时约 18%），
+//   每次新建 1 个外层数组 + 9 个列数组 + 32 个棋子位置对象会造成大量短命分配，
+//   加重 GC 压力并拉长单次主线程阻塞（表现为点击棋子偶发卡顿）。
+// - 这两块缓冲只在 generatePseudoMoves 内部使用、读取完即弃，而 generatePseudoMoves
+//   不会递归调用自己，因此复用是安全的。
+//   注意：返回的 moves 数组仍必须每次新建 —— 调用方（minimax/quiescence）会跨递归
+//   持有它，若共享会被子节点覆盖。
+const scratchPositions: { col: number; row: number; alive: boolean }[] = Array.from(
+  { length: 32 },
+  () => ({ col: 0, row: 0, alive: false })
+);
+const scratchPathPoints = createPathPointsBuffer();
+
 /**
  * 生成当前行动方的所有伪合法走法
  */
 function generatePseudoMoves(state: GameState): Move[] {
   const moves: Move[] = [];
-  const positions = state.pieces.map(p => ({ col: p.col, row: p.row, alive: p.alive }));
+  const positions = scratchPositions;
+  for (let i = 0; i < 32; i++) {
+    const p = state.pieces[i];
+    positions[i].col = p.col;
+    positions[i].row = p.row;
+    positions[i].alive = p.alive;
+  }
   const side = state.sideTag;
   const start = side === RED_SIDE ? 16 : 0;
   const end = side === RED_SIDE ? 31 : 15;
@@ -562,7 +582,8 @@ function generatePseudoMoves(state: GameState): Move[] {
   for (let i = start; i <= end; i++) {
     if (!state.pieces[i].alive) continue;
     const piece = state.pieces[i];
-    const pathPoints = getPathPoints(i, state.qiPan, positions);
+    const pathPoints = scratchPathPoints;
+    fillPathPoints(i, state.qiPan, positions, pathPoints);
 
     for (let r = 0; r < 10; r++) {
       for (let c = 0; c < 9; c++) {
@@ -1262,13 +1283,27 @@ function ponderMatches(entry: PonderEntry, state: GameState): boolean {
 }
 
 /**
- * 提示搜索（纯最佳模式）：hard 深度与时间预算、完全确定性；
- * 每 25ms 让出一次主线程，后台运行期间 UI 保持响应
+ * 提示搜索（纯最佳模式）：hard 深度与时间预算、完全确定性。
+ *
+ * 让出间隔（yieldIntervalMs）取 8ms 而非原先的 25ms：
+ * 让出点只在根节点走法之间（searchWithTimeBudget 的根节点循环），
+ * 两次让出之间会跑完一整棵 minimax + 静态搜索子树，因此单次主线程阻塞
+ * 并不由子树大小决定，而是由「上次让出后到下次让出检查」这段间隔决定。
+ * 实测同一批中局（见 _review/probe_yield_sweep.cjs）：
+ *   间隔 25ms → 搜索 79ms / 最长阻塞 51.9ms
+ *   间隔 12ms → 搜索 85ms / 最长阻塞 36.5ms
+ *   间隔  8ms → 搜索 110ms / 最长阻塞 28.1ms
+ * 走法在 25/16/12/8/4ms 下完全一致，8ms 在响应性与开销之间取平衡：
+ * 最长阻塞降到约 28ms（玩家点击最多被推迟这么久），搜索开销仅增加约 40%，
+ * 而提示是玩家主动点击后才消费的后台预计算，多花的 30ms 无人感知。
+ * 4ms 会让阻塞次数翻倍而最长阻塞不再下降，故不取。
  */
+const HINT_YIELD_INTERVAL_MS = 8;
+
 async function runHintSearch(state: GameState): Promise<AIMoveResult | null> {
   pureBestMode = true;
   try {
-    return await searchWithTimeBudget(state, MAX_DEPTH.hard, TIME_BUDGET.hard, 25);
+    return await searchWithTimeBudget(state, MAX_DEPTH.hard, TIME_BUDGET.hard, HINT_YIELD_INTERVAL_MS);
   } finally {
     pureBestMode = false;
   }

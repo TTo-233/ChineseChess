@@ -13,27 +13,43 @@ export function isTongBang(qz1: number, qz2: number): boolean {
 }
 
 /**
- * 获取棋子可移动的目标位置
- * @param moveQiZi 棋子编号
- * @param qiPan 当前棋盘数据 (9x10)
- * @param piecePositions 所有棋子位置 [{col, row, alive}]
- * @returns 返回 bool 二维数组 [9][10]，true 表示可以移动到该位置
+ * 分配一个 9×10 的走点布尔缓冲（供 fillPathPoints 复用，避免热路径反复分配）
  */
-export function getPathPoints(
-  moveQiZi: number,
-  qiPan: number[][],
-  piecePositions: Array<{ col: number; row: number; alive: boolean }>
-): boolean[][] {
+export function createPathPointsBuffer(): boolean[][] {
   const points: boolean[][] = [];
   for (let i = 0; i < BOARD_COLS; i++) {
-    points[i] = [];
+    const col: boolean[] = [];
     for (let j = 0; j < BOARD_ROWS; j++) {
-      points[i][j] = false;
+      col[j] = false;
+    }
+    points[i] = col;
+  }
+  return points;
+}
+
+/**
+ * 把棋子的可移动目标点写入调用方提供的 9×10 布尔缓冲（会先整体清零）。
+ *
+ * 搜索热路径每个节点要对在场每个棋子调用一次（本函数在 AI 搜索中占 ~18% 耗时），
+ * 而走点矩阵在读取后立刻被丢弃、从不长期持有，因此允许调用方复用同一块缓冲，
+ * 省掉每次调用要新建 1 个外层数组 + 9 个列数组的分配开销（进而减轻 GC 压力）。
+ * 注意：缓冲归调用方所有，下次调用会被覆盖 —— 调用方不得跨调用保存它。
+ */
+export function fillPathPoints(
+  moveQiZi: number,
+  qiPan: number[][],
+  piecePositions: Array<{ col: number; row: number; alive: boolean }>,
+  points: boolean[][]
+): void {
+  for (let i = 0; i < BOARD_COLS; i++) {
+    const col = points[i];
+    for (let j = 0; j < BOARD_ROWS; j++) {
+      col[j] = false;
     }
   }
 
-  if (moveQiZi > 31 || moveQiZi < 0) return points;
-  if (!piecePositions[moveQiZi].alive) return points;
+  if (moveQiZi > 31 || moveQiZi < 0) return;
+  if (!piecePositions[moveQiZi].alive) return;
 
   const col = piecePositions[moveQiZi].col;
   const row = piecePositions[moveQiZi].row;
@@ -72,7 +88,22 @@ export function getPathPoints(
       calcHongBing(col, row, moveQiZi, qiPan, points);
       break;
   }
+}
 
+/**
+ * 获取棋子可移动的目标位置
+ * @param moveQiZi 棋子编号
+ * @param qiPan 当前棋盘数据 (9x10)
+ * @param piecePositions 所有棋子位置 [{col, row, alive}]
+ * @returns 返回 bool 二维数组 [9][10]，true 表示可以移动到该位置
+ */
+export function getPathPoints(
+  moveQiZi: number,
+  qiPan: number[][],
+  piecePositions: Array<{ col: number; row: number; alive: boolean }>
+): boolean[][] {
+  const points = createPathPointsBuffer();
+  fillPathPoints(moveQiZi, qiPan, piecePositions, points);
   return points;
 }
 
