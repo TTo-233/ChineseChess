@@ -17,6 +17,7 @@ import {
 } from 'react-native';
 import Slider from '@react-native-community/slider';
 import { Screen } from '@/components/Screen';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useSafeRouter, useSafeSearchParams } from '@/hooks/useSafeRouter';
 import { useFocusEffect } from 'expo-router';
 import { FontAwesome6 } from '@expo/vector-icons';
@@ -24,7 +25,9 @@ import ChessBoard, { CapturedPiecesDrawer } from '@/components/ChessBoard';
 import { createInitialState, applyHandicap, makeMove, type GameState } from '@/utils/chess/GameEngine';
 import { RED_SIDE, BLACK_SIDE } from '@/utils/chess/types';
 import { getReplay, type ReplayGame } from '@/utils/replayStorage';
-import { useBoardLayoutBudget } from '@/utils/chess/capturedDrawerMetrics';
+import { useBoardLayoutBudget, capHostHeightToViewport } from '@/utils/chess/capturedDrawerMetrics';
+import { boardAlignedRowStyle } from '@/utils/chess/boardContentWidth';
+import { useBoardStyle } from '@/utils/chess/boardStyleStore';
 import { playSound, playJiangJunSound, preloadSounds, unloadAllSounds } from '@/utils/SoundManager';
 import { FONT } from '@/utils/typography';
 
@@ -42,6 +45,8 @@ const COLORS = {
 };
 
 const screenWidth = Dimensions.get('window').width;
+// 窗口高度：用于把棋盘宿主实测高度封顶到视口内，打断宽屏纵向溢出的正反馈
+const windowHeight = Dimensions.get('window').height;
 // 与人机对战一致：棋盘与下方控制区的间距随屏宽自适应
 const dynamicGap = Math.max(Math.round(screenWidth * 0.03), 8);
 
@@ -71,6 +76,10 @@ function formatFullTime(timestamp: number): string {
 export default function ReplayPlayerScreen() {
   const router = useSafeRouter();
   const params = useSafeSearchParams<{ id: string }>();
+  // 安全区：Screen 已在内容之外施加，预算封顶时需据此扣减可用高度
+  const insets = useSafeAreaInsets();
+  // 当前棋盘样式：控制区宽度需按样式几何换算棋盘本体宽度（用户可在首页设置中切换样式）
+  const boardStyle = useBoardStyle();
 
   const [replay, setReplay] = useState<ReplayGame | null | undefined>(undefined); // undefined=加载中
   const [step, setStep] = useState(0);
@@ -80,6 +89,8 @@ export default function ReplayPlayerScreen() {
   // 棋盘可用纵向空间实测（空间不足时缩小棋盘，避免挤占标题栏与进度条）
   const [boardAreaH, setBoardAreaH] = useState(0);
   const [controlsH, setControlsH] = useState(0);
+  // 棋盘内容宿主顶边相对页面内容顶边的 Y（含顶部栏与顶部安全区）：预算封顶时用于推算可用高度
+  const [boardAreaY, setBoardAreaY] = useState(0);
 
   // 每次进入页面按 id 重新加载（列表页删除后返回时兜底）
   useFocusEffect(
@@ -131,13 +142,29 @@ export default function ReplayPlayerScreen() {
   // 条件 2 —— 内容（棋盘 + 控制区）在宿主内垂直居中；居中时上方预留不足则整体下移贴住预留区
   //           （把下方空白让给棋盘），棋盘取到预留允许的最大尺寸。
   // 上方流内占位 = 0（无角标行）；下方流内占位 = dynamicGap + 控制区。
+  // hostHeight 经视口封顶：Screen 的 flexGrow 容器会让 flex:1 宿主按内容撑开，
+  // 不封顶则「宿主变大 → 棋盘变大 → 内容更高」正反馈会让宽屏页面纵向溢出
+  // （详见 capHostHeightToViewport 注释）。
   const { maxBoardHeight, paddingTop: boardPadTop } = useBoardLayoutBudget({
-    hostHeight: boardAreaH,
+    hostHeight: capHostHeightToViewport(
+      boardAreaH,
+      windowHeight,
+      boardAreaY,
+      insets.top,
+      insets.bottom,
+      0 // 控制区在 boardArea 之内，已由 bottomFlowHeight 计入
+    ),
     screenWidth,
     stripOffset: 0,
     topFlowHeight: 0,
     bottomFlowHeight: dynamicGap + controlsH,
   });
+
+  // 控制区宽度：跟随棋盘本体宽度居中，宽屏下不再横贯整个屏幕
+  const controlsWidthStyle = useMemo(
+    () => boardAlignedRowStyle(screenWidth, boardStyle, maxBoardHeight ?? 0),
+    [screenWidth, boardStyle, maxBoardHeight]
+  );
 
   // 只读棋盘：所有交互为空操作
   const noop = useCallback(() => undefined, []);
@@ -212,7 +239,13 @@ export default function ReplayPlayerScreen() {
         </View>
 
         {/* 棋盘 + 控制区（整体居中，控制区紧跟棋盘） */}
-        <View style={styles.boardArea} onLayout={e => setBoardAreaH(e.nativeEvent.layout.height)}>
+        <View
+          style={styles.boardArea}
+          onLayout={(e) => {
+            setBoardAreaH(e.nativeEvent.layout.height);
+            setBoardAreaY(e.nativeEvent.layout.y);
+          }}
+        >
           {/* 被吃棋子明细抽屉：点击摘要文字后自标题行向下展开（浮层，棋盘不动），与人机对战一致 */}
           {boardState && replay && (
             <CapturedPiecesDrawer
@@ -254,7 +287,7 @@ export default function ReplayPlayerScreen() {
 
               {/* 控制区：进度条 + 步进按钮 */}
               <View
-                style={[styles.controls, { width: screenWidth, marginTop: dynamicGap }]}
+                style={[styles.controls, controlsWidthStyle, { marginTop: dynamicGap }]}
                 onLayout={e => setControlsH(e.nativeEvent.layout.height)}
               >
                 {/* 步数指示 */}

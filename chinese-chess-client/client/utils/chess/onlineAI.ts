@@ -13,6 +13,10 @@
  *
  * 说明：服务端已将皮卡鱼 UCI 走法换算为应用内部坐标（col=文件序号，row=9-行号），
  * 客户端拿到 move 后可直接按 (fromCol, fromRow) 定位棋子。
+ *
+ * clientId 约定（重要）：服务端用它做进程内去重（同一 clientId 同时只允许一个在飞，
+ * 重复则返回 429 busy），且要等引擎算完才释放。因此调用方必须为**每个请求**传入唯一值，
+ * 绝不能复用玩家 ID——否则一次超时未完成的请求会挡住后续所有重试，形成无法自愈的活锁。
  */
 
 import { getOnlineServerUrl } from '@/utils/serverConfig';
@@ -41,8 +45,53 @@ export interface EngineHistory {
 }
 
 /**
+ * 在线 AI 失败原因分类（供调度器区别对待，决定是否熔断、是否重试）。
+ *
+ * 关键：服务端「忙」（429 busy）与「网络故障」必须分开。
+ * 忙说明服务是活的、只是排队中，对它熔断等于把唯一能出棋的路径也掐掉。
+ */
+export class OnlineAiError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'OnlineAiError';
+  }
+}
+
+/** 服务端返回 429：同一 clientId 已有请求在计算中（服务健康，仅繁忙） */
+export class OnlineAiBusyError extends OnlineAiError {
+  constructor(message: string) {
+    super(message);
+    this.name = 'OnlineAiBusyError';
+  }
+}
+
+/** 本地超时（已 abort 请求） */
+export class OnlineAiTimeoutError extends OnlineAiError {
+  constructor(message: string) {
+    super(message);
+    this.name = 'OnlineAiTimeoutError';
+  }
+}
+
+/** 网络层失败：DNS/断网/TLS/连接重置（fetch 自身抛出） */
+export class OnlineAiNetworkError extends OnlineAiError {
+  constructor(message: string) {
+    super(message);
+    this.name = 'OnlineAiNetworkError';
+  }
+}
+
+/**
  * 请求服务端皮卡鱼计算一步棋。
- * 使用 Promise.race 实现超时控制（兼容 RN / Web 的 fetch，避免 AbortController 差异）。
+ *
+ * 超时控制使用 AbortController（而非 Promise.race）：超时后真正 abort 掉底层 fetch，
+ * 及时断开与服务的连接，不再让"已放弃的请求"继续占用网络与服务端队列。
+ *
+ * 重要（客户端侧无法单方面解决、必须配合服务端）：
+ * 服务端用 clientId 做进程内去重，且在引擎算完后（await 之后）才释放。
+ * 客户端 abort 只会断开 HTTP 连接，服务端的去重槽位仍会一直持有到本次计算结束，
+ * 因此"超时即重试"若沿用同一个 clientId 会被自己的上一次请求挡住（429 busy）。
+ * 本模块的约定：调用方必须为每个请求传入唯一的 clientId（见 aiDispatcher 的 makeRequestId）。
  *
  * difficulty 取值：
  * - 'easy' | 'medium' | 'hard'：AI 对弈难度；
@@ -59,18 +108,16 @@ export async function fetchOnlineMove(
   clientId?: string,
   history?: EngineHistory
 ): Promise<OnlineMove> {
-  const request = (async (): Promise<OnlineMove> => {
-    /**
-     * 服务端文件：server/src/routes/ai.ts
-     * 接口：POST /api/v1/ai/move
-     * Body 参数：fen: string, difficulty: 'easy'|'medium'|'hard'|'hint', priority?: number,
-     *           clientId?: string, startFen?: string, moves?: string[]
-     * 服务器地址取大厅"服务器设置"中的自定义地址（未设置时用默认地址），与在线对局保持一致。
-     */
+  // 定时器在函数入口即启动：地址解析（读 AsyncStorage）也算进总预算，
+  // 否则地址读取卡住时本次调用会永远悬挂。
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
     const base = await getOnlineServerUrl();
     const response = await fetch(`${base}/api/v1/ai/move`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
+      signal: controller.signal,
       body: JSON.stringify({
         fen,
         difficulty,
@@ -81,7 +128,11 @@ export async function fetchOnlineMove(
     });
     const data = await response.json();
     if (!data || data.success !== true || !data.move) {
-      throw new Error((data && data.message) || '在线 AI 返回异常');
+      // 429 busy = 服务端"该 clientId 已有请求在算"，属服务健康但繁忙，与网络故障区别对待
+      if (response.status === 429) {
+        throw new OnlineAiBusyError((data && data.message) || '在线 AI 忙');
+      }
+      throw new OnlineAiError((data && data.message) || '在线 AI 返回异常');
     }
     return {
       uci: data.uci,
@@ -93,17 +144,18 @@ export async function fetchOnlineMove(
       timeMs: data.timeMs,
       engine: data.engine,
     };
-  })();
-
-  let timeoutTimer: ReturnType<typeof setTimeout> | null = null;
-  const timeout = new Promise<never>((_, reject) => {
-    timeoutTimer = setTimeout(() => reject(new Error('ONLINE_AI_TIMEOUT')), timeoutMs);
-  });
-
-  try {
-    return await Promise.race([request, timeout]);
+  } catch (err) {
+    // AbortController 抛出的 AbortError 不区分是超时还是外部取消，这里统一归为超时
+    if (err instanceof Error && err.name === 'AbortError') {
+      throw new OnlineAiTimeoutError(`在线 AI 超时（${timeoutMs}ms）`);
+    }
+    if (err instanceof OnlineAiError || err instanceof OnlineAiBusyError || err instanceof OnlineAiTimeoutError) {
+      throw err;
+    }
+    // fetch 自身失败（DNS/断网/TLS/连接被重置）→ 网络故障
+    throw new OnlineAiNetworkError(err instanceof Error ? err.message : String(err));
   } finally {
     // 无论成功/失败/超时都清理定时器，避免残留计时器持有事件循环
-    if (timeoutTimer) clearTimeout(timeoutTimer);
+    clearTimeout(timer);
   }
 }

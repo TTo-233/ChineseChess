@@ -15,6 +15,7 @@ import {
   Image,
   ActivityIndicator,
 } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Screen } from '@/components/Screen';
 import { useSafeRouter, useSafeSearchParams } from '@/hooks/useSafeRouter';
 import { useNavigation } from 'expo-router';
@@ -34,15 +35,15 @@ import {
   type GameState,
 } from '@/utils/chess/GameEngine';
 import { getBestMoveAsync, precomputeHint, cancelHintPonder, recordHistoryHash, clearHistoryHash, computeZobristHash } from '@/utils/chess/AIEngine';
-import { getHybridBestMove, getHybridHintMove, type AISource, type HybridMoveResult } from '@/utils/chess/aiDispatcher';
+import { getHybridBestMove, getHybridHintMove, getOnlineAiStatus, type AISource, type HybridMoveResult } from '@/utils/chess/aiDispatcher';
 import { isMoveBanned, recordBanViolation, enumerateLegalMoves } from '@/utils/chess/RuleEngine';
 import { playSound, playJiangJunSound, unloadAllSounds, preloadSounds, preloadGameEndSounds } from '@/utils/SoundManager';
 import { RED_SIDE, BLACK_SIDE } from '@/utils/chess/types';
 import { saveGame, loadGame, deleteSave, type GameSave } from '@/utils/GameSave';
 import { saveReplay } from '@/utils/replayStorage';
 import { BUILTIN_ENDGAMES } from '@/utils/chess/endgames';
-import { useBoardLayoutBudget } from '@/utils/chess/capturedDrawerMetrics';
-import { nameRowAlignmentStyle } from '@/utils/chess/boardContentWidth';
+import { useBoardLayoutBudget, capHostHeightToViewport } from '@/utils/chess/capturedDrawerMetrics';
+import { boardAlignedRowStyle } from '@/utils/chess/boardContentWidth';
 import { useBoardStyle } from '@/utils/chess/boardStyleStore';
 import {
   markLevelCompleted,
@@ -212,7 +213,11 @@ export default function GameScreen() {
 
   // 动态间距：随屏幕宽度/棋盘缩放比例自适应
   const screenWidth = Dimensions.get('window').width;
+  // 窗口高度：用于把棋盘宿主实测高度封顶到视口内，打断宽屏纵向溢出的正反馈
+  const windowHeight = Dimensions.get('window').height;
   const dynamicGap = Math.max(Math.round(screenWidth * 0.03), 8);
+  // 安全区：Screen 已在内容之外施加，预算封顶时需据此扣减可用高度
+  const insets = useSafeAreaInsets();
 
   // 游戏结束状态（声明提前，handleFlip 需要引用）
   const [gameOverReason, setGameOverReason] = useState<string | null>(null);
@@ -326,6 +331,8 @@ export default function GameScreen() {
   // 棋盘可用纵向空间实测（宽屏/纵向空间不足时限制棋盘尺寸，避免挤占标题行与底部操作栏）
   const [boardAreaH, setBoardAreaH] = useState(0);
   const [bottomBarH, setBottomBarH] = useState(0);
+  // 棋盘内容宿主顶边相对页面内容顶边的 Y（含顶部栏与顶部安全区）：预算封顶时用于推算可用高度
+  const [drawerHostY, setDrawerHostY] = useState(0);
 
   // 长将长捉规则提示横幅（接近阈值"请尽快变招"/达到阈值"禁着请变招"/违规警告，
   // 方案 10.3 / 12）：短暂展示后自动消失
@@ -350,8 +357,18 @@ export default function GameScreen() {
   // 宽屏下棋盘由纵向预算决定而缩小，抽屉随棋盘同步缩小，预留与真实抽屉高度精确一致，
   // 不再像旧实现那样按宽度缩放高估抽屉、把棋盘压缩得过小。
   // 上方流内占位 = AI 角标行(26+4=30)；下方流内占位 = dynamicGap + 底部操作栏。
+  // hostHeight 经视口封顶：Screen 的 flexGrow 容器会让 flex:1 宿主按内容撑开，
+  // 不封顶则「宿主变大 → 棋盘变大 → 内容更高」正反馈会让宽屏页面纵向溢出
+  // （详见 capHostHeightToViewport 注释）。
   const { maxBoardHeight, paddingTop: boardPadTop } = useBoardLayoutBudget({
-    hostHeight: boardAreaH,
+    hostHeight: capHostHeightToViewport(
+      boardAreaH,
+      windowHeight,
+      drawerHostY,
+      insets.top,
+      insets.bottom,
+      0 // 底部栏在 capturedDrawerHost 之内，已由 bottomFlowHeight 计入
+    ),
     screenWidth,
     stripOffset: 30,
     topFlowHeight: 30,
@@ -367,7 +384,13 @@ export default function GameScreen() {
   // AI 角标行宽度：取棋盘本体宽度并水平居中，使角标行左右边缘与棋盘边缘对齐
   // （宽屏下棋盘因纵向预算被压缩居中，角标行若铺满整屏会贴到屏幕最左/最右）
   const nameRowStyle = useMemo(
-    () => nameRowAlignmentStyle(screenWidth, boardStyle, maxBoardHeight ?? 0),
+    () => boardAlignedRowStyle(screenWidth, boardStyle, maxBoardHeight ?? 0),
+    [boardStyle, maxBoardHeight]
+  );
+
+  // 底部操作栏宽度：同样跟随棋盘本体宽度居中，宽屏下不再横贯整个屏幕
+  const bottomBarWidthStyle = useMemo(
+    () => boardAlignedRowStyle(screenWidth, boardStyle, maxBoardHeight ?? 0),
     [boardStyle, maxBoardHeight]
   );
 
@@ -1049,13 +1072,16 @@ export default function GameScreen() {
   // AI 标识角标文案：绿指示灯=皮卡鱼（在线，含搜索深度）；灰指示灯=本地AI（离线，含难度）
   // 首步 AI 走棋前来源未知，默认按本地 AI 展示，走棋后立即刷新为真实来源
   const aiIsOnline = aiSource === 'online';
+  // 在线 AI 连接状态：熔断中（走本地，稍后自动探测恢复）/ 冷却后将先探测再决定是否联网
+  // 修复"较长时间仍保持本地AI、似乎没有重连"的观感——明确告知用户系统在自救
+  const onlineAiStatus = getOnlineAiStatus();
   // 开局库命中时服务端 depth 恒为 0，展示"开局库"而非误导性的"深度0"；
   // 皮卡鱼搜索才展示真实深度（且深度>0 才显示，兜底避免异常 0 值）
   const aiChipLabel = aiIsOnline
     ? (aiEngine === 'book'
         ? '皮卡鱼（开局库）'
         : (aiDepth != null && aiDepth > 0 ? `皮卡鱼（深度${aiDepth}）` : '皮卡鱼'))
-    : `本地AI（${difficultyLabel}）`;
+    : `本地AI（${difficultyLabel}）${onlineAiStatus === 'circuit' ? '（重连中）' : ''}`;
 
   return (
     <Screen>
@@ -1110,7 +1136,10 @@ export default function GameScreen() {
         {/* 标题行下方内容宿主（相对定位，被吃棋子抽屉锚定于此 = 标题行正下方） */}
         <View
           style={styles.capturedDrawerHost}
-          onLayout={(e) => setBoardAreaH(e.nativeEvent.layout.height)}
+          onLayout={(e) => {
+            setBoardAreaH(e.nativeEvent.layout.height);
+            setDrawerHostY(e.nativeEvent.layout.y);
+          }}
         >
           {/* 被吃棋子明细抽屉：点击摘要文字后自标题行向下展开（浮层，棋盘不动） */}
           <CapturedPiecesDrawer
@@ -1178,7 +1207,7 @@ export default function GameScreen() {
               残局闯关规则：不允许翻转；每局限 3 次提示（走皮卡鱼）+ 10 次悔棋，
               剩余次数以按钮右上角数字角标展示；「说明」已移至标题行右侧标识 */}
           <View
-            style={[styles.bottomBar, { width: screenWidth, marginTop: dynamicGap }, jueShaVisible && { opacity: 0 }]}
+            style={[styles.bottomBar, bottomBarWidthStyle, { marginTop: dynamicGap }, jueShaVisible && { opacity: 0 }]}
             pointerEvents={jueShaVisible ? 'none' : 'auto'}
             onLayout={(e) => setBottomBarH(e.nativeEvent.layout.height)}
           >

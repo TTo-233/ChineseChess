@@ -28276,6 +28276,14 @@ function getBookSize() {
 // src/routes/ai.ts
 var aiRouter = (0, import_express2.Router)();
 var inflightClients = /* @__PURE__ */ new Set();
+/** clientId -> 持占到期时间戳；用于给 inflightClients 兜底过期，防止"幽灵持占"永久挡住重试 */
+var inflightExpiries = /* @__PURE__ */ new Map();
+/**
+ * 持占租约时长：应大于引擎 job 安全超时（JOB_SAFETY_TIMEOUT_MS，默认 15s），
+ * 这样正常路径下总是由 finally 先释放，定时器只兜底异常/重启导致的泄漏。
+ * 取默认值而非引用 JOB_SAFETY_TIMEOUT_MS：本行早于该常量的定义位置（esbuild 打包后同模块顺序已变）。
+ */
+var INFLIGHT_LEASE_MS = 2e4;
 function parseSideToken(fenStr) {
   const token = fenStr.trim().split(/\s+/).pop();
   return token === "b" ? "b" : "w";
@@ -28348,7 +28356,23 @@ aiRouter.post("/move", async (req, res) => {
     });
     return;
   }
-  if (clientId) inflightClients.add(clientId);
+  if (clientId) {
+    inflightClients.add(clientId);
+    // 兜底过期：客户端可能在超时/断网后放弃等待，而引擎计算仍会继续跑完。
+    // 若此时进程重启或异常路径未走到 finally，槽位会永久泄漏并挡住该 clientId 的所有后续请求。
+    // 这里为每个持占记录到期时间，到点后允许重新占用，避免"幽灵持占"造成永久 429。
+    // 正常路径下 finally 总先释放（远早于租约到期），定时器只兜底异常。
+    const leaseUntil = Date.now() + INFLIGHT_LEASE_MS;
+    inflightExpiries.set(clientId, leaseUntil);
+    const leaseTimer = setTimeout(() => {
+      // 仅当本次持占仍未被释放且已到期时才清理，避免误删后来者的持占
+      if (inflightExpiries.get(clientId) === leaseUntil) {
+        inflightClients.delete(clientId);
+        inflightExpiries.delete(clientId);
+      }
+    }, INFLIGHT_LEASE_MS);
+    if (typeof leaseTimer?.unref === 'function') leaseTimer.unref();
+  }
   const startedAt = Date.now();
   try {
     const cfg = ONLINE_DIFFICULTY[difficulty];
@@ -28376,7 +28400,10 @@ aiRouter.post("/move", async (req, res) => {
       message: err instanceof Error ? err.message : "\u76AE\u5361\u9C7C\u8BA1\u7B97\u5931\u8D25"
     });
   } finally {
-    if (clientId) inflightClients.delete(clientId);
+    if (clientId) {
+      inflightClients.delete(clientId);
+      inflightExpiries.delete(clientId);
+    }
   }
 });
 aiRouter.get("/stats", (_req, res) => {

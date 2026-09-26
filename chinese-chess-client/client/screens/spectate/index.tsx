@@ -7,6 +7,7 @@ import {
   Dimensions,
 } from 'react-native';
 import { Screen } from '@/components/Screen';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useSafeRouter, useSafeSearchParams } from '@/hooks/useSafeRouter';
 import { FontAwesome6 } from '@expo/vector-icons';
 import { type GameState } from '@/utils/chess/GameEngine';
@@ -16,8 +17,8 @@ import { useMoveEffect } from '@/hooks/useMoveEffect';
 import { playJiangJunSound, playSound, preloadSounds, unloadAllSounds } from '@/utils/SoundManager';
 import { getOnlineServerUrl } from '@/utils/serverConfig';
 import { BattleSocket } from '@/utils/battleSocket';
-import { useBoardLayoutBudget } from '@/utils/chess/capturedDrawerMetrics';
-import { nameRowAlignmentStyle } from '@/utils/chess/boardContentWidth';
+import { useBoardLayoutBudget, capHostHeightToViewport } from '@/utils/chess/capturedDrawerMetrics';
+import { boardAlignedRowStyle } from '@/utils/chess/boardContentWidth';
 import { useBoardStyle } from '@/utils/chess/boardStyleStore';
 import { FONT } from '@/utils/typography';
 
@@ -36,6 +37,8 @@ const COLORS = {
 };
 
 const screenWidth = Dimensions.get('window').width;
+// 窗口高度：用于把棋盘宿主实测高度封顶到视口内，打断宽屏纵向溢出的正反馈
+const windowHeight = Dimensions.get('window').height;
 
 interface RoomPlayer {
   id: string;
@@ -49,6 +52,8 @@ type SpectatePhase = 'connecting' | 'playing' | 'ended' | 'restarted' | 'error';
 
 export default function SpectateScreen() {
   const router = useSafeRouter();
+  // 安全区：Screen 已在内容之外施加，预算封顶时需据此扣减可用高度
+  const insets = useSafeAreaInsets();
   const params = useSafeSearchParams<{ roomId: string; roomName?: string }>();
   const roomId = params.roomId || '';
   const roomName = params.roomName || '';
@@ -75,6 +80,9 @@ export default function SpectateScreen() {
 
   // 棋盘区域尺寸测算（与人机/在线对局一致的居中布局）
   const [boardAreaH, setBoardAreaH] = useState(0);
+  const [bottomBarH, setBottomBarH] = useState(0);
+  // 棋盘内容宿主顶边相对页面内容顶边的 Y（含顶部栏与顶部安全区）：预算封顶时用于推算可用高度
+  const [drawerHostY, setDrawerHostY] = useState(0);
   const dynamicGap = Math.max(Math.round(screenWidth * 0.03), 8);
   // 当前棋盘样式：角标行宽度需按样式几何换算棋盘本体宽度
   const boardStyle = useBoardStyle();
@@ -85,8 +93,19 @@ export default function SpectateScreen() {
   //           下移贴住预留区（把下方空白让给棋盘），棋盘取到预留允许的最大尺寸。
   // 底部信息栏在宿主之外（宿主高本身已不含它，不再重复扣减），下方流内占位仅计下方名称角标行(26+2×2=30)。
   // 宿主未测得时维持返回 0 的既有行为（载入占位框依赖该数值）。
+  // hostHeight 经视口封顶：Screen 的 flexGrow 容器会让 flex:1 宿主按内容撑开，
+  // 不封顶则「宿主变大 → 棋盘变大 → 内容更高」正反馈会让宽屏页面纵向溢出
+  // （详见 capHostHeightToViewport 注释）。本屏底部信息栏在宿主之外，需作为
+  // belowHostHeight 扣减（宿主内只含上下两行名称角标行，已由 top/bottomFlowHeight 计入）。
   const { maxBoardHeight: budgetBoardHeight, paddingTop: boardPadTop } = useBoardLayoutBudget({
-    hostHeight: boardAreaH,
+    hostHeight: capHostHeightToViewport(
+      boardAreaH,
+      windowHeight,
+      drawerHostY,
+      insets.top,
+      insets.bottom,
+      dynamicGap + bottomBarH
+    ),
     screenWidth,
     stripOffset: 30,
     topFlowHeight: 30,
@@ -97,7 +116,13 @@ export default function SpectateScreen() {
   // 名称角标行宽度：取棋盘本体宽度并水平居中，使角标行左右边缘与棋盘边缘对齐
   // （宽屏下棋盘因纵向预算被压缩居中，角标行若铺满整屏会贴到屏幕最左/最右）
   const nameRowStyle = useMemo(
-    () => nameRowAlignmentStyle(screenWidth, boardStyle, maxBoardHeight),
+    () => boardAlignedRowStyle(screenWidth, boardStyle, maxBoardHeight),
+    [boardStyle, maxBoardHeight]
+  );
+
+  // 底部信息栏宽度：同样跟随棋盘本体宽度居中，宽屏下不再横贯整个屏幕
+  const bottomBarWidthStyle = useMemo(
+    () => boardAlignedRowStyle(screenWidth, boardStyle, maxBoardHeight),
     [boardStyle, maxBoardHeight]
   );
 
@@ -381,7 +406,13 @@ export default function SpectateScreen() {
         </View>
 
         {/* 棋盘区域 */}
-        <View style={styles.capturedDrawerHost} onLayout={(e) => setBoardAreaH(e.nativeEvent.layout.height)}>
+        <View
+          style={styles.capturedDrawerHost}
+          onLayout={(e) => {
+            setBoardAreaH(e.nativeEvent.layout.height);
+            setDrawerHostY(e.nativeEvent.layout.y);
+          }}
+        >
           {/* 被吃棋子明细抽屉：点击摘要文字后自标题行向下展开（浮层，棋盘不动），与人机对战一致 */}
           {gameState && (
             <CapturedPiecesDrawer
@@ -423,7 +454,9 @@ export default function SpectateScreen() {
         </View>
 
         {/* 底部信息栏 */}
-        <View style={[styles.bottomBar, { width: screenWidth, marginTop: dynamicGap }]}>
+        <View style={[styles.bottomBar, bottomBarWidthStyle, { marginTop: dynamicGap }]}
+          onLayout={(e) => setBottomBarH(e.nativeEvent.layout.height)}
+        >
           <View style={styles.infoPill}>
             <FontAwesome6 name="chess-board" size={14} color={COLORS.textLight} />
             <Text style={styles.infoPillText}>第 {Math.floor(moveCount / 2) + 1} 回合 · 共 {moveCount} 步</Text>

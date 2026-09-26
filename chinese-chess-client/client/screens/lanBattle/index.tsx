@@ -20,6 +20,7 @@ import {
 import { Screen } from '@/components/Screen';
 import { useSafeRouter, useSafeSearchParams } from '@/hooks/useSafeRouter';
 import { useFocusEffect } from 'expo-router';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { FontAwesome6 } from '@expo/vector-icons';
 import { createInitialState, applyHandicap, cloneGameState, getValidMoves, makeMove, undoMove, getWinnerSideTag, type GameState } from '@/utils/chess/GameEngine';
 import { isMoveBanned } from '@/utils/chess/RuleEngine';
@@ -33,8 +34,8 @@ import { playJiangJunSound, playSound, preloadSounds, unloadAllSounds } from '@/
 import { getOnlineServerUrl } from '@/utils/serverConfig';
 import { BattleSocket } from '@/utils/battleSocket';
 import { saveReplay } from '@/utils/replayStorage';
-import { useBoardLayoutBudget } from '@/utils/chess/capturedDrawerMetrics';
-import { nameRowAlignmentStyle } from '@/utils/chess/boardContentWidth';
+import { useBoardLayoutBudget, capHostHeightToViewport } from '@/utils/chess/capturedDrawerMetrics';
+import { boardAlignedRowStyle } from '@/utils/chess/boardContentWidth';
 import { useBoardStyle } from '@/utils/chess/boardStyleStore';
 import {
   SettingSelect,
@@ -63,6 +64,8 @@ const COLORS = {
 
 // 数值屏宽（与人机对战一致：底部操作栏/角标行按屏宽布局，规避部分 Android Yoga 对 stretch 的兼容问题）
 const screenWidth = Dimensions.get('window').width;
+// 窗口高度：用于把棋盘宿主实测高度封顶到视口内，打断宽屏纵向溢出的正反馈
+const windowHeight = Dimensions.get('window').height;
 
 function sideStringToTag(side: string): boolean {
   return side === 'red' ? RED_SIDE : !RED_SIDE;
@@ -151,6 +154,8 @@ type GamePhase = 'waiting' | 'reveal' | 'countdown' | 'playing' | 'ended';
 
 export default function LanBattleScreen() {
   const router = useSafeRouter();
+  // 安全区：Screen 已在内容之外施加顶部/底部安全区，预算封顶时需据此扣减可用高度
+  const insets = useSafeAreaInsets();
   // 返回大厅：优先 back 回到栈中已有的大厅页（replace 只是替换栈顶，会在旧大厅之上
   // 再叠一个新大厅，导致用户在大厅点返回时"又回到了大厅"）；Web 刷新等无栈场景兜底 replace
   const exitToLobby = useCallback(() => {
@@ -281,8 +286,18 @@ export default function LanBattleScreen() {
   // 条件 2 —— 内容（上角标行 + 棋盘 + 下角标行 + 底部栏）在宿主内垂直居中；居中时上方预留
   //           不足则整体下移贴住预留区（把下方空白让给棋盘），棋盘取到预留允许的最大尺寸。
   // 上方流内占位 = 对手名角标行(26+4=30)；下方流内占位 = 我方名角标行(26+4=30) + dynamicGap + 底部栏。
+  // hostHeight 经视口封顶：Screen 的 flexGrow 容器会让 flex:1 宿主按内容撑开，
+  // 不封顶则「宿主变大 → 棋盘变大 → 内容更高」正反馈会让宽屏页面纵向溢出（详见
+  // capHostHeightToViewport 注释）。
   const { maxBoardHeight, paddingTop: boardPadTop } = useBoardLayoutBudget({
-    hostHeight: boardAreaH,
+    hostHeight: capHostHeightToViewport(
+      boardAreaH,
+      windowHeight,
+      drawerHostY,
+      insets.top,
+      insets.bottom,
+      0 // 底部栏在 capturedDrawerHost 之内，已由 bottomFlowHeight 计入
+    ),
     screenWidth,
     stripOffset: 30,
     topFlowHeight: 30,
@@ -308,7 +323,13 @@ export default function LanBattleScreen() {
   // 名称角标行宽度：取棋盘本体宽度并水平居中，使角标行左右边缘与棋盘边缘对齐
   // （宽屏下棋盘因纵向预算被压缩居中，角标行若铺满整屏会贴到屏幕最左/最右）
   const nameRowStyle = useMemo(
-    () => nameRowAlignmentStyle(screenWidth, boardStyle, maxBoardHeight ?? 0),
+    () => boardAlignedRowStyle(screenWidth, boardStyle, maxBoardHeight ?? 0),
+    [screenWidth, boardStyle, maxBoardHeight]
+  );
+
+  // 底部操作栏宽度：同样跟随棋盘本体宽度居中，宽屏下不再横贯整个屏幕
+  const bottomBarWidthStyle = useMemo(
+    () => boardAlignedRowStyle(screenWidth, boardStyle, maxBoardHeight ?? 0),
     [screenWidth, boardStyle, maxBoardHeight]
   );
 
@@ -2345,10 +2366,10 @@ export default function LanBattleScreen() {
               </TouchableOpacity>
             </View>
 
-            {/* 底部操作栏：与人机对战一致的样式与布局位置（数值屏宽 + 自适应间距），
+            {/* 底部操作栏：与人机对战一致的样式与布局位置（宽度跟随棋盘本体 + 自适应间距），
                 全阶段常驻挂载以保持棋盘位置稳定，非交互阶段隐藏内容但保留占位 */}
             <View
-              style={[styles.bottomBar, { width: screenWidth, marginTop: dynamicGap }]}
+              style={[styles.bottomBar, bottomBarWidthStyle, { marginTop: dynamicGap }]}
               onLayout={(e) => setBottomBarH(e.nativeEvent.layout.height)}
             >
               {phase === 'waiting' && (

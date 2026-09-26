@@ -39,14 +39,16 @@ export function boardContentWidth(
 }
 
 /**
- * 名称角标行的对齐样式：宽度取棋盘本体宽度并保持水平居中，
- * 使角标行左右边缘与棋盘左右边缘重合。
+ * 与棋盘左右边缘对齐的行样式：宽度取棋盘本体宽度并保持水平居中，
+ * 使该行左右边缘与棋盘左右边缘重合。
+ *
+ * 适用对象：棋盘上下方的名称角标行，以及棋盘下方的底部操作栏/控制区。
  *
  * 保留「显式数值宽度」（而非依赖 stretch）的原因：部分 Android 设备的 Yoga
- * 对百分比/stretch 处理不可靠，角标行内部依赖 flex 等分与 marginLeft:'auto' 右对齐，
- * 必须拿到确定的可用宽度。
+ * 对百分比/stretch 处理不可靠，角标行内部依赖 flex 等分与 marginLeft:'auto' 右对齐、
+ * 底部栏内部依赖按钮 flex:1 等分，必须拿到确定的可用宽度。
  */
-export function nameRowAlignmentStyle(
+export function boardAlignedRowStyle(
   screenWidth: number,
   boardStyle: { imgWidth: number; scaleBaseWidth: number; scaleBaseHeight: number },
   maxBoardHeight: number

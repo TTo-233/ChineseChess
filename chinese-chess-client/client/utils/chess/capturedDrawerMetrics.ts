@@ -37,6 +37,40 @@ const DEFAULT_MIN_BOARD_HEIGHT = 200;
 const BISECT_ITER = 64;
 
 /**
+ * 宿主高度封顶：把 onLayout 实测的宿主高度限制在「视口内真正可用的高度」以内。
+ *
+ * 背景（宽屏纵向溢出的根因）：这些页面被 Screen 包在 KeyboardAwareScrollView 里，
+ * 其内容容器是 `flexGrow: 1`。`flexGrow: 1` 允许内容**超过**视口——内部的
+ * `flex: 1` 容器会按内容实际高度撑开。于是形成正反馈：
+ *   宿主实测高度被撑大 → 棋盘按更大的 hostHeight 反推尺寸 → 棋盘更高 → 内容更高 → …
+ * 结果宽屏下内容高 1588 > 视口 805，页面整体可滚动。
+ *
+ * 封顶后 `maxBoardHeight` 不再依赖被撑大的实测值，正反馈被打断：宿主取到真实剩余
+ * 空间 → 棋盘按真实空间缩小 → 内容回到一屏内 → 实测值本身也回落到封顶值（稳定不动点）。
+ *
+ * @param viewportHeight 窗口总高度（Dimensions 的 window 高度）
+ * @param measuredTop    宿主顶边相对页面内容顶边的距离（onLayout 的 layout.y，已含顶部栏与顶部安全区）
+ * @param topInset       顶部安全区高度（Screen 已在内容之外施加，此处仅用于扣减可用空间）
+ * @param bottomInset    底部安全区高度
+ * @param belowHostHeight 宿主**之外**、同属本页面的固定高度（底部栏等；宿主内的下方占位由 bottomFlowHeight 负责，不在此列）
+ */
+export function capHostHeightToViewport(
+  measuredHeight: number,
+  viewportHeight: number,
+  measuredTop: number,
+  topInset: number,
+  bottomInset: number,
+  belowHostHeight: number
+): number {
+  if (!(measuredHeight > 0)) return 0;
+  const available = viewportHeight - topInset - measuredTop - bottomInset - belowHostHeight;
+  // 极窄/极矮或测量异常时不返回负值；此时退回实测值交由 computeBoardLayoutBudget 的
+  // minBoardHeight 保底逻辑处理（与既有行为一致）。
+  if (!(available > 0)) return measuredHeight;
+  return Math.min(measuredHeight, available);
+}
+
+/**
  * 给定缩放比例下的抽屉展开态高度（与 CapturedPiecesDrawer 实际渲染口径一致）。
  */
 export function drawerHeightAtScale(screenWidth: number, boardStyle: BoardStyle, scale: number): number {
