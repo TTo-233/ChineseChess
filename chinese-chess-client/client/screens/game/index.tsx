@@ -36,7 +36,7 @@ import {
   type GameState,
 } from '@/utils/chess/GameEngine';
 import { getBestMoveAsync, precomputeHint, cancelHintPonder, recordHistoryHash, clearHistoryHash, computeZobristHash } from '@/utils/chess/AIEngine';
-import { getHybridBestMove, getHybridHintMove, getOnlineAiStatus, type AISource, type HybridMoveResult } from '@/utils/chess/aiDispatcher';
+import { getHybridBestMove, getHybridHintMove, getOnlineAiStatus, isOnlineAiBusyRetrying, getOnlineAiInvalidReason, getOnlineAiLongGameNotice, subscribeOnlineAiStatus, type AISource, type HybridMoveResult, type OnlineAiStatus } from '@/utils/chess/aiDispatcher';
 import { isMoveBanned, enumerateLegalMoves } from '@/utils/chess/RuleEngine';
 import { playSound, playJiangJunSound, unloadAllSounds, preloadSounds, preloadGameEndSounds } from '@/utils/SoundManager';
 import { RED_SIDE, BLACK_SIDE } from '@/utils/chess/types';
@@ -375,9 +375,9 @@ export default function GameScreen() {
     bottomFlowHeight: dynamicGap + bottomBarH,
   });
 
+
   // 棋盘真实几何（相对主容器）：供绝杀特效锁定棋盘中心、把结算文字/按钮排到棋盘正下方
   const { containerRef, boardRef, boardFrame, measure: measureBoardFrame } = useBoardFrame();
-
   // 当前棋盘样式：AI 角标行宽度需按样式几何换算棋盘本体宽度（用户可在首页设置中切换样式）
   const boardStyle = useBoardStyle();
 
@@ -425,6 +425,20 @@ export default function GameScreen() {
     if (!jueshaBoardFrame) return undefined;
     return jueshaBoardFrame.y + jueshaBoardFrame.height / 2 - drawerHostY;
   }, [jueshaBoardFrame, drawerHostY]);
+
+  // 在线 AI 状态订阅：熔断/恢复/服务端繁忙/走法被拒都会主动广播，
+  // 这里把它转成 state 触发重渲染——否则角标只能等下一次走子才刷新，
+  // 会出现"熔断了但界面毫无变化、一直本地 AI 且看不到任何提示"的死角。
+  const [onlineAiStatusState, setOnlineAiStatusState] = useState<OnlineAiStatus>(() => getOnlineAiStatus());
+  const [onlineAiStatusTick, setOnlineAiStatusTick] = useState(0);
+  useEffect(() => {
+    const unsubscribe = subscribeOnlineAiStatus((status) => {
+      setOnlineAiStatusState(status);
+      // busy / invalid_move / longGameNotice 不在 status 枚举里，用 tick 强制刷新
+      setOnlineAiStatusTick((n) => n + 1);
+    });
+    return unsubscribe;
+  }, []);
 
   // 动画
   const shakeAnim = useRef(new Animated.Value(0)).current;
@@ -1061,14 +1075,52 @@ export default function GameScreen() {
   const aiIsOnline = aiSource === 'online';
   // 在线 AI 连接状态：熔断中（走本地，稍后自动探测恢复）/ 冷却后将先探测再决定是否联网
   // 修复"较长时间仍保持本地AI、似乎没有重连"的观感——明确告知用户系统在自救
-  const onlineAiStatus = getOnlineAiStatus();
+  const onlineAiStatus = onlineAiStatusState;
+  // 服务端繁忙退避中：说明"还在连，只是服务端此刻排队"，与"连不上"要区分开
+  const onlineAiBusy = isOnlineAiBusyRetrying();
+  const onlineAiInvalidReason = getOnlineAiInvalidReason();
+  const longGameNotice = getOnlineAiLongGameNotice();
+  // 角标之外的说明条文案：把静默降级的原因讲清楚（拒收原因 / 对局过长 / 繁忙重试）。
+  // 用 GameNotice 横幅承载（覆盖在棋盘中央、不阻塞落子），不新增常驻行，
+  // 避免打乱棋盘高度预算（useBoardLayoutBudget 的 topFlowHeight）。
+  // key 只跟文案走：同一原因反复出现时不重复弹横幅（常驻指示靠角标，避免刷屏）；
+  // 靠 onlineAiStatusTick 消费掉"订阅有更新"这一信号（状态枚举外的变化靠角标读数体现）。
+  void onlineAiStatusTick;
+  const onlineAiNoticeText = onlineAiInvalidReason
+    ? '在线走法与本地局面不同步，已改用本地AI'
+    : longGameNotice
+      ? '对局过长，建议求和或重开'
+      : onlineAiBusy
+        ? '服务端繁忙，正在重试'
+        : null;
+  const onlineAiNoticeItem: GameNoticeItem | null = useMemo(
+    () =>
+      onlineAiNoticeText
+        ? {
+            key: `online-ai-${onlineAiNoticeText}`,
+            text: onlineAiNoticeText,
+            ...(onlineAiInvalidReason ? { detail: onlineAiInvalidReason } : {}),
+            ...(longGameNotice ? { detail: longGameNotice } : {}),
+            duration: 2600,
+          }
+        : null,
+    [onlineAiNoticeText, onlineAiInvalidReason, longGameNotice]
+  );
   // 开局库命中时服务端 depth 恒为 0，展示"开局库"而非误导性的"深度0"；
   // 皮卡鱼搜索才展示真实深度（且深度>0 才显示，兜底避免异常 0 值）
   const aiChipLabel = aiIsOnline
     ? (aiEngine === 'book'
         ? '皮卡鱼（开局库）'
         : (aiDepth != null && aiDepth > 0 ? `皮卡鱼（深度${aiDepth}）` : '皮卡鱼'))
-    : `本地AI（${difficultyLabel}）${onlineAiStatus === 'circuit' ? '（重连中）' : ''}`;
+    : [
+        `本地AI（${difficultyLabel}）`,
+        onlineAiBusy ? '服务端繁忙，重试中' : null,
+        onlineAiStatus === 'invalid_move' ? '在线走法被拒' : null,
+        onlineAiStatus === 'circuit' ? '重连中' : null,
+        onlineAiStatus === 'probing' ? '探测中' : null,
+      ]
+        .filter(Boolean)
+        .join('·');
 
   return (
     <Screen>
@@ -1275,9 +1327,10 @@ export default function GameScreen() {
 
           {/* 长将长捉规则提示（方案 12 文案）：接近阈值/禁着/违规警告。
               与联机对战页同款 GameNotice —— 绝对定位在棋盘中心、pointerEvents="box-none"
-              不阻塞落子、3s 后自动淡出；绝杀特效展示期间让位避免与结算文字重叠。 */}
+              不阻塞落子、3s 后自动淡出；绝杀特效展示期间让位避免与结算文字重叠。
+              在线 AI 提示走同一通道（优先级低于规则提示：规则提示优先，规则提示没有时才显示）。 */}
           <GameNotice
-            notice={jueShaVisible ? null : ruleNotice}
+            notice={jueShaVisible ? null : (ruleNotice ?? onlineAiNoticeItem)}
             centerY={ruleNoticeCenterY}
             onHide={hideRuleNotice}
           />
@@ -1490,7 +1543,8 @@ const styles = StyleSheet.create({
     borderColor: COLORS.border,
     paddingVertical: 4,
     paddingHorizontal: 10,
-    maxWidth: '60%',
+    // 角标文案会随在线状态追加状态后缀（如"·重连中""·在线走法被拒"），放宽上限避免截断
+    maxWidth: '86%',
   },
   // 指示灯：默认灰色=本地AI
   aiNameChipDot: {

@@ -28425,6 +28425,31 @@ function parseSideToken(fenStr) {
   const token = fenStr.trim().split(/\s+/).pop();
   return token === "b" ? "b" : "w";
 }
+// 畸形 FEN 行宽校验（在进入 Pikafish WASM 之前拦截，避免越界写内存打崩 worker 池）：行宽异常会让 Pikafish WASM 越界写内存并打崩整个 worker 池。
+// ⚠️ 本段由 scripts/patch-dist.mjs 注入，勿手改；dist 换版后需重跑该脚本。
+var FEN_ROWS = 10, FEN_COLS = 9;
+var isFenBoardShapeValid = function (fenStr) {
+  var parts = String(fenStr).trim().split(/\s+/);
+  var rows = parts[0] ? parts[0].split("/") : [];
+  if (rows.length !== FEN_ROWS) return false;
+  for (var r = 0; r < rows.length; r++) {
+    var width = 0;
+    for (var i = 0; i < rows[r].length; i++) {
+      var ch = rows[r][i];
+      if (ch >= "0" && ch <= "9") {
+        if (ch === "0") return false;
+        width += Number(ch);
+      } else if (/[a-z]/i.test(ch)) {
+        width += 1;
+      } else {
+        return false;
+      }
+      if (width > FEN_COLS) return false;
+    }
+    if (width !== FEN_COLS) return false;
+  }
+  return true;
+};
 var UCI_RE = /^[a-i][0-9][a-i][0-9]$/;
 aiRouter.post("/move", async (req, res) => {
   const body = req.body ?? {};
@@ -28434,6 +28459,12 @@ aiRouter.post("/move", async (req, res) => {
   const clientId = typeof body.clientId === "string" && body.clientId.trim() ? body.clientId.trim() : null;
   if (!fen) {
     res.status(400).json({ success: false, error: "invalid_fen", message: "\u7F3A\u5C11 fen \u53C2\u6570" });
+    return;
+  }
+  if (!isFenBoardShapeValid(fen)) {
+    // 畸形 FEN 行宽校验（在进入 Pikafish WASM 之前拦截，避免越界写内存打崩 worker 池）
+    // ⚠️ 本段由 scripts/patch-dist.mjs 注入，勿手改；dist 换版后需重跑该脚本。
+    res.status(400).json({ success: false, error: "invalid_fen", message: "fen \u677F\u9762\u884C\u5BBD\u975E\u6CD5" });
     return;
   }
   if (!ONLINE_DIFFICULTY[difficulty]) {

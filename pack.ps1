@@ -1,7 +1,9 @@
-# 象棋项目打包脚本（Windows / PowerShell 版，与 pack.sh 等价）
+﻿# 象棋项目打包脚本（Windows / PowerShell 版，与 pack.sh 等价）
 # 用法: pwsh -File pack.ps1 [client|server|all]   （默认 all）
 # 产物: 仓库根目录 chinese-chess-{client|server}_YYYYMMDD.zip
 # 排除: node_modules、.expo 缓存、dist/web-build 构建产物、.eslintcache 等无关文件
+# 清理: 每次打包会先删除「该端」的历史 zip（只删同前缀，client 与 server 互不影响），
+#       仓库根目录始终只保留每个端当天的这一个包，避免旧包被误当成最新包分发。
 param([ValidateSet('client', 'server', 'all')][string]$Target = 'all')
 
 $ErrorActionPreference = 'Stop'
@@ -9,9 +11,22 @@ $Date = Get-Date -Format yyyyMMdd
 $Root = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
 Set-Location $Root
 
+# 删除指定端的历史打包文件（保留当天那个，由后续打包重新生成）
+# -Like 'chinese-chess-client_*.zip' 只匹配 client 前缀，不会误删 server 的包
+function Remove-OldZip {
+  param([Parameter(Mandatory)][string]$Prefix)
+  $old = Get-ChildItem -Path $Root -Filter "$Prefix`_*.zip" -File -ErrorAction SilentlyContinue
+  if (-not $old) { return }
+  foreach ($f in $old) {
+    Remove-Item $f.FullName -Force
+    Write-Output "[CLEAN] 已删除历史包 $($f.Name)"
+  }
+}
+
 function New-ClientZip {
   $out = "chinese-chess-client_$Date.zip"
   if (Test-Path $out) { Remove-Item $out }
+  Remove-OldZip 'chinese-chess-client'
   tar -a -c -f $out `
     --exclude 'chinese-chess-client/node_modules' `
     --exclude 'chinese-chess-client/client/node_modules' `
@@ -30,6 +45,7 @@ function New-ClientZip {
 function New-ServerZip {
   $out = "chinese-chess-server_$Date.zip"
   if (Test-Path $out) { Remove-Item $out }
+  Remove-OldZip 'chinese-chess-server'
   # ⚠️ 服务端 dist/index.js 是手工打过补丁的构建产物（见 chinese-chess-server/scripts/patch-dist.mjs）。
   #    打包前强制校验，补丁丢失（重新构建/换版覆盖）时直接阻塞出包，避免把
   #    「已废弃的禁着拦截 + 连续 3 次判负」逻辑打进部署包。

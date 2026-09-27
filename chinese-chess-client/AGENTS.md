@@ -97,6 +97,22 @@ node chinese-chess-server/scripts/patch-dist.mjs --restore-marker  # 仅补回�
 规则引擎本体（`ruleEngine.cjs`）由 `client/utils/chess/ruleEngine.bundle.ts` 打包而来，
 `dist/index.js` 通过 `require("../ruleEngine.cjs")` 加载它——改规则请改**客户端**源码。
 
+## 打包规范（仓库根目录 pack.ps1 / pack.sh）
+
+```bash
+pwsh -File pack.ps1 [client|server|all]   # Windows（等价于 .\pack.ps1）
+./pack.sh      [client|server|all]         # POSIX
+```
+
+- **每次打包会自动删除「该端」的历史 zip**：只删同前缀的（`chinese-chess-client_*.zip` 或
+  `chinese-chess-server_*.zip`），**client 与 server 互不影响**。仓库根目录因此始终只保留
+  每个端当天的这一个包。这条是硬性要求：旧包如果留在根目录，极易被误当成最新包分发出去
+  （本项目就发生过一次：源码改了一整天，根目录的 zip 还停在前一天，所有修复都不在里面）。
+  打完包请确认根目录 `chinese-chess-*.zip` 各只剩一个。
+- 服务端出包前强制 `patch-dist.mjs --check`，校验失败**阻塞出包**（不生成 zip）。
+- `pack.ps1` 必须存为 **UTF-8 with BOM**：本机是 Windows PowerShell 5.1，无 BOM 时它按 GB2312
+  （codepage 936）解码，中文提示会变成乱码。用现代 pwsh (7+) 则无此问题。
+
 ## 如何修改主题模式（跟随系统、固定暗色、固定亮色）
 
 默认为跟随系统，如果用户明确指定为“暗色”或“亮色”，需要修改 `client/components/ColorSchemeUpdater.tsx` 的 `DEFAULT_THEME` 变量为合适的值

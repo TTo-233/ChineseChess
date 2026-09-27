@@ -100,6 +100,21 @@ node chinese-chess-server/scripts/patch-dist.mjs --restore-marker  # 仅补回�
 > 这些都是**非零退出即失败**的闸门，CI 只需调用其中任一即可阻塞流水线。
 > `node dist/index.js`、`start.bat` 等直启方式不做校验，需自行确认。
 
+## 打包规范（仓库根目录 pack.ps1 / pack.sh）
+
+```bash
+pwsh -File pack.ps1 [client|server|all]   # Windows（等价于 .\pack.ps1）
+./pack.sh      [client|server|all]         # POSIX
+```
+
+- **每次打包会自动删除「该端」的历史 zip**，只删同前缀的（`chinese-chess-client_*.zip` 或
+  `chinese-chess-server_*.zip`），**client 与 server 互不影响**；根目录因此始终只保留每个端
+  当天的那一个包。旧包留在根目录极易被误当成最新包分发（源码改了一整天、zip 还停在前一天的
+  情况本项目发生过一次），所以打完包请确认根目录 `chinese-chess-*.zip` 各只剩一个。
+- 服务端出包前强制 `patch-dist.mjs --check`，校验失败**阻塞出包**（不会生成 zip）。
+- `pack.ps1` 需存为 **UTF-8 with BOM**：Windows PowerShell 5.1 在无 BOM 时按 GB2312 解码，
+  中文提示会乱码。
+
 ## 如何修改主题模式（跟随系统、固定暗色、固定亮色）
 
 默认为跟随系统，如果用户明确指定为“暗色”或“亮色”，需要修改 `client/components/ColorSchemeUpdater.tsx` 的 `DEFAULT_THEME` 变量为合适的值

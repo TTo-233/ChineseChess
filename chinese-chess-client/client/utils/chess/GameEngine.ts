@@ -247,20 +247,90 @@ export function isKunBi(state: GameState, side: SideTag): boolean {
 
 /**
  * 原地回退最近一步（历史回溯专用，避免 undoMove 的整状态克隆开销）
+ *
+ * ⚠️ 正确性要点（曾导致在线 AI 全程回落本地 AI，见 buildEngineHistory 的说明）：
+ * 1. 清空落点必须用**着法记录的坐标**（toCol/toRow），不能用棋子当前坐标 —— 棋子当前坐标
+ *    在历史回溯过程中可能已被后续着法改写，用它清格会误清此刻正放着别的活子的格子。
+ * 2. 被吃子必须**放回落点并登记到 qiPan**。只恢复 alive 而不放回，会留下一枚
+ *    「alive=true 但不在棋盘上」的悬空子：它既不出现在 toFenString 里（表现为棋子凭空消失），
+ *    又会让后续回退在错误坐标上清格。
+ * 两点共同保证来回任意次数，回退得到的局面与按同一序列正向走出来的局面完全一致。
  */
 function undoInPlace(state: GameState): MoveRecord | null {
   const last = state.moveHistory.pop();
   if (!last) return null;
+
+  // 1. 用记录坐标清空落点（不用 piece.col/row）
+  state.qiPan[last.toCol][last.toRow] = -1;
+
+  // 2. 恢复移动子到起点
   const piece = state.pieces[last.pieceId];
-  state.qiPan[piece.col][piece.row] = -1;
   piece.col = last.fromCol;
   piece.row = last.fromRow;
   state.qiPan[last.fromCol][last.fromRow] = last.pieceId;
+
+  // 3. 被吃子放回落点并登记到棋盘（只置 alive 会留下悬空子）
   if (last.capturedPieceId !== -1) {
-    state.pieces[last.capturedPieceId].alive = true;
+    const captured = state.pieces[last.capturedPieceId];
+    captured.alive = true;
+    captured.col = last.toCol;
+    captured.row = last.toRow;
+    state.qiPan[last.toCol][last.toRow] = captured.id;
   }
+
   state.sideTag = !state.sideTag;
   return last;
+}
+
+/**
+ * 棋盘一致性自检：qiPan 与 pieces[].alive/坐标是否严格互相对应。
+ *
+ * 用于 buildEngineHistory 回退后的兜底校验——只要存在以下任一情况就判定不自洽：
+ * - qiPan 上登记了一个不存在的子、或已死亡的子；
+ * - qiPan 上的坐标与该子记录的坐标不一致；
+ * - 某个活子在它自己声明的坐标上不是棋盘登记的子（即"悬空活子"）。
+ * 返回不一致的描述列表（空数组 = 一致）。
+ */
+export function auditBoardConsistency(state: GameState): string[] {
+  const problems: string[] = [];
+  const seen = new Set<number>();
+
+  for (let col = 0; col < BOARD_COLS; col++) {
+    for (let row = 0; row < BOARD_ROWS; row++) {
+      const id = state.qiPan[col]?.[row];
+      if (id === undefined || id === -1) continue;
+      const piece = state.pieces[id];
+      if (!piece) {
+        problems.push(`qiPan@(${col},${row})=${id}：不存在此子`);
+        continue;
+      }
+      if (!piece.alive) {
+        problems.push(`qiPan@(${col},${row})=${id}：该子已死亡却仍在棋盘上`);
+        continue;
+      }
+      if (piece.col !== col || piece.row !== row) {
+        problems.push(`qiPan@(${col},${row})=${id}：该子记录坐标为 (${piece.col},${piece.row})`);
+        continue;
+      }
+      if (seen.has(id)) {
+        problems.push(`棋子 ${id}：在棋盘上出现了多次`);
+      }
+      seen.add(id);
+    }
+  }
+
+  for (const piece of state.pieces) {
+    if (!piece || !piece.alive) continue;
+    if (piece.col < 0 || piece.row < 0) {
+      problems.push(`棋子 ${piece.id}：alive 但没有合法坐标 (${piece.col},${piece.row})`);
+      continue;
+    }
+    if (state.qiPan[piece.col]?.[piece.row] !== piece.id) {
+      problems.push(`棋子 ${piece.id}：alive 于 (${piece.col},${piece.row}) 但棋盘该格登记的是 ${state.qiPan[piece.col]?.[piece.row]}`);
+    }
+  }
+
+  return problems;
 }
 
 /**
@@ -544,6 +614,37 @@ export function toFenString(state: GameState): string {
   return output;
 }
 
+/**
+ * 校验 FEN 棋盘段的每一行是否恰好 9 列。
+ *
+ * 防御性：服务端把 FEN 直接交给皮卡鱼 WASM，行宽异常（多/少于一列）会让引擎
+ * 写出越界内存并报 `memory access out of bounds`，把整个 worker 池打崩
+ * （/api/v1/ai/stats 的 ready 从 4 掉到 3，后续请求 500）。客户端在发出前
+ * 自检，宁可本地报错也不要拖垮服务端。
+ */
+export function isFenBoardWidthValid(fen: string): boolean {
+  const board = fen.trim().split(/\s+/)[0];
+  if (!board) return false;
+  const rows = board.split('/');
+  if (rows.length !== 10) return false;
+  return rows.every((row) => {
+    let width = 0;
+    for (const ch of row) {
+      if (ch >= '0' && ch <= '9') {
+        const n = Number(ch);
+        if (n === 0) return false; // '0' 是空位数 0，非法写法
+        width += n;
+      } else if (/[a-z]/i.test(ch)) {
+        width += 1;
+      } else {
+        return false; // 出现非棋子、非数字字符
+      }
+      if (width > 9) return false;
+    }
+    return width === 9;
+  });
+}
+
 /** 内部坐标 → UCI 坐标（如 (2,1) → c8） */
 function toUci(col: number, row: number): string {
   return `${String.fromCharCode(97 + col)}${9 - row}`;
@@ -556,16 +657,140 @@ function toUci(col: number, row: number): string {
  * UCI 序列。服务端收到 (startFen, moves) 后以 `position fen startFen moves ...`
  * 设置局面，引擎即可在搜索中识别本局真实出现的重复局面（长将/长捉/不变循环）。
  *
+ * ⚠️ 关键前提：**服务端在 moves 非空时会完全忽略请求里的 fen**（见
+ * chinese-chess-server/ai/pikafishWorker.cjs 的 position 命令组装），只按
+ * `startFen + moves` 重建局面。因此 startFen/moves 只要有一处不准，引擎就会在
+ * 另一个局面里搜索，返回的走法在真实局面里非法，被调度器的本地守卫静默拒掉，
+ * 表现为"明明网络正常却一直走本地 AI"。
+ *
+ * 兜底（两层）：
+ *  1. auditBoardConsistency：回退得到的棋盘必须与棋子数组严格对应，
+ *     防 undoInPlace 之类的回退 bug 复发（曾导致凭空少子、服务端在错局面搜索）。
+ *     不过则直接返回 null（连"从当前局面重放"都不可信）。
+ *  2. buildReplayableSegment：历史必须能被引擎逐步重放，防「自将/照面」口径不一致
+ *     导致引擎把棋盘停在半路（见该函数说明）。引擎一旦在某一步 K 拒绝应用，该步
+ *     **及其后所有步**都不能再发——服务端是顺序重放，断了就全废。此时不整条丢弃，
+ *     而是**保留最长的"引擎可重放后缀"**：startFen 换成走完第 K 手后的局面、
+ *     moves 只发其后半段，保住最近一段的重复局面感知。断点落在最后一手时才返回
+ *     null，调用方据此**只发 fen、不发历史**。
+ *
  * 注意：回退在克隆体上进行，不修改传入状态。
  */
-export function buildEngineHistory(state: GameState): { startFen: string; moves: string[] } {
+export function buildEngineHistory(state: GameState): { startFen: string; moves: string[] } | null {
   const probe = cloneGameState(state);
   while (probe.moveHistory.length > 0) {
     undoInPlace(probe);
   }
-  const startFen = toFenString(probe);
-  const moves = state.moveHistory.map((mv: MoveRecord) =>
-    `${toUci(mv.fromCol, mv.fromRow)}${toUci(mv.toCol, mv.toRow)}`
+  // 兜底 1：回退得到的棋盘必须与棋子数组严格对应（防 undoInPlace 类回退 bug 复发）
+  const boardProblems = auditBoardConsistency(probe);
+  if (boardProblems.length > 0) {
+    console.warn(
+      `[buildEngineHistory] 回退局面自检失败，降级为只发 fen（${boardProblems.length} 处不一致）：${boardProblems[0]}`
+    );
+    return null;
+  }
+  if (state.moveHistory.length === 0) {
+    return { startFen: toFenString(probe), moves: [] };
+  }
+  return buildReplayableSegment(probe, state.moveHistory);
+}
+
+/**
+ * 从历史起点逐步重放，求「最长的引擎可重放片段」并组装在线引擎请求载荷。
+ *
+ * ⚠️ 这是「明明网络正常却全程走本地 AI」的**第二根因**（第一根因是 undoInPlace 的
+ * 回退缺陷，已修）。机制如下：
+ *
+ * 客户端的走法生成 `getSelectableMoves` **故意不过滤**「走完后己方将/帅仍被攻击
+ * （含照面/飞将段）」——这是产品语义（允许玩家主动送将、照面），见本文件 isJiangJun
+ * 上方注释与 MoveCheck.afterMoveStillJiangJun 注释。而皮卡鱼的
+ * `position fen <startFen> moves ...` 重放**会**过滤这条：一旦某步走完己方仍被将，
+ * 引擎就拒绝应用该步，棋盘永远停在上一步（K-1）。于是：
+ *   · 后续所有着法都在错误局面上产生 → 客户端本地守卫（isOnlineMoveLegal /
+ *     isOnlineMoveRuleSafe）逐条静默拒掉 → 每步都回落本地 AI；
+ *   · 这类失败被记为 OnlineAiInvalidMoveError，**既不熔断也不重试**，
+ *     getOnlineAiStatus() 仍返回 'online'，用户只看到「一直本地AI」而没有「重连中」。
+ *
+ * 实测（_review/probe_pikafish_selfcheck.cjs，12/12 断点，且引擎 `go perft 1`
+ * 均不收录该着法）：每个断点都恰好是「走完该步后己方仍被将」；在生成对局时加上
+ * 同一过滤后（_review/probe_pikafish_hypothesis.cjs，20/20 局）引擎全程一致。
+ *
+ * 判据直接复用 `hasAnyLegalMove` 的底层函数 `afterMoveStillJiangJun`，在**发出请求前**
+ * 判定历史是否引擎可重放。
+ *
+ * 降级策略：引擎在第 K 步拒绝应用时，该步**及其后所有步**都不能发（服务端顺序重放，
+ * 断一处后面全废）。此时不整条丢弃，而是把 startFen 换成「客户端走完第 K 手后的局面」、
+ * moves 只发 K+1 之后的后缀，保住最近一段的重复局面感知。只有当断点落在最后一手
+ * （没有可用后缀）时，才彻底降级为只发 fen（返回 null）。
+ */
+function buildReplayableSegment(
+  start: GameState,
+  all: MoveRecord[]
+): { startFen: string; moves: string[] } | null {
+  const uciOf = (mv: MoveRecord) => `${toUci(mv.fromCol, mv.fromRow)}${toUci(mv.toCol, mv.toRow)}`;
+
+  // 逐手重放，记录**最后一个**引擎会拒绝的步号 lastBad。
+  // 必须取最后一个而不是第一个：引擎在第 K 步停下后，K 之后所有着法都是在错局面上
+  // 产生的，若只记第一个就照样会断在中途（实测在线率从 100% 掉到 68%）。
+  let cur = start;
+  let lastBad = -1;
+  let reason = '';
+  let fenAfterLastBad: string | null = null;
+  let broken = false;
+
+  for (let i = 0; i < all.length; i++) {
+    // 将/帅已被吃掉的局面无法重放（isJiangJun 会读到 col/row = -1 而越界）。
+    // 正常对局在绝杀/困毙时即结束走子流程，走不到这里；此处仅作防御性短路。
+    if (!cur.pieces[0].alive || !cur.pieces[16].alive) {
+      console.warn(
+        `[buildEngineHistory] 第 ${i} 步之前将/帅已被吃掉，历史无法重放，降级为只发 fen`
+      );
+      return null;
+    }
+    const mv = all[i];
+    if (broken) break;
+    const piece = cur.pieces[mv.pieceId];
+    if (!piece || !piece.alive) {
+      // 起始子不存在/已死：无法确定这一步之后的局面，放弃后缀方案
+      lastBad = i;
+      reason = '起始子不存在或已死';
+      fenAfterLastBad = null;
+      break;
+    }
+    if (afterMoveStillJiangJun(
+      mv.pieceId, mv.fromCol, mv.fromRow, mv.toCol, mv.toRow,
+      cur.qiPan, toPiecePositions(cur.pieces)
+    )) {
+      lastBad = i;
+      reason = '走完后己方将/帅仍被攻击（含照面），引擎会拒绝重放该步';
+    }
+    const res = makeMove(cur, mv.pieceId, mv.toCol, mv.toRow);
+    if (!res || !res.newState) {
+      if (lastBad < 0) { lastBad = i; reason = '客户端引擎也不接受该步'; }
+      fenAfterLastBad = null;
+      broken = true;
+      break;
+    }
+    cur = res.newState;
+    if (lastBad === i) fenAfterLastBad = toFenString(cur);
+  }
+
+  if (lastBad < 0) {
+    return { startFen: toFenString(start), moves: all.map(uciOf) };
+  }
+
+  const tailStart = lastBad + 1;
+  if (fenAfterLastBad === null || tailStart >= all.length) {
+    console.warn(
+      `[buildEngineHistory] 第 ${lastBad} 步（${uciOf(all[lastBad])}）无法被在线引擎重放且无可用后缀，` +
+      `降级为只发 fen：${reason}`
+    );
+    return null;
+  }
+  const tail = all.slice(tailStart);
+  console.warn(
+    `[buildEngineHistory] 第 ${lastBad} 步（${uciOf(all[lastBad])}）无法被在线引擎重放：${reason}；` +
+    `改发其后 ${tail.length} 步，保留最近一段重复局面感知`
   );
-  return { startFen, moves };
+  return { startFen: fenAfterLastBad, moves: tail.map(uciOf) };
 }

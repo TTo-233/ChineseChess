@@ -24,8 +24,12 @@ export const DEFAULT_SERVER_URL = (() => {
   return process.env.EXPO_PUBLIC_BACKEND_BASE_URL || 'https://chess.ttocnserver.dpdns.org';
 })();
 
-// 内存缓存，避免每次请求都读 AsyncStorage
+// 内存缓存，避免每次请求都读 AsyncStorage；带 TTL 定期回源，
+// 避免"进程启动时读一次、此后永久定格"——改了服务器地址或环境变量不生效。
+const CACHE_TTL_MS = 30000;
 let cachedUrl: string | null = null;
+let cachedAt = 0;
+let inflight: Promise<string> | null = null;
 
 /** 提取主机名（去除协议、端口、路径），用于判断地址类型 */
 function extractHost(url: string): string {
@@ -63,18 +67,33 @@ export function normalizeServerUrl(input: string): string {
   return url.replace(/\/+$/, '');
 }
 
-/** 获取当前对战服务器地址（优先用户自定义，其次默认地址） */
+/**
+ * 获取当前对战服务器地址（优先用户自定义，其次默认地址）
+ *
+ * 缓存有 30s TTL：命中则直接返回；过期后重新读 AsyncStorage，并把并发请求
+ * 合并成一次实际读取（inflight），既避免每步走子都读一次磁盘，也不至于
+ * "一次读取后永远定格"导致换地址/改环境变量后仍连旧服务器。
+ */
 export async function getOnlineServerUrl(): Promise<string> {
-  if (cachedUrl) return cachedUrl;
-  let resolved = DEFAULT_SERVER_URL;
+  if (cachedUrl !== null && Date.now() - cachedAt < CACHE_TTL_MS) return cachedUrl;
+  if (inflight) return inflight;
+  inflight = (async () => {
+    let resolved = DEFAULT_SERVER_URL;
+    try {
+      const saved = await AsyncStorage.getItem(STORAGE_KEY);
+      if (saved) resolved = normalizeServerUrl(saved);
+    } catch {
+      // 读取失败时使用默认地址
+    }
+    cachedUrl = resolved;
+    cachedAt = Date.now();
+    return resolved;
+  })();
   try {
-    const saved = await AsyncStorage.getItem(STORAGE_KEY);
-    if (saved) resolved = normalizeServerUrl(saved);
-  } catch {
-    // 读取失败时使用默认地址
+    return await inflight;
+  } finally {
+    inflight = null;
   }
-  cachedUrl = resolved;
-  return resolved;
 }
 
 /**
@@ -97,12 +116,14 @@ export async function getOnlineWsUrl(): Promise<string> {
 export async function setOnlineServerUrl(url: string): Promise<void> {
   const normalized = normalizeServerUrl(url);
   cachedUrl = normalized;
+  cachedAt = Date.now();
   await AsyncStorage.setItem(STORAGE_KEY, normalized);
 }
 
 /** 恢复默认服务器地址 */
 export async function resetOnlineServerUrl(): Promise<void> {
   cachedUrl = DEFAULT_SERVER_URL;
+  cachedAt = Date.now();
   await AsyncStorage.removeItem(STORAGE_KEY);
 }
 
