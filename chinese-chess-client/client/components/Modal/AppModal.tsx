@@ -8,6 +8,7 @@ import {
   StyleSheet,
   Text,
   TouchableWithoutFeedback,
+  useWindowDimensions,
   View,
 } from 'react-native';
 import type { StyleProp, ViewStyle } from 'react-native';
@@ -39,6 +40,15 @@ export interface AppModalProps {
   variant?: ModalVariant | 'none';
   /** 卡片位置：center 居中；bottom 贴底（不遮挡棋盘中心） */
   placement?: 'center' | 'bottom';
+  /**
+   * 弹窗卡片中心锚点（窗口坐标）。用于「对局中弹窗须位于棋盘中心」的场景：
+   * RN <Modal> 渲染在独立原生窗口，其坐标系是窗口，而棋盘位置由动态布局预算决定
+   * 未必与屏幕中心重合（棋盘受纵向预算压缩时会明显偏移）。
+   * 传入后遮罩仍走 placement 的原有 flex 定位（卡片宽高/内边距约束不变），仅把卡片
+   * 从「屏幕中心」平移到锚点，保证卡片不会因绝对定位而贴边或溢出；
+   * 未传时行为与既往完全一致。
+   */
+  anchorCenter?: { x: number; y: number } | null;
   /** 是否展示关闭控件 */
   showCloseBtn?: boolean;
   /** 关闭控件样式：icon 图标 X / text 文字「关闭」 */
@@ -83,8 +93,11 @@ export default function AppModal({
   bodyStyle,
   cardStyle,
   avoidKeyboard = false,
+  anchorCenter = null,
   children,
 }: AppModalProps) {
+  const { width: windowWidth, height: windowHeight } = useWindowDimensions();
+
   // 强交互场景直接吞掉返回键（no-op），而不是调用 onClose
   const handleRequestClose = blockBackButton ? () => undefined : onClose;
 
@@ -94,6 +107,19 @@ export default function AppModal({
     variant === 'none' && styles.maskTransparent,
     placement === 'bottom' ? styles.maskBottom : styles.maskCenter,
   ];
+
+  // 锚点修正：遮罩仍按 placement 正常居中/贴底（卡片宽高约束保持不变），
+  // 只把卡片从「屏幕中心」平移到锚点中心——避免绝对定位下 width:'100%' 的百分比基准歧义。
+  // 前提是 placement==='center'（遮罩 padding 上下左右对称，卡片中心仍等于屏幕中心）；
+  // 传 bottom 组合时基准会是「底部条带中心」，调用方须自行换算锚点。
+  const anchorOffsetStyle = anchorCenter
+    ? ({
+        transform: [
+          { translateX: anchorCenter.x - windowWidth / 2 },
+          { translateY: anchorCenter.y - windowHeight / 2 },
+        ],
+      } as const)
+    : null;
 
   const handleMaskPress = () => {
     if (Platform.OS === 'web') {
@@ -108,7 +134,7 @@ export default function AppModal({
       <View style={maskStyle} collapsable={false}>
         {/* 卡片 */}
         <TouchableWithoutFeedback onPress={() => Keyboard.dismiss()}>
-          <View style={[styles.card, placement === 'bottom' && styles.cardBottom, cardStyle]}>
+          <View style={[styles.card, placement === 'bottom' && styles.cardBottom, cardStyle, anchorOffsetStyle]}>
             {(!!title || showCloseBtn) && (
               <View style={styles.header}>
                 <View style={styles.headerSpacer} />

@@ -26757,6 +26757,9 @@ function buildGameStatePayload(room) {
     undoRefusals: Object.fromEntries(room.players.map((p) => [p.id, p.undoRefusals])),
     drawRefusals: Object.fromEntries(room.players.map((p) => [p.id, p.drawRefusals])),
     players: room.players.map((p) => ({ id: p.id, name: p.name, side: p.side, connected: p.connected })),
+    // 结算后「已返回房间」记录（key=playerId，value=返回时刻）：
+    // 客户端据此提示「对手已返回房间」，并据此不自动跟随房间重置（互不干扰）
+    returnedToRoom: room.returnedToRoom || {},
     spectatorCount: room.spectators.length,
     emojiMessages: room.emojiMessages.map((m) => ({ id: m.id, playerId: m.playerId, emoji: m.emoji, time: m.time }))
   };
@@ -26826,6 +26829,14 @@ function healStaleEndedRoom(room) {
     endedSinceMap.delete(room.id);
     return false;
   }
+  // 对方主动离场所致的终局不参与自愈：该局的输赢已由「离场即弃局」裁定，
+  // 留下的一方需要停留在结算页决定去留；若被下面「活跃人数 ≤1 就重置为等待中」的逻辑接管，
+  // 结算浮层会在 ENDED_STALE_GRACE_MS（10s）后被静默清空，胜方连结果都来不及看。
+  // 这类房间的收口交给 ACTIVE_ROOM_TTL（2h）GC，或由玩家主动点「返回房间/退出房间」。
+  if (room.endReason === "leave") {
+    endedSinceMap.delete(room.id);
+    return false;
+  }
   const now = Date.now();
   const since = endedSinceMap.get(room.id);
   if (since === void 0) {
@@ -26849,6 +26860,53 @@ function healStaleEndedRoom(room) {
     transferHost(room);
   }
   actRematch(room.id, {});
+  return true;
+}
+function hasCompleteSeating(room) {
+  // 观战席位校验：棋盘需要红黑双方都在席才能呈现完整对局。
+  // 一方离场后房间仍会短暂停留在 ended（等 healStaleEndedRoom 收口），
+  // 此时放行观战只会看到「红方/黑方」空占位，必须直接拒绝。
+  const sides = new Set(
+    room.players.map((p) => p.side).filter((s) => s === "red" || s === "black")
+  );
+  return sides.has("red") && sides.has("black");
+}
+function settleAbandonedPlayingRoom(room, leaverId) {
+  // 对局中离场结算：一方在 playing 阶段离开（主动返回退出、断连后被移出等）必须立即裁定本局，
+  // 否则房间会以「单人 playing」形态滞留，派生出一整串错误状态：
+  //   1) 留下的玩家在状态负载里查不到对手 → 前端退化成「等待对手加入」的空席位；
+  //   2) 房中已无第二个玩家，detectDisconnect 找不到可判断线的对象，DISCONNECT_TIMEOUT
+  //      倒计时对留下的一方空转，棋钟继续走并可能在超时后把留下的一方判负；
+  //   3) 房间卡在 playing，既不进 sweepWaitingRoom 也不进 healStaleEndedRoom，
+  //      只能等 ACTIVE_ROOM_TTL(2h) 被 GC 回收，期间任何人都能进「空局」观战。
+  // 语义取「离场即弃局」：判对方获胜。endReason 用 'leave' 而非 'resign'，
+  // 前端据此给出「对手离开了对局」而不是误报「对手选择了认输」。
+  // leaverId 为空表示兜底路径（席位被动缺失、来源不可考），结算口径与显式离场一致。
+  if (room.phase !== "playing") return false;
+  if (leaverId && !room.players.some((p) => p.id === leaverId)) return false;
+  const remaining = leaverId ? room.players.filter((p) => p.id !== leaverId) : room.players;
+  if (remaining.length === 0) {
+    rooms.delete(room.id);
+    return true;
+  }
+  if (remaining.length >= 2) return false;
+  const leaver = leaverId ? room.players.find((p) => p.id === leaverId) : null;
+  const survivor = remaining[0];
+  // 胜负以离场者阵营为准；离场者阵营缺失时按在场者阵营取反
+  const leaverSide = leaver && leaver.side ? leaver.side : survivor.side === "red" ? "black" : "red";
+  room.phase = "ended";
+  room.winner = leaverSide === "red" ? "black" : "red";
+  room.endReason = "leave";
+  // 离场不是认输：surrenderBy 保持为空，避免结算文案把「离开」说成「认输」
+  room.surrenderBy = null;
+  room.clockPausedAt = null;
+  room.disconnectedPlayerId = null;
+  room.disconnectTime = null;
+  room.pendingUndo = null;
+  room.undoResult = null;
+  room.pendingDraw = null;
+  room.drawResult = null;
+  room.lastActivity = Date.now();
   return true;
 }
 function tryAutoStart(room) {
@@ -26878,6 +26936,15 @@ var gameTickTimer = setInterval(() => {
     if (!rooms.has(room.id)) continue;
     if (healStaleEndedRoom(room)) changed = true;
     if (!rooms.has(room.id)) continue;
+    // 对局不变量兜底：playing 相位必须红黑双方都在席。
+    // 正常路径由 /leave 立即结算，这里覆盖的是改座位遗留的异常态（如旧版本房间已滞留），
+    // 防止单人 playing 无限滞留（空局可被观战、留下的一方被空转的断线倒计时牵连）。
+    if (settleAbandonedPlayingRoom(room)) {
+      if (!rooms.has(room.id)) continue;
+      changed = true;
+    }
+    // 结算后的「返回房间」10s 兜底：客户端未按时补齐时按超时自动补齐并可能触发房间重置
+    if (expireReturnedPlayers(room, Date.now())) changed = true;
     if (tryAutoStart(room)) changed = true;
     if (expirePendingUndo(room)) changed = true;
     if (expirePendingDraw(room)) changed = true;
@@ -26986,6 +27053,10 @@ router.post("/rooms", (req, res) => {
     sideReveal: null,
     gameStartAt: null,
     matchId: 0,
+    // 结算后每位玩家独立的「已返回房间」记录（playerId → 返回时刻）。
+    // 双方互不干扰：本端返回不自动把对手拉回房间，对手端据此自行决定；
+    // 记录供客户端提示「对手已返回房间」，并由 expireReturnedPlayers 按 10s 兜底清理。
+    returnedToRoom: {},
     spectators: [],
     emojiMessages: [],
     createdAt: Date.now(),
@@ -27145,6 +27216,9 @@ router.get("/rooms/:roomId", (req, res) => {
         ready: p.ready,
         connected: p.connected
       })),
+      // 结算后「已返回房间」记录（key=playerId，value=返回时刻）：
+      // 客户端 2s 轮询据此判断对手是否已返回房间，并据此不自动跟随房间重置
+      returnedToRoom: room.returnedToRoom || {},
       // 等待阶段表情消息（TTL 内）：客户端 2s 轮询详情时同步，作为 WS 之外的接收兜底通道
       emojiMessages: room.emojiMessages.map((m) => ({ id: m.id, playerId: m.playerId, emoji: m.emoji, time: m.time }))
     }
@@ -27505,6 +27579,11 @@ router.post("/rooms/:roomId/spectate", (req, res) => {
   if (room.phase === "waiting") {
     return res.status(400).json({ success: false, message: "\u5BF9\u5C40\u5C1A\u672A\u5F00\u59CB\uFF0C\u6682\u65E0\u6CD5\u89C2\u6218" });
   }
+  // 席位不完整（一方已离场）时不再放行：否则观战者会进入一个只有单边棋子的「空局」，
+  // 名称角标只能落到「红方/黑方」占位文本上。提示按「对局已终止」表述，避免观战者误判为网络问题。
+  if (!hasCompleteSeating(room)) {
+    return res.status(400).json({ success: false, message: "对局已有玩家离开，观战已结束" });
+  }
   pruneSpectators(room);
   const name = typeof spectatorName === "string" && spectatorName.trim() ? spectatorName.trim().slice(0, 16) : "\u89C2\u4F17";
   const existing = room.spectators.find((s) => s.id === spectatorId);
@@ -27608,6 +27687,7 @@ function actRematch(roomId, _body) {
   room.drawResult = null;
   room.sideReveal = null;
   room.emojiMessages = [];
+  room.returnedToRoom = {};
   room.players.forEach((p) => {
     p.ready = false;
     p.side = null;
@@ -27622,6 +27702,67 @@ function actRematch(roomId, _body) {
 }
 router.post("/rooms/:roomId/rematch", (req, res) => {
   respondAction(res, req.params.roomId, actRematch(req.params.roomId, req.body));
+});
+/**
+ * 结算后的「返回房间」：把房间重置回等待中，供返回者自行准备。
+ *
+ * 与 /rematch 的区别在「谁被重置」：两者都是房间级重置，但 /rematch 是发起者单方面决定
+ * 把对手一起拽回（用户反馈的 BUG）。本动作把决定权交给双方——重置后房间即为 waiting，
+ * 但对手端不会自动跟随（客户端仅在自己也点击过返回、或 10s 兜底到期时才切换），
+ * 因此对手仍停留在结算页自行决定去留，互不干扰。
+ *
+ * returnedToRoom 记录每位玩家已返回的时刻，客户端据此判断「对手是否已回房间」，
+ * 并作为 10s 兜底倒计时的时间基准（由 expireReturnedPlayers 定期清理）。
+ */
+function actReturnToRoom(roomId, body) {
+  const { playerId } = body;
+  const room = rooms.get(roomId);
+  if (!room) {
+    return { status: 404, body: { success: false, message: "房间不存在" } };
+  }
+  const player = room.players.find((p) => p.id === playerId);
+  if (!player) {
+    return { status: 404, body: { success: false, message: "玩家不在房间中" } };
+  }
+  if (room.phase !== "ended") {
+    // 房间已不在结算阶段（重复点击，或对手已重置）：幂等返回当前状态
+    return { status: 200, body: { success: true, phase: room.phase } };
+  }
+  if (!room.returnedToRoom) room.returnedToRoom = {};
+  // 房间回到等待中：返回者可立即自行准备/选边；对手端不自动跟随（见上方注释）
+  actRematch(roomId, {});
+  // 必须在 actRematch 之后写：actRematch 会清空 returnedToRoom
+  room.returnedToRoom[playerId] = Date.now();
+  return { status: 200, body: { success: true, phase: room.phase } };
+}
+/**
+ * 「返回房间」记录清理：
+ *   · 离席玩家的记录（覆盖 /leave、healStaleEndedRoom 等摘除成员的路径）——必须立即清理，
+ *     否则留下的人会一直看到「对手已返回房间」；
+ *   · 超过 TTL 的旧记录——兜底清理，避免无限增长。
+ *
+ * TTL 必须**大于**客户端的结算兜底倒计时（RETURN_ROOM_FALLBACK_SECONDS = 10s），且要留出
+ * 轮询/WS 传达的余量：若服务端与客户端的 10s 几乎同时到点，记录会先被清掉，对手端就永远
+ * 看不到「对手已返回房间」提示（实测双方倒计时同步时该提示一闪即逝）。取 30s。
+ */
+var RETURNED_GRACE_MS = 30 * 1e3;
+function expireReturnedPlayers(room, now) {
+  if (!room.returnedToRoom) return false;
+  const ids = Object.keys(room.returnedToRoom);
+  if (ids.length === 0) return false;
+  const seated = new Set(room.players.map((p) => p.id));
+  let changed = false;
+  ids.forEach((id) => {
+    if (!seated.has(id) || now - room.returnedToRoom[id] >= RETURNED_GRACE_MS) {
+      delete room.returnedToRoom[id];
+      changed = true;
+    }
+  });
+  if (changed) room.lastActivity = now;
+  return changed;
+}
+router.post("/rooms/:roomId/returnToRoom", (req, res) => {
+  respondAction(res, req.params.roomId, actReturnToRoom(req.params.roomId, req.body));
 });
 function actUndo(roomId, body) {
   const { playerId, proposedState } = body;
@@ -27864,7 +28005,14 @@ router.post("/rooms/:roomId/leave", (req, res) => {
     return res.status(404).json({ error: "\u623F\u95F4\u4E0D\u5B58\u5728" });
   }
   const wasHost = room.hostId === playerId;
+  // 对局中离场：先裁定本局，再摘除成员。
+  // 顺序不能颠倒——settleAbandonedPlayingRoom 依赖离场者仍在席来读其阵营并区分「离场者/留下者」，
+  // 也依赖人数关系判断是「1v0 直接销毁」还是「1v1 判对方胜」。
+  const abandoned = settleAbandonedPlayingRoom(room, playerId);
+  const settled = abandoned && rooms.has(roomId);
   room.players = room.players.filter((p) => p.id !== playerId);
+  // 离场者的返回记录必须清除：否则会残留到 10s 兜底清理
+  if (room.returnedToRoom) delete room.returnedToRoom[playerId];
   room.lastActivity = Date.now();
   if (room.players.length === 0) {
     rooms.delete(roomId);
@@ -27880,11 +28028,17 @@ router.post("/rooms/:roomId/leave", (req, res) => {
       });
       room.sideReveal = null;
       room.gameStartAt = null;
-    } else if (room.phase === "ended") {
+    } else if (room.phase === "ended" && !settled) {
+      // 结算态离场：按原语义把房间重置为等待中，供留下的人另起一局。
+      // 但若是本次离场刚刚触发的结算（settled），必须停在 ended：
+      // 立刻 rematch 会把 winner/endReason 冲掉，胜方将永远看不到「对手离开了对局」这一结果。
+      // 该局不完整，是否再战由留下的人通过结算浮层自行决定。
       actRematch(roomId, {});
     }
   }
-  res.json({ success: true });
+  // 离场是一次权威状态变更：必须广播，让留下的玩家立刻收到终局，而不是等 2s 轮询才发现
+  if (rooms.has(roomId)) roomBroadcaster(rooms.get(roomId));
+  res.json({ success: true, endReason: settled ? "leave" : room.endReason ?? null });
 });
 var lanGame_default = router;
 
@@ -28644,6 +28798,12 @@ function attachBattleWebSocket(server2) {
       }
       if (room.phase === "waiting") {
         sendJson(ws, { type: "error", message: "\u5BF9\u5C40\u5C1A\u672A\u5F00\u59CB\uFF0C\u6682\u65E0\u6CD5\u89C2\u6218" });
+        ws.close();
+        return;
+      }
+      // 与 HTTP /spectate 同一准入口径：席位不完整时拒绝，避免观战者进入「空局」
+      if (!hasCompleteSeating(room)) {
+        sendJson(ws, { type: "error", message: "对局已有玩家离开，观战已结束" });
         ws.close();
         return;
       }

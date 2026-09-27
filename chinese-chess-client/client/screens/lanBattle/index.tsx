@@ -18,6 +18,11 @@ import {
 import { Screen } from '@/components/Screen';
 import { useSafeRouter, useSafeSearchParams } from '@/hooks/useSafeRouter';
 import { useFocusEffect } from 'expo-router';
+// usePreventRemove 由 @react-navigation/core 提供，经 @react-navigation/native 转出；
+// expo-router 6.0.23 自身未导出该 hook（build/exports.d.ts 无此名），故从 react-navigation 取。
+// 它拦截的是导航容器的 beforeRemove 事件——iOS 侧滑返回与 Web 浏览器后退键都走这条路径
+// （顶部返回按钮与安卓物理返回键是显式 onPress，不经此事件，已各自接 requestExit）。
+import { useNavigation, usePreventRemove, type NavigationProp } from '@react-navigation/native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { FontAwesome6 } from '@expo/vector-icons';
 import { createInitialState, applyHandicap, cloneGameState, getValidMoves, makeMove, undoMove, getWinnerSideTag, type GameState } from '@/utils/chess/GameEngine';
@@ -115,6 +120,9 @@ const EMOJI_CODE_POINTS: number[][] = [
 const EMOJI_LIST = EMOJI_CODE_POINTS.map(cps => String.fromCodePoint(...cps));
 // 单条表情本地展示时长（毫秒）：弹入 → 停留 → 淡出后移除
 const EMOJI_DISPLAY_MS = 4000;
+// 结算页「返回房间」兜底倒计时（秒）：双方互不干扰意味着都可能不点按钮，
+// 到点后本端自动回房间准备界面，避免结算页无限期停留
+const RETURN_ROOM_FALLBACK_SECONDS = 10;
 
 // 当前正在展示的活跃表情（本地按首次接收时间计时，超时自动移除）
 interface ActiveEmoji {
@@ -187,6 +195,23 @@ export default function LanBattleScreen() {
   const phaseRef = useRef<GamePhase>('waiting');
   phaseRef.current = phase;
   const [showSurrenderModal, setShowSurrenderModal] = useState(false);
+  // 对局中退出二次确认：返回按钮 / 侧滑返回 / 安卓物理返回键共用一个入口，
+  // 由 requestExit 统一决定「直接退出」还是「先弹窗」，避免各入口各写一套判断
+  const [showLeaveConfirm, setShowLeaveConfirm] = useState(false);
+  // 「中途退出」二次确认的导航拦截开关（详见下方 usePreventRemove 处注释）。
+  // ref 供 confirmLeaveAndExit / handleBack 同步撤防——等下一帧 state 更新会让确认弹窗被重新弹回；
+  // state 驱动 usePreventRemove 的 preventRemove 参数，最终同步给导航容器。
+  const [leaveArmed, setLeaveArmed] = useState(false);
+  const leaveArmedRef = useRef(false);
+  // 弹窗已开标记：Web 端 popstate 兜底在弹窗开着时不再重复触发（连点后退会连弹多次）
+  const showLeaveConfirmRef = useRef(false);
+  // 「撤销后退」标记：history.go(1) 会自己再触发一次 popstate，用它区分自发回退与撤销回退
+  const webPopRestoreRef = useRef(false);
+  // 被 beforeRemove 拦下的原始离场动作，确认后原样 dispatch 放行（不能改写成 router.back()）
+  const pendingLeaveRef = useRef<{
+    nav: Pick<NavigationProp<ReactNavigation.RootParamList>, 'dispatch'>;
+    action: Parameters<NavigationProp<ReactNavigation.RootParamList>['dispatch']>[0];
+  } | null>(null);
   const [countdown, setCountdown] = useState(3);
   const [gameResult, setGameResult] = useState<{
     winner: string | null;
@@ -197,8 +222,8 @@ export default function LanBattleScreen() {
     isDraw?: boolean; // 和棋（双方同意求和）
   } | null>(null);
   const [jueShaVisible, setJueShaVisible] = useState(false);
-  // 终局原因：区分「绝杀/困毙」（播绝杀特效）与「认输/和棋/断线判负」（仅普通文字结算）
-  const [gameEndReason, setGameEndReason] = useState<'checkmate' | 'resign' | 'draw' | 'disconnect' | 'timeout' | null>(null);
+  // 终局原因：区分「绝杀/困毙」（播绝杀特效）与「认输/和棋/断线判负/对方离开」（仅普通文字结算）
+  const [gameEndReason, setGameEndReason] = useState<'checkmate' | 'resign' | 'draw' | 'disconnect' | 'timeout' | 'leave' | null>(null);
   // 引擎终局细分原因（juesha/kunbi/changjiang/changzhuo/repetition/red_win/black_win），用于结算文案与特效开关
   const [gameOverReason, setGameOverReason] = useState<string>('');
   // 准备阶段：房间名、选边与准备状态
@@ -229,6 +254,12 @@ export default function LanBattleScreen() {
   // 进行中的准备请求数：>0 时忽略新的连点，防止并发请求互相覆盖
   const readyInFlightRef = useRef(0);
   const rematchInFlightRef = useRef(false); // 重新对局请求在途标记：防止连点并发
+  // 「返回房间」10s 兜底倒计时的剩余秒数：结算后开始计时（无论玩家是否已点），
+  // 归零即自动切到房间准备界面，避免停在结算页干等对手。
+  const [returnRoomCountdown, setReturnRoomCountdown] = useState<number | null>(null);
+  // 对方是否已返回房间（服务端 returnedToRoom 下发）：用于在结算页提示对手去留。
+  const [opponentReturned, setOpponentReturned] = useState(false);
+  const returnToRoomInFlightRef = useRef(false); // 「返回房间」请求在途标记：防止连点并发
   // 最近一次本地切换准备的时间戳：轮询在此宽限窗口内不用服务端旧数据覆盖本端状态，避免按钮回跳
   const lastReadyToggleRef = useRef(0);
   // 最近一次「返回房间」（重赛重置）的时间戳：此后轮询拿到的旧对局状态（phase=playing/旧 gameStartTime）
@@ -303,8 +334,9 @@ export default function LanBattleScreen() {
     bottomFlowHeight: 30 + dynamicGap + bottomBarH,
   });
 
-  // 棋盘真实几何（相对主容器）：供绝杀特效锁定棋盘中心、把结算文字/按钮排到棋盘正下方
-  const { containerRef, boardRef, boardFrame, measure: measureBoardFrame } = useBoardFrame();
+  // 棋盘真实几何（相对主容器）：供绝杀特效锁定棋盘中心、把结算文字/按钮排到棋盘正下方，
+  // 以及把对局中弹窗（悔棋/求和等）与提示条精确对齐到棋盘中心
+  const { containerRef, boardRef, boardFrame, containerOrigin, measure: measureBoardFrame } = useBoardFrame();
 
   // 当前棋盘样式：名称角标行宽度需按样式几何换算棋盘本体宽度（用户可在首页设置中切换样式）
   const boardStyle = useBoardStyle();
@@ -345,6 +377,37 @@ export default function LanBattleScreen() {
       height: h,
     };
   }, [boardFrame, boardSize]);
+
+  // 结算浮层（JueShaOverlay）用的棋盘矩形，单位为其所在宿主容器的坐标系。
+  // jueshaBoardFrame 是相对根容器（containerRef）测量的，而浮层实际挂在标题行下方的
+  // capturedDrawerHost 里——该宿主相对根容器向下偏移了 drawerHostY（实测 62px），
+  // 直接把根容器坐标喂给浮层会让「绝/杀」特效、结果提示条与棋盘底下方按钮整体下移 62px。
+  // boardFrame prop 的约定本就是「浮层容器内」的坐标，故在此完成换算。
+  const jueshaHostBoardFrame = useMemo(() => {
+    if (!jueshaBoardFrame) return null;
+    // 宿主是根容器的纵向 flex 子节点、铺满整行宽度，x 方向无偏移，故只换算 y
+    return { ...jueshaBoardFrame, y: jueshaBoardFrame.y - drawerHostY };
+  }, [jueshaBoardFrame, drawerHostY]);
+
+  // 对局内提示条（GameNotice）的棋盘中心纵坐标，单位与主容器一致（容器相对）：
+  // 提示条挂载在 capturedDrawerHost 内，而 jueshaBoardFrame 正是相对根容器测量的，
+  // 两者相差 drawerHostY，需换算；缺测量时返回 undefined 由 GameNotice 退回容器 50% 居中。
+  const noticeCenterY = useMemo(() => {
+    if (!jueshaBoardFrame) return undefined;
+    return jueshaBoardFrame.y + jueshaBoardFrame.height / 2 - drawerHostY;
+  }, [jueshaBoardFrame, drawerHostY]);
+
+  // 对局中弹窗（悔棋/求和请求）的棋盘中心锚点，单位为窗口坐标：
+  // boardFrame 是相对主容器的坐标，而 <Modal> 渲染在独立原生窗口、以窗口为坐标系，
+  // 两者必须加 containerOrigin（容器自身的窗口原点）才能对齐。缺任一项则返回 null，
+  // 由 AppModal 退回 placement 的原有定位。
+  const dialogAnchorCenter = useMemo(() => {
+    if (!jueshaBoardFrame || !containerOrigin) return null;
+    return {
+      x: containerOrigin.x + jueshaBoardFrame.x + jueshaBoardFrame.width / 2,
+      y: containerOrigin.y + jueshaBoardFrame.y + jueshaBoardFrame.height / 2,
+    };
+  }, [jueshaBoardFrame, containerOrigin]);
 
   // 房间设置
   const [turnTimeLimit, setTurnTimeLimit] = useState(0); // 秒，0=不限时
@@ -644,13 +707,18 @@ export default function LanBattleScreen() {
               setMyPreference(me.sidePreference ?? null);
             }
             // 公示被取消（对方退出/死连被清扫，服务端已清空公示与统一定时）→ 中止倒数回准备阶段；
-            // 已本地进局但服务端未开局（对方在倒数窗口内离开）→ 同样回退，避免单人空局卡死
-            if (
-              room.phase === 'waiting' &&
-              !room.sideReveal &&
-              !uploadedRef.current &&
-              (revealStartedRef.current || phaseRef.current === 'playing')
-            ) {
+            // 已本地进局但服务端未开局（对方在倒数窗口内离开）→ 同样回退，避免单人空局卡死。
+            //
+            // 必须限定在本端仍处于公示/倒数/对局阶段：结算之后（phaseRef==='ended'）房间被
+            // 重置为 waiting 时同样满足 room.phase==='waiting' && !room.sideReveal，而
+            // revealStartedRef 自 startRevealSequence 置 true 起要到重置/中止才清回，结算期一直为
+            // true，于是本端会被 abortRevealSequence 从结算页硬拽回准备界面——对手点一次
+            // 「返回房间」就把我也带走，正是这个条件漏判导致的。
+            const inRevealSequence =
+              phaseRef.current === 'reveal' ||
+              phaseRef.current === 'countdown' ||
+              phaseRef.current === 'playing';
+            if (room.phase === 'waiting' && !room.sideReveal && !uploadedRef.current && inRevealSequence) {
               abortRevealSequence();
             }
             // 双方已准备且阵营已分配 → 启动公示→倒数序列（只启动一次，倒数锚定服务端统一开局时刻）
@@ -700,9 +768,22 @@ export default function LanBattleScreen() {
             ) {
               uploadInitialGame();
             }
-            // 对方点击重新对局：房间从 ended 回到 waiting，重置本地状态
+            // 房间从 ended 回到 waiting → 本端跟随回到准备界面。
+            // 「返回房间」是互不干扰语义：对方点他的按钮会重置房间，但**不会**把本端一起拽走——
+            // 只有本端自己也点过（returnedToRoom 含 playerId），或结算兜底倒计时归零后
+            // 由本端自己发起，才切换。未表态时留在结算页，等自己的倒计时到点或对手离开。
             if (room.phase === 'waiting' && phaseRef.current === 'ended') {
-              resetForRematch();
+              const returned = (room.returnedToRoom ?? {}) as Record<string, number>;
+              const iReturned = !!returned[playerId];
+              if (iReturned || returnFallbackFiredRef.current) {
+                resetForRematch();
+              } else {
+                // 房间已被对方重置但本端未表态：**保持结算页与兜底倒计时不变**，让玩家
+                // 看到「对方已返回房间」提示后，自己决定点「返回房间」还是等倒计时到点。
+                // 早期实现在这里收起浮层（settlementDismissed=true），结果本端还在倒计时中
+                // 「返回房间」按钮就被换成了占位——这正是「点了没反应、按钮也消失了」的 BUG。
+                // 双方互不干扰的前提是：本端在倒计时结束前，操作入口必须一直在。
+              }
             }
           }
         } catch (error) {
@@ -724,7 +805,7 @@ export default function LanBattleScreen() {
       gameStartTime?: number | null;
       winner?: string | null;
       surrenderBy?: string | null;
-      endReason?: 'checkmate' | 'resign' | 'draw' | 'disconnect' | null;
+      endReason?: 'checkmate' | 'resign' | 'draw' | 'disconnect' | 'leave' | null;
       lastMoveTime?: number | null;
       disconnectedPlayerId?: string | null;
       disconnectTime?: number | null;
@@ -740,6 +821,9 @@ export default function LanBattleScreen() {
       clockPausedAt?: number | null; // 悔棋/求和协商暂停锚点（服务端时钟域）
       undoRefusals?: Record<string, number>; // 各玩家本局悔棋被对方连续拒绝次数（≥2 封禁悔棋入口）
       drawRefusals?: Record<string, number>; // 各玩家本局求和被对方连续拒绝次数（≥2 封禁求和入口）
+      // 结算后各玩家「已返回房间」记录（playerId → 返回时刻，服务端时钟）
+      returnedToRoom?: Record<string, number>;
+      players?: { id: string; name: string; side: string | null; connected: boolean }[];
     };
 
     // 同步 emoji 表情消息：独立于 gameState 处理，准备阶段（未开局、gameState 为空）同样生效。
@@ -752,9 +836,10 @@ export default function LanBattleScreen() {
       }
     }
 
-    if (data.gameState) {
-      const newState = data.gameState;
-
+    // 房间重置为 waiting 时负载里没有 gameState，故把 newState 提到 if 之外，
+    // 供下方与 gameState 无关的阶段判断（如结算步数）使用
+    const newState = data.gameState;
+    if (newState) {
       // 乐观更新保护：本端刚走子且上传在途时，服务端可能仍是走子前的旧局面，
       // 直接覆盖会让棋子回退、待上传落地后又重新移动。服务端未追上本端着法数时跳过本轮覆盖。
       if (pendingSyncRef.current) {
@@ -921,26 +1006,48 @@ export default function LanBattleScreen() {
         selfDisconnectedRef.current = true;
         sendReconnect();
       }
+    } // ← 关闭 if (data.gameState)
 
-      // 检查对局是否结束（对方认输、断线超时、走棋绝杀或对方同意求和）
-      if (data.phase === 'ended') {
-        const isDraw = !data.winner; // 无胜负方 = 和棋
-        const isWin = !isDraw && data.winner === mySideRef.current;
-        setGameResult({
-          winner: data.winner ?? null,
-          isWin,
-          duration: data.gameStartTime ? Date.now() - data.gameStartTime : 0,
-          moveCount: newState.moveHistory?.length || 0,
-          surrenderBy: data.surrenderBy ?? null,
-          isDraw,
-        });
-        setPhase('ended');
-        // 终局原因：服务端明确下发；缺失时按结果兜底推断（和棋/认输可判，其余有胜负方的按绝杀处理）
-        const endReason = data.endReason ?? (isDraw ? 'draw' : data.surrenderBy ? 'resign' : 'checkmate');
-        setGameEndReason(endReason);
-        // 所有结束方式都展示结算界面；其中仅绝杀/困毙播放「绝/杀」特效，
-        // 认输/和棋/断线判负由 showEffect 控制为普通文字结算
-        setJueShaVisible(true);
+    // 结算后「已返回房间」记录：据此提示对手是否已回房间（互不干扰语义的可视化）
+    if (data.returnedToRoom && typeof data.returnedToRoom === 'object' && Array.isArray(data.players)) {
+      const rec = data.returnedToRoom as Record<string, number>;
+      const opponentId = (data.players as { id: string }[]).find((p) => p.id !== playerId)?.id;
+      setOpponentReturned(!!opponentId && !!rec[opponentId]);
+    }
+
+    // 检查对局是否结束（对方认输、断线超时、走棋绝杀或对方同意求和）
+    // 注意：这两段刻意置于 if (data.gameState) 之外——房间被重置为 waiting 时负载里
+    // 没有 gameState，若关在里面本端会永远停在 ended 结算页。
+    if (data.phase === 'ended') {
+      const isDraw = !data.winner; // 无胜负方 = 和棋
+      const isWin = !isDraw && data.winner === mySideRef.current;
+      setGameResult({
+        winner: data.winner ?? null,
+        isWin,
+        duration: data.gameStartTime ? Date.now() - data.gameStartTime : 0,
+        moveCount: newState?.moveHistory?.length || 0,
+        surrenderBy: data.surrenderBy ?? null,
+        isDraw,
+      });
+      setPhase('ended');
+      // 终局原因：服务端明确下发；缺失时按结果兜底推断（和棋/认输可判，其余有胜负方的按绝杀处理）
+      const endReason = data.endReason ?? (isDraw ? 'draw' : data.surrenderBy ? 'resign' : 'checkmate');
+      setGameEndReason(endReason);
+      // 所有结束方式都展示结算界面；其中仅绝杀/困毙播放「绝/杀」特效，
+      // 认输/和棋/断线判负由 showEffect 控制为普通文字结算
+      setJueShaVisible(true);
+    } else if (data.phase === 'waiting' && phaseRef.current === 'ended') {
+      // 房间已被重置为等待中。是否跟随回到准备界面取决于**本端**是否已表态：
+      // - 本端点过「返回房间」或结算兜底倒计时已归零（returnFallbackFiredRef）→ 跟随；
+      // - 仅对手表态 → 留在结算页（对方已返回房间提示），实现双方互不干扰。
+      // 旧实现无条件 resetForRematch()，正是「对方也被返回房间」的根因。
+      const returned = (data.returnedToRoom ?? {}) as Record<string, number>;
+      if (returned[playerId] || returnFallbackFiredRef.current) {
+        resetForRematch();
+      } else {
+        // 对方已回房间但本端未表态：与 checkRoom 分支保持一致——**不收起结算页**，
+        // 保住本端「返回房间」入口直到自己的倒计时归零（早期实现在此收起浮层，
+        // 导致对手一返回，本端倒计时中途按钮变占位——即 m02128 报告的 BUG）。
       }
     }
   };
@@ -2018,6 +2125,45 @@ export default function LanBattleScreen() {
     if (!canUseEmoji && emojiPickerOpen) setEmojiPickerOpen(false);
   }, [canUseEmoji, emojiPickerOpen]);
 
+  // 「返回房间」10s 兜底倒计时：进入结算即开始计时（不点按钮也会到点自动回房间）。
+  // 目的：结算页不能无限期停留等待对手决策——双方互不干扰意味着谁都不点就谁都不动，
+  // 到点自动收起结算并把本端切回房间准备界面，与点了按钮的效果一致。
+  useEffect(() => {
+    if (phase !== 'ended' || sessionGone) return;
+    setReturnRoomCountdown(RETURN_ROOM_FALLBACK_SECONDS);
+    const timer = setInterval(() => {
+      setReturnRoomCountdown((prev) => {
+        if (prev === null) return null;
+        if (prev <= 1) {
+          clearInterval(timer);
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+    return () => {
+      clearInterval(timer);
+      setReturnRoomCountdown(null);
+    };
+  }, [phase, sessionGone]);
+
+  // 兜底倒计时归零 → 与主动点「返回房间」等价：发请求并切回准备界面。
+  // 经 ref 调用以避开 handleReturnToRoom 的声明顺序（它是普通 async 函数，非 useCallback），
+  // ref 每轮渲染刷新，始终指向最新实现。
+  // 初始为空实现，由下方「每轮渲染刷新指向」的 effect 在首帧后填入 handleReturnToRoom
+  const returnToRoomRef = useRef<() => void>(() => undefined);
+  const returnFallbackFiredRef = useRef(false);
+  useEffect(() => {
+    if (returnRoomCountdown !== 0 || returnFallbackFiredRef.current) return;
+    returnFallbackFiredRef.current = true;
+    returnToRoomRef.current();
+  }, [returnRoomCountdown]);
+
+  // 重新进入结算（新一局终局）时重置兜底触发标记
+  useEffect(() => {
+    if (phase !== 'ended') returnFallbackFiredRef.current = false;
+  }, [phase]);
+
   // 重置本地状态回到准备阶段（重新对局）
   const resetForRematch = () => {
     if (revealTimerRef.current) { clearTimeout(revealTimerRef.current); revealTimerRef.current = null; }
@@ -2031,6 +2177,8 @@ export default function LanBattleScreen() {
     setGameDuration(0);
     setJueShaVisible(false);
     setGameEndReason(null);
+    setReturnRoomCountdown(null);
+    setOpponentReturned(false);
     gameStartTimeRef.current = 0;
     // 注意：playedMatchIdRef（已入局纪元）刻意不重置——重赛后轮询若先拿到上一局旧快照
     // （phase=playing + 旧 matchId），须凭它识别并忽略，避免跳过准备阶段直接进入对局
@@ -2070,7 +2218,7 @@ export default function LanBattleScreen() {
     seenEmojiIdsRef.current = new Set();
   };
 
-  // 重新对局：必须等服务端重置落地后再本地重置——否则本地已回准备阶段而服务端仍是
+  // 重新对局（房间级重置）：必须等服务端重置落地后再本地重置——否则本地已回准备阶段而服务端仍是
   // ended，此刻点准备会被 400 拒绝并回滚（表现为「准备跳回」）。respondAction 成功
   // 即广播，对手经 WS 即时同步，无需额外走 WS 通道
   const handleRematch = async () => {
@@ -2108,12 +2256,86 @@ export default function LanBattleScreen() {
     resetForRematch();
   };
 
+  // 结算后的「返回房间」：把本端退回房间准备界面，随后可自行准备/选边。
+  // 与 /rematch 的关键差别在**谁被重置**：/rematch 由发起者单方面把对手一起拽回准备阶段
+  // （用户反馈的「对方也被返回房间」）。本接口同样把房间重置为 waiting，但客户端只在
+  // **本端**切到准备界面；对手端仅在轮询发现「自己也被标记返回」或结算兜底倒计时归零时才切换，
+  // 因此双方互不干扰，各自决定何时离开结算页。
+  const handleReturnToRoom = async () => {
+    if (returnToRoomInFlightRef.current) return; // 防连点
+    returnToRoomInFlightRef.current = true;
+    try {
+      const base = await getOnlineServerUrl();
+      /**
+       * 服务端文件：server/src/routes/lanGame.ts
+       * 接口：POST /api/v1/lan/rooms/:roomId/returnToRoom
+       * Body 参数：playerId: string
+       */
+      const response = await fetch(`${base}/api/v1/lan/rooms/${roomId}/returnToRoom`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ playerId }),
+      });
+      const data = await response.json();
+      if (!data.success) {
+        console.error('返回房间被服务端拒绝:', data);
+        const msg = typeof data?.message === 'string' ? data.message : '';
+        if (msg.includes('不在房间') || msg.includes('房间不存在')) {
+          handleSessionGone(msg.includes('房间不存在') ? 'room-closed' : 'removed');
+          return;
+        }
+        return;
+      }
+    } catch (error) {
+      console.error('返回房间失败:', error);
+      return;
+    } finally {
+      returnToRoomInFlightRef.current = false;
+    }
+    // 服务端已把房间重置为等待中 → 同步本端到准备界面
+    resetForRematch();
+  };
+
+  // 每轮渲染刷新兜底回调指向，保持指向最新闭包。必须放在组件体顶层：
+  // 若塞进 handleReturnToRoom 内部，只有成功请求后才会更新，会漏掉首次渲染与失败重试场景，
+  // 兜底倒计时归零时可能调用到上一轮（或空）实现。
+  useEffect(() => {
+    returnToRoomRef.current = handleReturnToRoom;
+  });
+
   // 返回：通知服务端离开房间后再返回（房间无人时服务端自动销毁，等待期离开会重置对手状态）。
+  // 确认「中途退出」后才真正离开：实际离开动作（leave 请求 + 回大厅）都在 handleBack 里，
+  // 本函数只负责在**对局进行中**拦一道二次确认。
+  //
+  // 覆盖阶段：playing（正在下棋）与 reveal / countdown（公示与开局倒数——此时退出同样会
+  // 让对方等不到对手，语义上与 playing 一致）。waiting（准备阶段，退出不判负）与
+  // ended（结算阶段，已有独立的「返回房间/退出房间」按钮）不拦，保持原一键返回。
+  //
+  // 用 phaseRef 而非 phase 读取阶段：安卓物理返回键的监听只订阅一次（避免每次渲染重新
+  // 订阅），回调里拿到的是注册那一刻的闭包，必须读 ref 才能拿到最新阶段。
+  const requestExit = useCallback(() => {
+    const p = phaseRef.current;
+    if (p === 'playing' || p === 'reveal' || p === 'countdown') {
+      showLeaveConfirmRef.current = true;
+      setShowLeaveConfirm(true);
+      return;
+    }
+    handleBackRef.current();
+  }, []);
+
   // 等待离开请求落地（上限 800ms 兜底）再跳转：否则大厅聚焦轮询可能在离开生效前查到旧成员身份，
   // 误显示「回到对局/未开始房间」的回连提醒
+  //
+  // 本函数是「已确认的离场」收口：所有调用方（顶部返回按钮经 requestExit、结算期「退出房间」、
+  // sessionGone 浮层、confirmLeaveAndExit）都已就绪，故第一件事就是撤防 + 置主动退出标记。
+  // 撤防不可省：下面的 exitToLobby() 本身也是一次导航，会触发 beforeRemove；若拦截仍开着，
+  // 退出动作会被自己的对话框再拦一次（点了没反应 / 弹窗循环）。
   const handleBack = useCallback(async () => {
     // 先置主动退出标记：抑制离开请求与 2s 轮询竞态导致的「房间已关闭/你已被移出房间」误报
     intentionalExitRef.current = true;
+    leaveArmedRef.current = false;
+    setLeaveArmed(false);
+    showLeaveConfirmRef.current = false;
     try {
       const base = await getOnlineServerUrl();
       /**
@@ -2136,10 +2358,103 @@ export default function LanBattleScreen() {
     exitToLobby();
   }, [roomId, playerId, exitToLobby]);
 
-  // handleBack 最新引用：供安卓返回键监听（仅挂载时订阅一次）调用，
+  // handleBack 最新引用：供安卓返回键监听与路由拦截回调调用，
   // 避免 useSafeRouter 每次渲染返回新对象导致监听反复订阅/退订
   const handleBackRef = useRef(handleBack);
   handleBackRef.current = handleBack;
+
+  // 拦截「不经过返回按钮/物理返回键」的离场路径：iOS 侧滑返回手势、Web 浏览器后退键、
+  // 以及任何 router.back()/replace() 的程序化跳转。它们都触发导航容器的 beforeRemove 事件，
+  // 这里在**对局进行中**先弹二次确认；等待/结算阶段不拦（结算阶段有独立按钮与倒计时兜底）。
+  //
+  // 确认后必须 nav.dispatch(**原对象** action) 放行，不能改成再调一次 router.back()：
+  //  1. 被拦的可能是 replace/goto 等非 pop 动作，重放成 back 会跳去错误页面；
+  //  2. 原 action 身上带 react-navigation 内部的 VISITED_ROUTE_KEYS 标记（见
+  //     @react-navigation/core 的 useOnPreventRemove.shouldPreventRemove），重放它会让
+  //     拦截判定走「已处理过该路由」分支直接放行；若换成 router.back() 生成的新动作没有该
+  //     标记，会被自己的 usePreventRemove 再次拦下，形成死循环。
+  const navigation = useNavigation();
+  // 仅在对局进行中武装拦截。waiting（准备阶段，退出不判负）与 ended（结算阶段，已有独立的
+  // 「返回房间/退出房间」按钮和 10s 自动返回兜底）都不拦。
+  const inGamePhase = phaseRef.current === 'playing' || phaseRef.current === 'reveal' || phaseRef.current === 'countdown';
+  useEffect(() => {
+    // 阶段离开对局、或已确认退出（intentionalExitRef）后都必须撤防：拦截开着会让
+    // handleBack 的 exitToLobby()、结算期的「返回房间」跳转全部被自己的对话框拦下。
+    const armed = inGamePhase && !intentionalExitRef.current;
+    if (leaveArmedRef.current === armed) return;
+    leaveArmedRef.current = armed;
+    setLeaveArmed(armed);
+  }, [inGamePhase]);
+  usePreventRemove(leaveArmed, ({ data }) => {
+    pendingLeaveRef.current = { nav: navigation, action: data.action };
+    showLeaveConfirmRef.current = true;
+    setShowLeaveConfirm(true);
+  });
+
+  // Web 端浏览器后退键的独立兜底：expo-router 的 popstate 处理器在「历史项带缓存 state」时
+  // 走 navigation.resetRoot(record.state)，它把 CommonActions.reset 直接 dispatch 到 root 容器
+  // （@react-navigation/core 的 BaseNavigationContainer.resetRoot），**绕过了** useOnAction 里
+  // 的 shouldPreventRemove 判定门 —— 于是浏览器后退会直接离开对局页、usePreventRemove 拦不住。
+  // iOS 侧滑返回不经过这里，仍由 usePreventRemove 覆盖（实测那条路径会先触发
+  // usePreventRemove(action=RESET)，再落到本兜底的 popstate，二者不冲突）。
+  //
+  // 做法：自己监听 popstate。若此刻处于对局中且尚未确认退出，就先用 history.go(1) 把这次后退
+  // 原样撤销（页面与 URL 都回到对局页），再弹二次确认；确认后走 handleBack 主动跳大厅，
+  // 不依赖浏览器历史，因此撤销历史是安全的。
+  useEffect(() => {
+    if (Platform.OS !== 'web') return;
+    const onPopState = () => {
+      // go(1) 撤销自身触发的回退 popstate：expo-router 仍需处理它（把路由重置回对局页），
+      // 但我们不能再弹一次窗，否则会与用户点「继续对局」后的下一次后退互相触发。
+      if (webPopRestoreRef.current) {
+        webPopRestoreRef.current = false;
+        return;
+      }
+      if (!leaveArmedRef.current || showLeaveConfirmRef.current) return;
+      // 先置标记并弹窗，再撤销历史：go(1) 是异步的（会再触发一次 popstate），
+      // 若顺序颠倒，第二次 popstate 到达时 confirmOpen 仍为 false，会被当成新的后退而重复弹窗。
+      webPopRestoreRef.current = true;
+      showLeaveConfirmRef.current = true;
+      setShowLeaveConfirm(true);
+      window.history.go(1);
+    };
+    window.addEventListener('popstate', onPopState);
+    return () => window.removeEventListener('popstate', onPopState);
+  }, []);
+
+  // 确认「中途退出」：先离开房间，再放行被拦下的原始离场动作（或走 handleBack 收口）。
+  // intentionalExitRef 提前置位，让本端的 2s 轮询/WS 在跳转前不再报「房间已关闭」误报。
+  //
+  // 关键：必须先撤防（leaveArmedRef）再触发任何导航。confirmLeaveAndExit 的两条分支最终
+  // 都会产生一次导航（dispatch 原 action / handleBack→exitToLobby），而那些导航本身也会触发
+  // beforeRemove；若此时拦截仍处于开启状态，同一个对话框会被立刻重新弹回来（死循环）。
+  // 撤防走 ref + 强制重渲染，usePreventRemove 的 preventRemove 参数下一帧才变为 false，
+  // 所以这里同步调用 setState 触发一次重渲染即可让 effect 及时更新 setPreventRemove。
+  const confirmLeaveAndExit = useCallback(() => {
+    setShowLeaveConfirm(false);
+    showLeaveConfirmRef.current = false;
+    leaveArmedRef.current = false;
+    setLeaveArmed(false);
+    intentionalExitRef.current = true;
+    const pending = pendingLeaveRef.current;
+    pendingLeaveRef.current = null;
+    if (!pending) {
+      // 顶部返回按钮 / 安卓物理返回键路径：不在 beforeRemove 流程内，交 handleBack 统一收口
+      handleBackRef.current();
+      return;
+    }
+    const { nav, action } = pending;
+    void getOnlineServerUrl()
+      .then(base =>
+        fetch(`${base}/api/v1/lan/rooms/${roomId}/leave`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ playerId }),
+        })
+      )
+      .catch(() => undefined)
+      .then(() => nav.dispatch(action));
+  }, [roomId, playerId]);
 
   // 卸载即视为主动退出：覆盖 iOS 侧滑等不经 handleBack 的退出路径，
   // 抑制卸载后仍在途的轮询触发「房间已关闭」误报
@@ -2167,17 +2482,17 @@ export default function LanBattleScreen() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // 安卓系统返回键（侧边返回手势）：与顶部返回按钮一致——先离开房间再返回。
-  // 若走默认 pop 路由则不会触发离开请求，导致房间残留/未真正退出房间。
+  // 安卓系统返回键（侧边返回手势）：对局进行中先弹二次确认，其余阶段与顶部返回按钮一致——
+  // 先离开房间再返回。若走默认 pop 路由则不会触发离开请求，导致房间残留/未真正退出房间。
   // （有 Modal 打开时由 Modal 自行接管返回键，此处不会触发）
   useEffect(() => {
     const onHardwareBack = () => {
-      handleBackRef.current();
-      return true; // 拦截默认返回，交由 handleBack 统一处理
+      requestExit();
+      return true; // 拦截默认返回，交由 requestExit 统一处理
     };
     const sub = BackHandler.addEventListener('hardwareBackPress', onHardwareBack);
     return () => sub.remove();
-  }, []);
+  }, [requestExit]);
 
   // 双方均准备后进入 3 秒倒数（准备按钮上显示），倒数期间任意一方可取消准备；
   // 倒数完成自动弹出选边弹窗（选边仅通过弹窗进行）
@@ -2190,7 +2505,7 @@ export default function LanBattleScreen() {
         <View style={styles.topBar}>
           {/* 返回按钮：与其他页面一致的圆角描边芯片样式 */}
           <View style={styles.backBtnZone}>
-            <TouchableOpacity style={styles.backBtn} onPress={handleBack}>
+            <TouchableOpacity style={styles.backBtn} onPress={requestExit}>
               <FontAwesome6 name="chevron-left" size={20} color={COLORS.textPrimary} />
             </TouchableOpacity>
           </View>
@@ -2260,7 +2575,9 @@ export default function LanBattleScreen() {
                   ]}
                 />
                 <Text style={styles.nameChipText} numberOfLines={1}>
-                  {opponentName || '等待对手加入'}
+                  {/* 对局中/结算中拿不到对手，只可能是对手已离席（服务端已判负），
+                      不能仍说「等待对手加入」；等待阶段才是真的在等人 */}
+                  {opponentName || (phase === 'waiting' ? '等待对手加入' : '对手已离开')}
                 </Text>
                 {phase === 'waiting' && opponentName !== '' && (
                   <View style={[styles.readyTag, opponentReady ? styles.readyTagOn : styles.readyTagOff]}>
@@ -2288,7 +2605,7 @@ export default function LanBattleScreen() {
 
               {/* 回合倒计时：统一显示在棋盘右上方，与对方名称同一行对齐（对局开启限时且进入对局后显示） */}
               {phase === 'playing' && turnTimeLimit > 0 && (
-                <View style={[styles.nameChip, styles.timerChip]}>
+                <View style={[styles.nameChip, styles.timerChipPinned]}>
                   <FontAwesome6
                     name="clock"
                     size={11}
@@ -2349,7 +2666,7 @@ export default function LanBattleScreen() {
               ))}
               {/* 我方局时时钟（基本用时+加秒制；轮我方走棋且 ≤30s 时告警红显） */}
               {phase === 'playing' && clockText.mine !== null && (
-                <View style={[styles.nameChip, styles.timerChip]}>
+                <View style={[styles.nameChip, styles.timerChipMine]}>
                   <FontAwesome6 name="hourglass-half" size={10} color={clockText.mineUrgent ? COLORS.danger : COLORS.textLight} />
                   <Text style={[styles.timerChipText, clockText.mineUrgent && styles.timerChipTextUrgent]}>
                     {clockText.mine}
@@ -2430,7 +2747,35 @@ export default function LanBattleScreen() {
                   </TouchableOpacity>
                 </>
               )}
-              {(phase === 'reveal' || phase === 'countdown' || phase === 'ended' || (phase === 'playing' && jueShaVisible)) && (
+              {phase === 'ended' && (
+                /* 结算阶段的唯一操作入口：棋盘停在最终局面，去留在这里决定——
+                   「返回房间」把**本端**退回房间准备界面（handleReturnToRoom；不再调 /rematch，
+                   那是房间级重置且会把对手一起拽回），「退出房间」离开。
+                   另标注兜底倒计时与对手去留：双方互不干扰，谁都不点则到点各自自动返回。
+                   结算浮层只承担结果告知，不再重复提供这两个动作。
+
+                   注意：本分支**不随对手动作收起**。对手点「返回房间」只会重置房间并下发
+                   returnedToRoom，本端仍留在结算页、按钮与倒计时都保留，由玩家自己决定；
+                   早期实现在此隐藏入口（settlementDismissed），导致对手一返回，本端倒计时
+                   中途按钮变「占位」——即用户报告的「点了没反应、按钮也消失了」。 */
+                <>
+                  <TouchableOpacity style={styles.actionButton} onPress={handleReturnToRoom}>
+                    <FontAwesome6 name="rotate-right" size={16} color={COLORS.textPrimary} />
+                    <Text style={styles.actionButtonText}>
+                      {returnRoomCountdown !== null
+                        ? opponentReturned
+                          ? '对手已返回房间'
+                          : `返回房间(${returnRoomCountdown})`
+                        : '返回房间'}
+                    </Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity style={styles.actionButton} onPress={handleBack}>
+                    <FontAwesome6 name="door-open" size={16} color={COLORS.textPrimary} />
+                    <Text style={styles.actionButtonText}>退出房间</Text>
+                  </TouchableOpacity>
+                </>
+              )}
+              {(phase === 'reveal' || phase === 'countdown' || (phase === 'playing' && jueShaVisible)) && (
                 /* 占位按钮：不可见但保持底部栏高度，避免公示/倒数/绝杀/结算阶段棋盘跳动 */
                 <View style={[styles.actionButton, { opacity: 0 }]} pointerEvents="none">
                   <FontAwesome6 name="flag" size={16} color={COLORS.textPrimary} />
@@ -2451,11 +2796,12 @@ export default function LanBattleScreen() {
             </View>
           )}
 
-          {/* 结算浮层：绝杀/困毙播放「绝/杀」特效；长将/长捉判负、认输/和棋/断线判负仅普通文字结算 */}
+          {/* 结算浮层：绝杀/困毙播放「绝/杀」特效；长将/长捉判负、认输/和棋/断线判负仅普通文字结算。
+              只告知结果，不带操作按钮——「再来一局 / 退出房间」统一放在底部操作栏，避免重复入口 */}
           {jueShaVisible && (
             <JueShaOverlay
               visible={jueShaVisible}
-              boardFrame={jueshaBoardFrame}
+              boardFrame={jueshaHostBoardFrame}
               showEffect={
                 gameEndReason === 'checkmate' &&
                 gameOverReason !== 'changjiang' &&
@@ -2479,17 +2825,15 @@ export default function LanBattleScreen() {
                         ? (gameResult.isWin ? '对手长捉判负，你获胜！' : '你方长捉判负')
                         : gameResult.surrenderBy
                           ? (gameResult.surrenderBy === playerId ? '你选择了认输' : '对手选择了认输')
-                          : gameEndReason === 'disconnect'
-                            ? (gameResult.isWin ? '对方断线，你获胜' : '你断线超时判负')
-                            : gameEndReason === 'timeout'
-                              ? (gameResult.isWin ? '对方超时，你获胜' : '你超时判负')
-                              : gameResult.isWin ? '恭喜获胜！' : '对局失败'
+                          : gameEndReason === 'leave'
+                            ? (gameResult.isWin ? '对方离开了对局，你获胜' : '你离开了对局')
+                            : gameEndReason === 'disconnect'
+                              ? (gameResult.isWin ? '对方断线，你获胜' : '你断线超时判负')
+                              : gameEndReason === 'timeout'
+                                ? (gameResult.isWin ? '对方超时，你获胜' : '你超时判负')
+                                : gameResult.isWin ? '恭喜获胜！' : '对局失败'
                   : ''
               }
-              primaryText="返回房间"
-              secondaryText="退出房间"
-              onPlayAgain={handleRematch}
-              onGoHome={handleBack}
             />
           )}
 
@@ -2509,9 +2853,16 @@ export default function LanBattleScreen() {
           )}
 
           {/* 对局内低干扰提示条（替代重构前的 10 处 Alert.alert，Web 端此前完全不显示）：
-              绝对定位在棋盘中心上方、pointerEvents="box-none" 不阻塞落子，3s 后自动淡出 */}
-          <GameNotice notice={notice} onHide={hideNotice} />
-          </View>
+              绝对定位在棋盘中心、pointerEvents="box-none" 不阻塞落子，3s 后自动淡出。
+              centerY 为 noticeCenterY：棋盘中心换算到本提示条所属 capturedDrawerHost
+              坐标系的纵坐标（换算在 noticeCenterY 内完成）。缺测量时传 undefined，
+              组件退回 50% 居中。 */}
+          <GameNotice
+            notice={notice}
+            centerY={noticeCenterY}
+            onHide={hideNotice}
+          />
+        </View>
         </View>
 
         {/* 表情下拉栏：点击我方名称角标后在其正下方展开，宽度适配屏幕，单行横滑选取
@@ -2817,6 +3168,22 @@ export default function LanBattleScreen() {
               </ScrollView>
         </AppModal>
 
+        {/* 中途退出二次确认：对局进行中（playing/reveal/countdown）返回时拦一道。
+            语义与「认输」等价——服务端 settleAbandonedPlayingRoom 会以 endReason='leave'
+            判对方获胜（surrenderBy 为 null，故结算文案走「对方离开了对局」而非「对方认输」）。
+            强交互场景阻断物理返回键，避免二次确认期间再被返回键关掉。 */}
+        <AppDialog
+          visible={showLeaveConfirm}
+          title="确认退出对局"
+          message="中途退出将自动判负，确定要退出吗？"
+          cancelText="继续对局"
+          confirmText="退出并判负"
+          danger
+          blockBackButton
+          onCancel={() => { setShowLeaveConfirm(false); showLeaveConfirmRef.current = false; }}
+          onConfirm={confirmLeaveAndExit}
+        />
+
         {/* 认输确认弹窗：强交互场景，阻断物理返回键（danger 变体替代原内联背景色覆盖） */}
         <AppDialog
           visible={showSurrenderModal}
@@ -2830,7 +3197,7 @@ export default function LanBattleScreen() {
           onConfirm={handleSurrender}
         />
 
-        {/* 对方悔棋请求：低干扰呈现（placement="bottom" 贴底悬浮卡片，不遮挡棋盘中心），
+        {/* 对方悔棋请求：卡片精确居中于棋盘（anchorCenter 用窗口坐标对齐 boardFrame），
             强交互场景阻断物理返回键 */}
         <AppDialog
           visible={undoRequestFromOpponent}
@@ -2839,13 +3206,13 @@ export default function LanBattleScreen() {
           cancelText="拒绝"
           confirmText="同意"
           confirmVariant="success"
-          placement="bottom"
+          anchorCenter={dialogAnchorCenter}
           blockBackButton
           onCancel={() => handleUndoResponse(false)}
           onConfirm={() => handleUndoResponse(true)}
         />
 
-        {/* 对方求和请求：同悔棋，贴底悬浮卡片不遮挡棋盘 */}
+        {/* 对方求和请求：同悔棋，居中于棋盘 */}
         <AppDialog
           visible={drawRequestFromOpponent}
           title="求和请求"
@@ -2853,7 +3220,7 @@ export default function LanBattleScreen() {
           cancelText="拒绝"
           confirmText="同意"
           confirmVariant="success"
-          placement="bottom"
+          anchorCenter={dialogAnchorCenter}
           blockBackButton
           onCancel={() => handleDrawResponse(false)}
           onConfirm={() => handleDrawResponse(true)}
@@ -3162,8 +3529,20 @@ const styles = StyleSheet.create({
     borderRadius: 3,
     backgroundColor: '#2E7D32',
   },
-  // 回合倒计时角标：与名字角标同款药丸，靠行尾右对齐
+  // 局时角标：与名字角标同款药丸，紧贴名字内侧。
+  // nameRow 没有 gap，两行内药丸之间的间距唯一来源就是各自的 margin；
+  // 对方行是普通 row（marginLeft = 名称与局时之间），我方行是 nameRowMe 右对齐镜像
+  // （marginRight 才是名称与局时之间，若沿用 marginLeft 会变成行尾外侧而贴死）。
+  // 故两者取同值，保证上下两侧「名字↔局时」间距一致。
   timerChip: {
+    marginLeft: 6,
+  },
+  // 我方局时：右对齐镜像行，用 marginRight 与对方行的 marginLeft 对称
+  timerChipMine: {
+    marginRight: 6,
+  },
+  // 回合倒计时：同款药丸但语义不同——它属于行尾右对齐的一枚（与对方局时共用 marginLeft 会把它推走）
+  timerChipPinned: {
     marginLeft: 'auto',
   },
   timerChipText: {

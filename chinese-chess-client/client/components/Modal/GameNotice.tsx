@@ -18,7 +18,15 @@ export interface GameNoticeItem {
 export interface GameNoticeProps {
   /** 当前提示（null 表示不展示） */
   notice: GameNoticeItem | null;
-  /** 覆盖棋盘中心的纵向位置（0~1，默认 0.5） */
+  /**
+   * 提示条中心的纵向位置，单位与父容器一致（像素）。
+   *
+   * 优先用它精确覆盖棋盘中心：对局页的提示条父容器是整屏主容器，而棋盘在其中
+   * 因标题行/底部栏的纵向预算并不居中，按容器 50% 定位会明显偏上。
+   * 未传时退回 centerRatio（相对父容器高度的百分比，默认 0.5）。
+   */
+  centerY?: number;
+  /** 覆盖棋盘中心的纵向位置（0~1，默认 0.5），仅在未传 centerY 时生效 */
   centerRatio?: number;
   /** 水平最大宽度，默认跟随棋盘宽度（约屏幕 - 32） */
   maxWidth?: number;
@@ -39,6 +47,7 @@ export interface GameNoticeProps {
  */
 export default function GameNotice({
   notice,
+  centerY,
   centerRatio = 0.5,
   maxWidth,
   style,
@@ -99,13 +108,15 @@ export default function GameNotice({
   const containerStyle = useMemo<StyleProp<ViewStyle>>(
     () => [
       styles.container,
-      // 百分比定位：Animated.View 的 style 类型不接受普通 string，
-      // 显式断言为 ViewStyle 后由 RN 运行时按百分比解析
-      { top: `${centerRatio * 100}%` } as unknown as ViewStyle,
+      // 优先按像素锚定棋盘中心；缺锚点时才退回百分比（Animated.View 的 style 类型
+      // 不接受普通 string，兜底分支显式断言为 ViewStyle 后由 RN 运行时按百分比解析）
+      centerY != null
+        ? { top: centerY }
+        : ({ top: `${centerRatio * 100}%` } as unknown as ViewStyle),
       maxWidth != null ? { maxWidth } : null,
       style,
     ],
-    [centerRatio, maxWidth, style],
+    [centerY, centerRatio, maxWidth, style],
   );
 
   if (!notice) return null;

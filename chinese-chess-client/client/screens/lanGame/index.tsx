@@ -255,7 +255,9 @@ export default function LanGameScreen() {
 
   // 进入观战：对战中的房间可以旁观者身份观看，不参与对局
   const handleSpectate = (room: Room) => {
-    // 本人是该房间成员时不应进入观战（否则会看到自己和「红方/黑方」占位席），引导回到对局
+    // 本人是该房间成员时不应进入观战（否则会看到自己和空席位占位），引导回到对局。
+    // 注意：本人是成员但已被移出（对局中对方离开后自己先退出等）时 activeRoom 可能已失效，
+    // 此时服务端会因席位不完整拒绝观战，错误页会给出「对局已有玩家离开」的终态说明。
     if (activeRoom && activeRoom.id === room.id) {
       handleBackToRoom(activeRoom);
       return;

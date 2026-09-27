@@ -28,6 +28,12 @@ export interface AppDialogProps {
   variant?: 'dark' | 'light' | 'none';
   /** 贴底呈现（悔棋/求和等需要看清棋盘的场景） */
   placement?: 'center' | 'bottom';
+  /**
+   * 卡片中心锚点（窗口坐标）：对局中弹窗须位于棋盘中心时传入。
+   * 传入后卡片在 placement 原有定位的基础上平移到锚点（宽高约束不变），
+   * 因此须传窗口坐标而非容器相对坐标；见 AppModal.anchorCenter。
+   */
+  anchorCenter?: { x: number; y: number } | null;
 }
 
 /**
@@ -50,6 +56,7 @@ export default function AppDialog({
   blockBackButton = false,
   variant = 'dark',
   placement = 'center',
+  anchorCenter = null,
 }: AppDialogProps) {
   const variantOfConfirm: ModalButtonVariant = confirmVariant ?? (danger ? 'danger' : 'primary');
   const hasCancel = !!onCancel;
@@ -61,6 +68,7 @@ export default function AppDialog({
       title={title}
       variant={variant}
       placement={placement}
+      anchorCenter={anchorCenter}
       blockBackButton={blockBackButton}
       // 确认类弹窗不支持点遮罩关闭，避免误触丢失输入
       dismissOnMaskPress={false}

@@ -5,13 +5,15 @@ import {
   TouchableOpacity,
   StyleSheet,
   Dimensions,
+  Animated,
+  Easing,
 } from 'react-native';
 import { Screen } from '@/components/Screen';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useSafeRouter, useSafeSearchParams } from '@/hooks/useSafeRouter';
 import { FontAwesome6 } from '@expo/vector-icons';
 import { type GameState } from '@/utils/chess/GameEngine';
-import { RED_SIDE } from '@/utils/chess/types';
+import { RED_SIDE, type SideTag } from '@/utils/chess/types';
 import ChessBoard, { CapturedPiecesDrawer } from '@/components/ChessBoard';
 import { useMoveEffect } from '@/hooks/useMoveEffect';
 import { playJiangJunSound, playSound, preloadSounds, unloadAllSounds } from '@/utils/SoundManager';
@@ -48,6 +50,48 @@ interface RoomPlayer {
   ready: boolean;
 }
 
+// 服务端权威钟面（毫秒）+ 插值锚点：与在线对局同口径，观战端据此展示双方局时
+interface ClockSnap {
+  red: number;
+  black: number;
+  lastMoveTime: number;
+  sideTag: SideTag;
+  clockPausedAt: number | null;
+}
+
+// 结算后「已返回房间」记录：观战端用于感知对局是否即将重开（不参与对局，仅提示）
+interface ReturnedRecord {
+  [playerId: string]: number;
+}
+
+// 单条表情本地展示时长（毫秒）：与在线对局一致，弹入 → 停留 → 淡出后移除
+const EMOJI_DISPLAY_MS = 4000;
+
+// 表情气泡：弹入 → 停留 → 淡出缩小（与 lanBattle 同款，观战端复用同一视觉）
+function EmojiBubble({ emoji, lifetime }: { emoji: string; lifetime: number }) {
+  const [anim] = useState(() => new Animated.Value(0));
+  useEffect(() => {
+    Animated.sequence([
+      Animated.timing(anim, {
+        toValue: 1,
+        duration: 240,
+        easing: Easing.out(Easing.back(1.6)),
+        useNativeDriver: true,
+      }),
+      Animated.delay(Math.max(0, lifetime - 640)),
+      Animated.timing(anim, { toValue: 0, duration: 380, useNativeDriver: true }),
+    ]).start();
+  }, [anim, lifetime]);
+  return (
+    <Animated.View
+      pointerEvents="none"
+      style={[styles.emojiBubble, { opacity: anim, transform: [{ scale: anim }] }]}
+    >
+      <Text style={styles.emojiBubbleText}>{emoji}</Text>
+    </Animated.View>
+  );
+}
+
 // 观战阶段：连接中 / 对局进行中 / 对局已结束 / 对局已重开 / 出错
 type SpectatePhase = 'connecting' | 'playing' | 'ended' | 'restarted' | 'error';
 
@@ -66,6 +110,20 @@ export default function SpectateScreen() {
   const [spectatorCount, setSpectatorCount] = useState(0);
   const [isFlipped, setIsFlipped] = useState(false);
   const [winner, setWinner] = useState<string | null>(null);
+  // 局时/步时（与在线对局同源同口径）：
+  // clockSnapRef 存服务端权威钟面 + 锚点，1s 本地插值出展示文案；turnTimeLimit/turnTimeLeft
+  // 为步时（单回合）限制，锚点为 lastMoveTime。此前观战端完全没有时钟，这是缺失功能的根因。
+  const clockSnapRef = useRef<ClockSnap | null>(null);
+  const [clockText, setClockText] = useState<{ red: string | null; black: string | null; redUrgent: boolean; blackUrgent: boolean }>({ red: null, black: null, redUrgent: false, blackUrgent: false });
+  const [turnTimeLimit, setTurnTimeLimit] = useState(0); // 秒，0=不限时
+  const [turnTimeLeft, setTurnTimeLeft] = useState(0);
+  const lastMoveTimeRef = useRef<number>(0);
+  const serverTimeOffsetRef = useRef(0);
+  // 房间读秒时长（byoyomi）：基本用时耗尽后展示「读 M:SS」
+  const byoyomiRef = useRef(0);
+  // 活跃表情：按首次接收时间本地计时，超时移除（与服务端 EMOJI_TTL 无关，纯展示生命周期）
+  const [activeEmojis, setActiveEmojis] = useState<{ id: string; playerId: string; emoji: string; receivedAt: number }[]>([]);
+  const seenEmojiIdsRef = useRef<Set<string>>(new Set());
 
   const { moveEffect, triggerMoveEffect } = useMoveEffect();
   const seenHistoryLenRef = useRef(0);
@@ -139,11 +197,60 @@ export default function SpectateScreen() {
     phase?: string;
     winner?: string | null;
     spectatorCount?: number;
+    clocks?: { red: number; black: number } | null;
+    clockPausedAt?: number | null;
+    lastMoveTime?: number;
+    serverNow?: number;
+    settings?: { turnTimeLimit?: number; byoyomiSeconds?: number } | null;
+    emojiMessages?: { id: string; playerId: string; emoji: string }[];
+    returnedToRoom?: ReturnedRecord;
   }) => {
     if (!mountedRef.current) return;
 
     if (Array.isArray(data.players)) setPlayers(data.players);
     if (typeof data.spectatorCount === 'number') setSpectatorCount(data.spectatorCount);
+
+    // 服务端时钟校正：所有与服务端时间戳的比较统一走校正时间（否则局时/步时会随时钟漂移）
+    if (typeof data.serverNow === 'number') {
+      serverTimeOffsetRef.current = data.serverNow - Date.now();
+    }
+
+    // 房间读秒与步时设置同步
+    if (data.settings) {
+      if (typeof data.settings.turnTimeLimit === 'number') setTurnTimeLimit(data.settings.turnTimeLimit);
+      if (typeof data.settings.byoyomiSeconds === 'number') byoyomiRef.current = data.settings.byoyomiSeconds;
+    }
+
+    // 表情同步：服务端按 id 下发，本地按 id 去重（WS 与轮询双通道都会带，按 id 幂等）
+    if (Array.isArray(data.emojiMessages)) {
+      for (const m of data.emojiMessages) {
+        if (!m || typeof m.id !== 'string' || typeof m.emoji !== 'string') continue;
+        if (seenEmojiIdsRef.current.has(m.id)) continue;
+        seenEmojiIdsRef.current.add(m.id);
+        setActiveEmojis(prev =>
+          [...prev, { id: m.id, playerId: m.playerId, emoji: m.emoji, receivedAt: Date.now() }]
+        );
+      }
+    }
+
+    // 步时倒计时锚点：对方走棋/悔棋后服务端刷新 lastMoveTime
+    if (typeof data.lastMoveTime === 'number' && data.lastMoveTime > 0) {
+      lastMoveTimeRef.current = data.lastMoveTime;
+    }
+
+    // 局时钟面快照（服务端权威毫秒 + 锚点）：与在线对局同口径，本地 1s 插值展示
+    if (data.clocks && typeof data.clocks.red === 'number' && typeof data.clocks.black === 'number' && data.gameState) {
+      clockSnapRef.current = {
+        red: data.clocks.red,
+        black: data.clocks.black,
+        lastMoveTime: typeof data.lastMoveTime === 'number' ? data.lastMoveTime : Date.now(),
+        sideTag: data.gameState.sideTag,
+        clockPausedAt: typeof data.clockPausedAt === 'number' ? data.clockPausedAt : null,
+      };
+    } else if (!data.clocks) {
+      // 对局未启用局时（或房间被重置）：清空展示，避免残留上一局残留时间
+      clockSnapRef.current = null;
+    }
 
     // 对局阶段流转
     if (data.phase === 'ended') {
@@ -183,6 +290,78 @@ export default function SpectateScreen() {
       }
     }
   }, [setPhaseSafe, triggerMoveEffect]);
+
+  // 局时展示：服务端快照为锚点做 1s 本地插值（仅走棋方钟走动；悔棋/求和协商期以暂停锚点冻结）
+  // 观战端不做任何超时判负——判负由服务端裁定，观战只如实呈现钟面。
+  useEffect(() => {
+    if (phase !== 'playing') return undefined;
+
+    const formatClock = (ms: number): string => {
+      const totalSec = Math.max(0, Math.ceil(ms / 1000));
+      const m = Math.floor(totalSec / 60);
+      const s = totalSec % 60;
+      return `${m}:${s.toString().padStart(2, '0')}`;
+    };
+
+    const tick = () => {
+      const snap = clockSnapRef.current;
+      if (!snap) {
+        setClockText(prev => (prev.red === null && prev.black === null ? prev : { red: null, black: null, redUrgent: false, blackUrgent: false }));
+        return;
+      }
+      const correctedNow = Date.now() + serverTimeOffsetRef.current;
+      const anchorNow = snap.clockPausedAt ?? correctedNow;
+      const elapsed = Math.max(0, anchorNow - snap.lastMoveTime);
+      const toMove: 'red' | 'black' = snap.sideTag === RED_SIDE ? 'red' : 'black';
+      const byoMs = byoyomiRef.current * 1000;
+
+      const displayFor = (color: 'red' | 'black'): { text: string; urgent: boolean } => {
+        const moving = toMove === color;
+        const net = moving ? snap[color] - elapsed : snap[color];
+        if (net > 0) return { text: formatClock(net), urgent: moving && net <= 30000 };
+        if (byoMs > 0) {
+          const byoRemain = moving ? byoMs + net : byoMs;
+          return { text: `读${formatClock(byoRemain)}`, urgent: moving && byoRemain <= 10000 };
+        }
+        return { text: formatClock(0), urgent: moving };
+      };
+
+      const redD = displayFor('red');
+      const blackD = displayFor('black');
+      setClockText(prev =>
+        prev.red === redD.text && prev.black === blackD.text && prev.redUrgent === redD.urgent && prev.blackUrgent === blackD.urgent
+          ? prev
+          : { red: redD.text, black: blackD.text, redUrgent: redD.urgent, blackUrgent: blackD.urgent }
+      );
+    };
+
+    tick();
+    const timer = setInterval(tick, 1000);
+    return () => clearInterval(timer);
+  }, [phase]);
+
+  // 步时（单回合）倒计时：锚点为服务端 lastMoveTime，对局开启限时步时才有值
+  useEffect(() => {
+    if (phase !== 'playing' || turnTimeLimit <= 0) return undefined;
+    const tick = () => {
+      const correctedNow = Date.now() + serverTimeOffsetRef.current;
+      const elapsed = Math.floor(Math.max(0, correctedNow - lastMoveTimeRef.current) / 1000);
+      setTurnTimeLeft(Math.max(0, turnTimeLimit - elapsed));
+    };
+    tick();
+    const timer = setInterval(tick, 1000);
+    return () => clearInterval(timer);
+  }, [phase, turnTimeLimit]);
+
+  // 表情生命周期：超过展示时长即移除（观战端不发送表情，只接收展示）
+  useEffect(() => {
+    if (activeEmojis.length === 0) return undefined;
+    const timer = setInterval(() => {
+      const now = Date.now();
+      setActiveEmojis(prev => prev.filter(e => now - e.receivedAt <= EMOJI_DISPLAY_MS + 400));
+    }, 500);
+    return () => clearInterval(timer);
+  }, [activeEmojis.length]);
 
   // applySnapshot 的最新引用（供 WS/轮询回调使用，避免把不稳定的依赖塞进 effect 依赖数组）
   const applySnapshotRef = useRef(applySnapshot);
@@ -272,8 +451,11 @@ export default function SpectateScreen() {
       try {
         const base = await getOnlineServerUrl();
         const response = await fetch(`${base}/api/v1/lan/rooms/${roomId}/gameState`);
+        if (!response.ok) return;
         const data = await response.json();
-        if (data.success) applySnapshotRef.current(data);
+        // GET /gameState 返回的是对局负载本体（无 success 包装字段），
+        // 旧写法 if (data.success) 恒为假，导致 WS 断线后的轮询兜底从未生效
+        if (data && Array.isArray(data.players)) applySnapshotRef.current(data);
       } catch {
         // 轮询瞬时失败忽略，下一轮重试
       } finally {
@@ -354,27 +536,107 @@ export default function SpectateScreen() {
 
   const moveCount = gameState ? gameState.moveHistory.length : 0;
 
-  // 名字角标（带行棋指示）
-  const renderNameChip = (player: RoomPlayer | null, side: 'red' | 'black', align: 'left' | 'right') => {
+  // 步时倒计时文案（与 lanBattle 的 formatTurnClock 同口径）
+  const formatTurnClock = (totalSeconds: number): string => {
+    const m = Math.floor(totalSeconds / 60);
+    const s = totalSeconds % 60;
+    return `${m}:${s.toString().padStart(2, '0')}`;
+  };
+
+  // 按玩家过滤表情：观战端只展示对局双方发送的表情
+  const topEmojis = useMemo(
+    () => activeEmojis.filter(e => e.playerId === topPlayer?.id),
+    [activeEmojis, topPlayer?.id]
+  );
+  const bottomEmojis = useMemo(
+    () => activeEmojis.filter(e => e.playerId === bottomPlayer?.id),
+    [activeEmojis, bottomPlayer?.id]
+  );
+
+  // 局时按实际执棋方映射到上下行（未翻转：红下黑上；翻转：黑下红上）
+  const topClock = isFlipped ? clockText.red : clockText.black;
+  const topUrgent = isFlipped ? clockText.redUrgent : clockText.blackUrgent;
+  const bottomClock = isFlipped ? clockText.black : clockText.red;
+  const bottomUrgent = isFlipped ? clockText.blackUrgent : clockText.redUrgent;
+
+  // 名字角标（带行棋指示 + 局时 + 表情）
+  // 布局与在线对局一致：顶行「名称 → 局时 → 表情 →····→ 步时（右对齐）」，底行镜像。
+  // 局时/步时此前观战端完全没有，是用户反馈的「观战看不到双方局时和步时」。
+  const renderNameChip = (
+    player: RoomPlayer | null,
+    side: 'red' | 'black',
+    align: 'left' | 'right',
+    clock: { text: string | null; urgent: boolean },
+    emojis: { id: string; emoji: string }[],
+  ) => {
     const isTurn = gameState ? (side === 'red' ? isRedTurn : !isRedTurn) : false;
+    // 顶行是普通 row（从左到右），底行是 nameRowMe 右对齐镜像。两者视觉顺序相反：
+    //   顶行：名称 → 局时 → 表情 →····→ 步时（行尾）
+    //   底行：表情 → 局时 → 名称（右对齐）
+    // 局时紧贴名称：顶行用 marginLeft 落在名称右侧，底行用 marginRight 落在名称左侧，
+    // nameRow 没有 gap，两侧间距的唯一来源就是这两个 margin（必须同值，否则两侧不一致）。
+    const nameChip = (
+      <View style={styles.nameChip}>
+        {align === 'left' && (
+          <View style={[styles.nameChipDot, { backgroundColor: side === 'red' ? COLORS.redPiece : COLORS.blackPiece }]} />
+        )}
+        <Text style={styles.nameChipText} numberOfLines={1}>
+          {/* 席位缺失即玩家已离场：说「红方/黑方」会把一次离场伪装成正常对局，
+              这里显式告知席位空缺的原因。正常对局两端席位齐备，不会走到此分支。 */}
+          {player ? player.name : '（玩家已离开）'}
+        </Text>
+        {isTurn && phase === 'playing' && (
+          <View style={[styles.readyTag, styles.readyTagOn]}>
+            <Text style={[styles.readyTagText, styles.readyTagTextOn]}>行棋中</Text>
+          </View>
+        )}
+        {align === 'right' && (
+          <View style={[styles.nameChipDot, { backgroundColor: side === 'red' ? COLORS.redPiece : COLORS.blackPiece }]} />
+        )}
+      </View>
+    );
+
+    const clockChip = clock.text !== null ? (
+      <View style={[styles.nameChip, align === 'right' ? styles.timerChipMine : styles.timerChip]}>
+        <FontAwesome6 name="hourglass-half" size={10} color={clock.urgent ? COLORS.danger : COLORS.textLight} />
+        <Text style={[styles.timerChipText, clock.urgent && styles.timerChipTextUrgent]}>
+          {clock.text}
+        </Text>
+      </View>
+    ) : null;
+
+    const emojiBubbles = emojis.map(e => (
+      <EmojiBubble key={e.id} emoji={e.emoji} lifetime={EMOJI_DISPLAY_MS} />
+    ));
+
     return (
       <View style={[styles.nameRow, align === 'right' ? styles.nameRowMe : undefined, nameRowStyle]} pointerEvents="none">
-        <View style={styles.nameChip}>
-          {align === 'left' && (
-            <View style={[styles.nameChipDot, { backgroundColor: side === 'red' ? COLORS.redPiece : COLORS.blackPiece }]} />
-          )}
-          <Text style={styles.nameChipText} numberOfLines={1}>
-            {player ? player.name : side === 'red' ? '红方' : '黑方'}
-          </Text>
-          {isTurn && phase === 'playing' && (
-            <View style={[styles.readyTag, styles.readyTagOn]}>
-              <Text style={[styles.readyTagText, styles.readyTagTextOn]}>行棋中</Text>
-            </View>
-          )}
-          {align === 'right' && (
-            <View style={[styles.nameChipDot, { backgroundColor: side === 'red' ? COLORS.redPiece : COLORS.blackPiece }]} />
-          )}
-        </View>
+        {align === 'right' ? (
+          <>
+            {emojiBubbles}
+            {clockChip}
+            {nameChip}
+          </>
+        ) : (
+          <>
+            {nameChip}
+            {clockChip}
+            {emojiBubbles}
+            {/* 步时（单回合）倒计时：与对局一致固定在顶行行尾 */}
+            {phase === 'playing' && turnTimeLimit > 0 && (
+              <View style={[styles.nameChip, styles.timerChipPinned]}>
+                <FontAwesome6
+                  name="clock"
+                  size={11}
+                  color={turnTimeLeft <= 30 ? COLORS.danger : COLORS.textLight}
+                />
+                <Text style={[styles.timerChipText, turnTimeLeft <= 30 && styles.timerChipTextUrgent]}>
+                  {formatTurnClock(turnTimeLeft)}
+                </Text>
+              </View>
+            )}
+          </>
+        )}
       </View>
     );
   };
@@ -425,7 +687,13 @@ export default function SpectateScreen() {
           )}
           {/* 顶部留白由预算控制：优先垂直居中，预留不足时整体下移贴住预留区 */}
           <View style={[styles.boardContainer, { paddingTop: boardPadTop }]}>
-            {renderNameChip(topPlayer, isFlipped ? 'red' : 'black', 'left')}
+            {renderNameChip(
+              topPlayer,
+              isFlipped ? 'red' : 'black',
+              'left',
+              { text: topClock, urgent: topUrgent },
+              topEmojis,
+            )}
 
             {gameState ? (
               <ChessBoard
@@ -450,7 +718,13 @@ export default function SpectateScreen() {
               </View>
             )}
 
-            {renderNameChip(bottomPlayer, isFlipped ? 'black' : 'red', 'right')}
+            {renderNameChip(
+              bottomPlayer,
+              isFlipped ? 'black' : 'red',
+              'right',
+              { text: bottomClock, urgent: bottomUrgent },
+              bottomEmojis,
+            )}
           </View>
         </View>
 
@@ -627,6 +901,48 @@ const styles = StyleSheet.create({
   },
   readyTagTextOn: {
     color: COLORS.success,
+  },
+  // 局时/步时芯片：与 lanBattle 同款。nameRow 没有 gap，两侧「名称↔局时」间距唯一来源是
+  // 各自的 margin——顶行（普通 row）用 marginLeft，底行（右对齐镜像）必须用 marginRight，
+  // 否则同一个 marginLeft 会落到底行行尾外侧，造成两侧间距不一致。
+  timerChip: {
+    marginLeft: 6,
+  },
+  timerChipMine: {
+    marginRight: 6,
+  },
+  // 步时倒计时固定在顶行行尾
+  timerChipPinned: {
+    marginLeft: 'auto',
+  },
+  timerChipText: {
+    fontSize: FONT.micro,
+    color: COLORS.textLight,
+  },
+  timerChipTextUrgent: {
+    color: COLORS.danger,
+  },
+  // 表情气泡：观战端只接收展示，不发送（样式与 lanBattle 保持一致）
+  emojiBubble: {
+    marginHorizontal: 5,
+    minWidth: 30,
+    height: 30,
+    borderRadius: 15,
+    backgroundColor: COLORS.card,
+    borderWidth: 1,
+    borderColor: COLORS.borderSolid,
+    alignItems: 'center',
+    justifyContent: 'center',
+    shadowColor: COLORS.primary,
+    shadowOpacity: 0.12,
+    shadowRadius: 6,
+    shadowOffset: { width: 0, height: 2 },
+    elevation: 3,
+  },
+  emojiBubbleText: {
+    // 表情为图形符号，字号随气泡尺寸微调，不套用正文字阶
+    fontSize: 18,
+    lineHeight: 22,
   },
   bottomBar: {
     flexDirection: 'row',

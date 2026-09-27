@@ -65,11 +65,19 @@ class FakeWebSocket {
 }
 
 /** 建立连接并返回「已打开」的替身连接 */
-async function connectSocket(handlers: Partial<ConstructorParameters<typeof BattleSocket>[2]> = {}) {
-  const socket = new BattleSocket('room-1', 'player-1', {
-    onState: () => undefined,
-    ...handlers,
-  });
+async function connectSocket(
+  handlers: Partial<ConstructorParameters<typeof BattleSocket>[2]> = {},
+  role: ConstructorParameters<typeof BattleSocket>[3] = 'player',
+) {
+  const socket = new BattleSocket(
+    'room-1',
+    role === 'spectator' ? 'spectator-1' : 'player-1',
+    {
+      onState: () => undefined,
+      ...handlers,
+    },
+    role,
+  );
   await socket.connect();
   const ws = FakeWebSocket.instances[FakeWebSocket.instances.length - 1];
   ws.open();
@@ -159,6 +167,17 @@ describe('BattleSocket 心跳与可见性', () => {
     opened = socket;
     ws.emit({ type: 'error', message: '玩家不在房间中' });
     expect(onFatalError).toHaveBeenCalledWith('玩家不在房间中');
+  });
+
+  it('收到「对局已有玩家离开」致命错误 → 停止重连（观战不会陷入无限重连）', async () => {
+    const onFatalError = jest.fn();
+    const { socket, ws } = await connectSocket({ onFatalError }, 'spectator');
+    opened = socket;
+    ws.emit({ type: 'error', message: '对局已有玩家离开，观战已结束' });
+    expect(onFatalError).toHaveBeenCalledWith('对局已有玩家离开，观战已结束');
+    ws.close();
+    jest.advanceTimersByTime(30000);
+    expect(FakeWebSocket.instances).toHaveLength(1);
   });
 
   it('welcome/state 推送经 onState 分发（状态刷新通道正常）', async () => {

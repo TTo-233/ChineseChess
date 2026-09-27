@@ -12,6 +12,9 @@
  *   3. 玩家回到前台（心跳/重连恢复）→ 立即撤销断线等待，不会按旧计时被误判负；
  *   4. 断线判负 / 对局结束后，仍在后台的玩家不会被立刻移出房间（房间不销毁），
  *      回来的客户端才能收到终局状态并刷新 UI。
+ *   5. 对局中一方主动离场（返回退出）→ 立即裁定本局，不滞留「单人 playing」空局；
+ *      席位不完整时观战被拒绝；结算结果不被后续 tick 静默冲掉；胜方可正常发起再战。
+ *   6. 等待阶段离场 → 保持原语义（重置准备状态回到等待中，不判负）。
  *
  * 实现要点：把 Date.now() 换成可推进的虚拟时钟（定时器仍按真实时间运行），
  * 从而在不等待数分钟的情况下模拟「浏览器后台节流 + 服务端 1s tick」的真实时序。
@@ -179,11 +182,79 @@ async function scenarioRoomKeptForHiddenPlayer() {
   ok('后台玩家仍在房间成员列表中（不会被误移出）', stillIn, JSON.stringify(room.json?.room?.players));
 }
 
+async function scenarioLeaveDuringGame() {
+  console.log('\n[场景 5] 对局中一方主动离场：立即裁定本局，不留下单人 playing 空局');
+  const { roomId, pa, pb } = await setupPlayingRoom('leave');
+
+  const host = await get(`/rooms/${roomId}`);
+  const aSide = (host.json?.room?.players ?? []).find(p => p.id === pa)?.side;
+  ok('开局后红黑双方都在席', aSide === 'red' || aSide === 'black', `pa.side=${aSide}`);
+
+  // A 以「返回」方式退出对局
+  const left = await post(`/rooms/${roomId}/leave`, { playerId: pa });
+  ok('离场接口成功', left.status === 200 && left.json?.success === true, JSON.stringify(left.json));
+
+  const after = await roomState(roomId);
+  ok('对局立即结束（不滞留单人 playing）',
+    after.phase === 'ended', `phase=${after.phase}`);
+  ok('终局原因标记为离场而非认输',
+    after.endReason === 'leave' && after.surrenderBy === null,
+    `endReason=${after.endReason} surrenderBy=${after.surrenderBy}`);
+  const expectedWinner = aSide === 'red' ? 'black' : 'red';
+  ok('留下的一方获胜',
+    after.winner === expectedWinner, `winner=${after.winner} 期望=${expectedWinner}`);
+  ok('棋钟已停止（不再空转）',
+    after.disconnectedPlayerId === null, `disconnected=${after.disconnectedPlayerId}`);
+
+  // 观战准入闸门：席位不完整时不得放行，否则观战者会看到「红方/黑方」空占位
+  const spec = await post(`/rooms/${roomId}/spectate`, { spectatorId: 'spec-leave', spectatorName: '观众' });
+  ok('席位不完整 → 拒绝进入观战',
+    spec.status === 400 && /玩家离开|观战已结束/.test(spec.json?.message || ''),
+    `status=${spec.status} message=${spec.json?.message}`);
+
+  // 结算结果不能被随后的自愈/离场逻辑冲掉：跨过 ended 自愈窗口后依然是终局。
+  // healStaleEndedRoom 会把「活跃人数 ≤1」的 ended 房间静默重置为 waiting，
+  // 若不加 leave 守卫，胜方的结算浮层会在 10s 后被清空，连结果都来不及看。
+  advance(60_000);
+  await ticks(3);
+  const healed = await roomState(roomId);
+  ok('跨过 ended 自愈窗口 → 结算结果仍保留（不被静默重置为 waiting）',
+    healed.phase === 'ended' && healed.endReason === 'leave' && healed.winner === expectedWinner,
+    `phase=${healed.phase} reason=${healed.endReason} winner=${healed.winner}`);
+
+  // 胜方在结算页点「返回房间」→ 重开一局，房间回到等待中且席位可再次配齐
+  const rematch = await post(`/rooms/${roomId}/rematch`, { playerId: pb });
+  ok('胜方可发起再战', rematch.json?.success === true, JSON.stringify(rematch.json));
+  const afterRematch = await roomState(roomId);
+  ok('再战后回到等待中', afterRematch.phase === 'waiting', `phase=${afterRematch.phase}`);
+  const specAfter = await post(`/rooms/${roomId}/spectate`, { spectatorId: 'spec-again' });
+  ok('等待中仍不可观战（再战前不放行）', specAfter.status === 400, `status=${specAfter.status}`);
+}
+
+async function scenarioLeaveWaitingRoomUnchanged() {
+  console.log('\n[场景 6] 等待阶段离场：保持原语义（重置准备状态回到等待中）');
+  const pa = 'pa-wait';
+  const pb = 'pb-wait';
+  const created = await post('/rooms', { playerName: 'A-wait', playerId: pa });
+  const roomId = created.json.roomId;
+  await post(`/rooms/${roomId}/join`, { playerName: 'B-wait', playerId: pb });
+  await post(`/rooms/${roomId}/ready`, { playerId: pa, ready: true });
+  await post(`/rooms/${roomId}/leave`, { playerId: pa });
+  const after = await roomState(roomId);
+  ok('等待阶段离场 → 房间仍在等待中（不判负）',
+    after.phase === 'waiting' && after.winner === null,
+    `phase=${after.phase} winner=${after.winner}`);
+  const spec = await post(`/rooms/${roomId}/spectate`, { spectatorId: 'spec-wait' });
+  ok('等待阶段仍不可观战', spec.status === 400, `status=${spec.status}`);
+}
+
 (async () => {
   await sleep(500); // 等服务端 listen 完成
   await scenarioBackgroundThrottle();
   await scenarioReturnClearsCountdown();
   await scenarioRoomKeptForHiddenPlayer();
+  await scenarioLeaveDuringGame();
+  await scenarioLeaveWaitingRoomUnchanged();
   console.log(`\n全部通过：${passed} 项断言`);
   process.exit(0);
 })().catch(err => {
