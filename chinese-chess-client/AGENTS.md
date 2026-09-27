@@ -52,16 +52,50 @@ Uniwind 官方文档：https://docs.uniwind.dev/llms.txt
 
 ## 如何进行静态校验（TSC + ESLint）
 
+`chinese-chess-client/` 下的 pnpm workspace 只包含 `client` 一个包。
+真正的服务端是仓库根下的 `chinese-chess-server/`，它是**独立目录、独立依赖**，不属于本 workspace。
+
 ```bash
-# 对 client 和 server 目录同时进行校验
-pnpm -w lint:all
-
-# 对 client 目录进行校验
+# 客户端校验（等价写法：pnpm -w lint / pnpm validate / pnpm -w lint:all）
 pnpm -w lint:client
-
-# 对 server 目录进行校验
-pnpm -w lint:server
 ```
+
+服务端仓库是**已构建的部署产物**（只有 `dist/index.js`、`ruleEngine.cjs`、`ai/`，没有 `src/`、没有 `tsconfig.json`），
+所以不存在可执行的服务端 lint；执行 `pnpm build` / `pnpm dev` / `pnpm serve` / `pnpm lint` 会打印一段说明
+（`scripts/unavailable.mjs`），告诉你为什么不可用以及该去哪里做。服务端改动请直接重新构建部署包，
+或在有 `src/` 的源码环境中校验。
+
+**不要**使用 `pnpm -w lint:server`——该脚本已删除，因为它指向的 `chinese-chess-client/server/` 目录并不存在。
+
+### ⚠️ 服务端 dist 是手工改动过的构建产物（改它必须重跑补丁脚本）
+
+`chinese-chess-server/dist/index.js` 里**手工删除过一段运行时逻辑**：
+服务端对「长将长捉禁着」的二次拦截与「连续 3 次违规判负」。
+该改动无法回到源码（本部署包没有 `src/`、没有 sourcemap），所以被固化成幂等补丁脚本
+`chinese-chess-server/scripts/patch-dist.mjs`：
+
+```bash
+node chinese-chess-server/scripts/patch-dist.mjs            # 打补丁（已打则 no-op）
+node chinese-chess-server/scripts/patch-dist.mjs --check    # 只校验，缺失则 exit 1
+node chinese-chess-server/scripts/patch-dist.mjs --restore-marker  # 仅补回丢失的标记（逻辑本就正确时）
+```
+
+**每次重新构建 / 换版本 / 覆盖 `dist/index.js` 之后，立刻重跑第一个命令。**
+否则已删除的拦截会复活，症状是「客户端能走的着法被服务端以 400『禁着，请变招』拒绝」。
+
+闸门挂在以下环节，任一环节丢补丁都会立刻以非零退出失败（CI 调用任一即可阻塞流水线）：
+
+| 环节 | 命令 | 行为 |
+| --- | --- | --- |
+| 启动服务端 | `pnpm start`（`scripts/start.mjs`） | 启动前自动 `--check`，丢失则**拒绝启动** |
+| 打包服务端 | `pack.ps1 server` / `pack.sh server` | 出包前校验，失败则**阻塞出包**（不生成 zip） |
+| 安装服务端依赖 | 服务端目录下 `pnpm install` | `postinstall` 自动 `--check`，失败即安装失败 |
+| 客户端静态校验 | `pnpm -w validate` | 先 `lint`，再 `--check` 服务端补丁 |
+| 单独校验 | `pnpm -w verify:rules` / 服务端 `pnpm verify` | 只做 `--check` |
+
+但 `node dist/index.js`、`start.bat` 等直启方式不做校验，需自行确认。
+规则引擎本体（`ruleEngine.cjs`）由 `client/utils/chess/ruleEngine.bundle.ts` 打包而来，
+`dist/index.js` 通过 `require("../ruleEngine.cjs")` 加载它——改规则请改**客户端**源码。
 
 ## 如何修改主题模式（跟随系统、固定暗色、固定亮色）
 
@@ -280,4 +314,19 @@ import { Screen } from '../../../components/Screen';
 
 ## 本地开发
 
-`coze dev`：用来首次启动前后端服务，也可以用来重启前后端服务（该命令会先尝试杀掉占用端口的进程，再启动服务）
+在 `chinese-chess-client/` 下执行：
+
+```bash
+pnpm -w dev:all       # 同时起服务端 + 客户端（推荐）
+pnpm -w dev:server    # 只起服务端（仓库根的 chinese-chess-server/，默认 9091）
+pnpm -w dev:client    # 只起 Expo web 客户端（5000），/api/v1 代理到 SERVER_PORT
+```
+
+`dev:all` 由 `scripts/dev-all.mjs` 实现：它给客户端注入 `SERVER_PORT`，
+让 `client/metro.config.js:104-105` 把 `/api/v1/*` 代理到对应端口的后端。
+用 `PORT=8080 pnpm -w dev:all` 可同时改两端端口。
+
+> ⚠️ 根脚本 `dev` / `build` / `start` 仍指向 `.cozeproj/scripts/*.sh`，
+> 而这些脚本以 `$ROOT_DIR/server`（即 `chinese-chess-client/server/`）为工作目录——
+> 该目录并不存在，服务端实际在仓库根的 `../chinese-chess-server/`。
+> `.cozeproj/` 标记为禁止修改，所以这三个脚本在当前仓库结构下不可用，请改用上面的 `dev:*`。

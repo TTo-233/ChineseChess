@@ -24,8 +24,30 @@
 三、启动服务（本机手动 / 调试）
   方式1：双击 start.bat。
   方式2：在本目录打开 cmd，执行  node dist\index.js 。
+  方式3（推荐）：执行  pnpm start  （等价于方式2，并额外做补丁校验，见下方红字警告）。
   默认端口 9091；如需修改：先执行  set PORT=8080  再  node dist\index.js 。
   本机自测：浏览器访问  http://localhost:9091/api/v1/health  返回 {"status":"ok"} 即本地正常。
+
+  ============================ 红字警告 ============================
+  【dist\index.js 是手工改动过的构建产物】
+  本目录是自包含部署包：没有 src\、没有 tsconfig.json、没有 sourcemap。
+  「长将长捉超限不拦截落子、不按违规次数判负」这条规则的实现就写在该文件里，
+  由 scripts\patch-dist.mjs 注入（幂等补丁）。
+
+  每次重新构建 / 换版本 / 从其它机器拷贝 dist\index.js 覆盖之后，
+  必须立刻执行：   node scripts\patch-dist.mjs
+  否则已删除的「禁着拦截 + 连续 3 次判负」逻辑会复活，表现为
+  「客户端能走的着法被服务端以 400『禁着，请变招』拒绝」。
+
+  补丁已存在（no-op），只有标记丢失时用：  node scripts\patch-dist.mjs --restore-marker
+
+  这道闸门已挂在以下环节，任一环节丢补丁都会立刻以非零退出失败：
+    启动服务   pnpm start                    启动前自动 --check，补丁丢失则拒绝启动
+    打包服务端 pack.ps1 server / pack.sh server  出包前校验，失败则阻塞出包（不生成 zip）
+    安装依赖   本目录下 pnpm install         postinstall 自动 --check，失败即安装失败
+    单独校验   pnpm verify                   只做 --check
+  用 node dist\index.js 或 start.bat 直接启动则不做校验，需自行确认。
+  ===================================================================
 
 四、开机自启与崩溃自愈（强烈推荐配置）
   背景：Windows 重启/断电/系统更新后，手动双击的 start.bat 不会自动恢复，服务端会离线。

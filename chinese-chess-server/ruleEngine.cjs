@@ -17,19 +17,18 @@ var __copyProps = (to, from, except, desc) => {
 };
 var __toCommonJS = (mod) => __copyProps(__defProp({}, "__esModule", { value: true }), mod);
 
-// utils/chess/ruleEngine.bundle.ts
+// chinese-chess-client/client/utils/chess/ruleEngine.bundle.ts
 var ruleEngine_bundle_exports = {};
 __export(ruleEngine_bundle_exports, {
   cloneGameState: () => cloneGameState,
   createInitialState: () => createInitialState,
   getValidMoves: () => getValidMoves,
   isMoveBanned: () => isMoveBanned,
-  makeMove: () => makeMove,
-  recordBanViolation: () => recordBanViolation
+  makeMove: () => makeMove
 });
 module.exports = __toCommonJS(ruleEngine_bundle_exports);
 
-// utils/chess/types.ts
+// chinese-chess-client/client/utils/chess/types.ts
 var BLACK_SIDE = false;
 var RED_SIDE = true;
 var QIZI_INIT_POSITION = [
@@ -69,20 +68,30 @@ var QIZI_INIT_POSITION = [
 var BOARD_COLS = 9;
 var BOARD_ROWS = 10;
 
-// utils/chess/MoveCheck.ts
+// chinese-chess-client/client/utils/chess/MoveCheck.ts
 function isTongBang(qz1, qz2) {
   return qz1 >= 0 && qz2 >= 0 && (qz1 <= 15 && qz2 <= 15 || qz1 >= 16 && qz2 >= 16);
 }
-function getPathPoints(moveQiZi, qiPan, piecePositions) {
+function createPathPointsBuffer() {
   const points = [];
   for (let i = 0; i < BOARD_COLS; i++) {
-    points[i] = [];
+    const col = [];
     for (let j = 0; j < BOARD_ROWS; j++) {
-      points[i][j] = false;
+      col[j] = false;
+    }
+    points[i] = col;
+  }
+  return points;
+}
+function fillPathPoints(moveQiZi, qiPan, piecePositions, points) {
+  for (let i = 0; i < BOARD_COLS; i++) {
+    const col2 = points[i];
+    for (let j = 0; j < BOARD_ROWS; j++) {
+      col2[j] = false;
     }
   }
-  if (moveQiZi > 31 || moveQiZi < 0) return points;
-  if (!piecePositions[moveQiZi].alive) return points;
+  if (moveQiZi > 31 || moveQiZi < 0) return;
+  if (!piecePositions[moveQiZi].alive) return;
   const col = piecePositions[moveQiZi].col;
   const row = piecePositions[moveQiZi].row;
   switch (moveQiZi) {
@@ -96,7 +105,7 @@ function getPathPoints(moveQiZi, qiPan, piecePositions) {
     case 6:
     case 21:
     case 22:
-      calcMa(col, row, moveQiZi, qiPan, points, piecePositions);
+      calcMa(col, row, moveQiZi, qiPan, points);
       break;
     case 3:
     case 4:
@@ -112,7 +121,7 @@ function getPathPoints(moveQiZi, qiPan, piecePositions) {
       break;
     case 0:
     case 16:
-      calcJiang(col, row, moveQiZi, qiPan, points, piecePositions);
+      calcJiang(col, row, moveQiZi, qiPan, points);
       break;
     case 9:
     case 10:
@@ -135,6 +144,10 @@ function getPathPoints(moveQiZi, qiPan, piecePositions) {
       calcHongBing(col, row, moveQiZi, qiPan, points);
       break;
   }
+}
+function getPathPoints(moveQiZi, qiPan, piecePositions) {
+  const points = createPathPointsBuffer();
+  fillPathPoints(moveQiZi, qiPan, piecePositions, points);
   return points;
 }
 function calcChe(col, row, moveQiZi, qiPan, points) {
@@ -171,8 +184,7 @@ function calcChe(col, row, moveQiZi, qiPan, points) {
     }
   }
 }
-function calcMa(col, row, moveQiZi, qiPan, points, piecePositions) {
-  if (justOneIsThis(moveQiZi, qiPan, piecePositions)) return;
+function calcMa(col, row, moveQiZi, qiPan, points) {
   if (row > 1 && qiPan[col][row - 1] === -1) {
     if (col > 0 && !isTongBang(moveQiZi, qiPan[col - 1][row - 2])) points[col - 1][row - 2] = true;
     if (col < 8 && !isTongBang(moveQiZi, qiPan[col + 1][row - 2])) points[col + 1][row - 2] = true;
@@ -191,7 +203,6 @@ function calcMa(col, row, moveQiZi, qiPan, points, piecePositions) {
   }
 }
 function calcXiang(col, row, moveQiZi, qiPan, points) {
-  if (justOneIsThis(moveQiZi, qiPan, [])) return;
   let side = 0;
   if (row <= 4) side = 5;
   if (row !== 9 - side) {
@@ -212,7 +223,6 @@ function calcXiang(col, row, moveQiZi, qiPan, points) {
   }
 }
 function calcShi(col, row, moveQiZi, qiPan, points) {
-  if (justOneIsThis(moveQiZi, qiPan, [])) return;
   let side = 0;
   if (row <= 4) side = 7;
   if (row !== 9 - side) {
@@ -224,78 +234,20 @@ function calcShi(col, row, moveQiZi, qiPan, points) {
     if (col < 5 && !isTongBang(moveQiZi, qiPan[col + 1][row - 1])) points[col + 1][row - 1] = true;
   }
 }
-function calcJiang(col, row, moveQiZi, qiPan, points, piecePositions) {
+function calcJiang(col, row, moveQiZi, qiPan, points) {
   let side = 0;
   if (row <= 4) side = 7;
-  const jiang0Col = piecePositions[0].col;
-  const jiang0Row = piecePositions[0].row;
-  const jiang16Col = piecePositions[16].col;
-  const jiang16Row = piecePositions[16].row;
-  if (row !== 9 - side) {
-    if (!isTongBang(moveQiZi, qiPan[col][row + 1])) {
-      if (jiang0Col !== jiang16Col) {
-        points[col][row + 1] = true;
-      } else {
-        if (moveQiZi === 0) {
-          for (let i = jiang0Row + 2; i < jiang16Row; i++) {
-            if (qiPan[col][i] !== -1) {
-              points[col][row + 1] = true;
-              break;
-            }
-          }
-        }
-        if (moveQiZi === 16) {
-          points[col][row + 1] = true;
-        }
-      }
-    }
+  if (row !== 9 - side && !isTongBang(moveQiZi, qiPan[col][row + 1])) {
+    points[col][row + 1] = true;
   }
-  if (row !== 7 - side) {
-    if (!isTongBang(moveQiZi, qiPan[col][row - 1])) {
-      if (jiang0Col !== jiang16Col) {
-        points[col][row - 1] = true;
-      } else {
-        if (moveQiZi === 0) {
-          points[col][row - 1] = true;
-        }
-        if (moveQiZi === 16) {
-          for (let i = jiang0Row + 1; i < jiang16Row - 1; i++) {
-            if (qiPan[col][i] !== -1) {
-              points[col][row - 1] = true;
-              break;
-            }
-          }
-        }
-      }
-    }
+  if (row !== 7 - side && !isTongBang(moveQiZi, qiPan[col][row - 1])) {
+    points[col][row - 1] = true;
   }
-  if (col > 3) {
-    if (!isTongBang(moveQiZi, qiPan[col - 1][row])) {
-      if (col - 1 === jiang0Col || col - 1 === jiang16Col) {
-        for (let i = jiang0Row + 1; i < jiang16Row; i++) {
-          if (qiPan[col - 1][i] !== -1) {
-            points[col - 1][row] = true;
-            break;
-          }
-        }
-      } else {
-        points[col - 1][row] = true;
-      }
-    }
+  if (col > 3 && !isTongBang(moveQiZi, qiPan[col - 1][row])) {
+    points[col - 1][row] = true;
   }
-  if (col < 5) {
-    if (!isTongBang(moveQiZi, qiPan[col + 1][row])) {
-      if (col + 1 === jiang0Col || col + 1 === jiang16Col) {
-        for (let i = jiang0Row + 1; i < jiang16Row; i++) {
-          if (qiPan[col + 1][i] !== -1) {
-            points[col + 1][row] = true;
-            break;
-          }
-        }
-      } else {
-        points[col + 1][row] = true;
-      }
-    }
+  if (col < 5 && !isTongBang(moveQiZi, qiPan[col + 1][row])) {
+    points[col + 1][row] = true;
   }
 }
 function calcPao(col, row, moveQiZi, qiPan, points) {
@@ -340,7 +292,7 @@ function calcHeiZu(col, row, moveQiZi, qiPan, points) {
   if (row < 9 && !isTongBang(moveQiZi, qiPan[col][row + 1])) {
     points[col][row + 1] = true;
   }
-  if (!justOneIsThis(moveQiZi, qiPan, []) && row <= 9 && row > 4) {
+  if (row > 4) {
     if (col > 0 && !isTongBang(moveQiZi, qiPan[col - 1][row])) points[col - 1][row] = true;
     if (col < 8 && !isTongBang(moveQiZi, qiPan[col + 1][row])) points[col + 1][row] = true;
   }
@@ -349,26 +301,10 @@ function calcHongBing(col, row, moveQiZi, qiPan, points) {
   if (row > 0 && !isTongBang(moveQiZi, qiPan[col][row - 1])) {
     points[col][row - 1] = true;
   }
-  if (!justOneIsThis(moveQiZi, qiPan, []) && row >= 0 && row < 5) {
+  if (row < 5) {
     if (col > 0 && !isTongBang(moveQiZi, qiPan[col - 1][row])) points[col - 1][row] = true;
     if (col < 8 && !isTongBang(moveQiZi, qiPan[col + 1][row])) points[col + 1][row] = true;
   }
-}
-function justOneIsThis(qiZi, qiPan, piecePositions) {
-  if (piecePositions.length === 0) return false;
-  const j0Col = piecePositions[0].col;
-  const j0Row = piecePositions[0].row;
-  const j16Col = piecePositions[16].col;
-  const j16Row = piecePositions[16].row;
-  if (j0Col !== j16Col) return false;
-  if (piecePositions[qiZi].col !== j0Col) return false;
-  if (piecePositions[qiZi].row < j0Row) return false;
-  if (piecePositions[qiZi].row > j16Row) return false;
-  let count = 0;
-  for (let i = j0Row + 1; i < j16Row; i++) {
-    if (qiPan[j0Col][i] !== -1) count++;
-  }
-  return count === 1;
 }
 function afterMoveStillJiangJun(qiZi, x0, y0, x1, y1, qiPan, piecePositions) {
   const myQiPan = qiPan.map((r) => [...r]);
@@ -428,7 +364,7 @@ function afterMoveStillJiangJun(qiZi, x0, y0, x1, y1, qiPan, piecePositions) {
   return false;
 }
 
-// utils/chess/RuleEngine.ts
+// chinese-chess-client/client/utils/chess/RuleEngine.ts
 var RULE_CONFIG = {
   /** 长将允许着数：按参与长将的子力数量（1 子 / 2 子 / 3 子及以上），方案 2.1.1 */
   longCheckByPieceCount: [6, 12, 18],
@@ -447,9 +383,7 @@ var RULE_CONFIG = {
   /** 自然限招窗口内将军累计上限（方案 2.4） */
   checkCountLimit: 40,
   /** 双方累计总着数上限（方案 2.4） */
-  totalMoveLimit: 400,
-  /** 连续坚持禁着自动判负次数（方案 10.1） */
-  banViolationLimit: 3
+  totalMoveLimit: 400
 };
 function sideOfPiece(id) {
   return id <= 15 ? BLACK_SIDE : RED_SIDE;
@@ -661,7 +595,6 @@ function createInitialRuleState(state) {
     banReason: null,
     banChaseTargets: [],
     banMoves: [],
-    banViolations: { red: 0, black: 0 },
     notice: null,
     noticeKey: null
   };
@@ -688,7 +621,6 @@ function cloneRuleState(r) {
     banReason: r.banReason,
     banChaseTargets: [...r.banChaseTargets],
     banMoves: r.banMoves.map((m) => ({ ...m })),
-    banViolations: { ...r.banViolations },
     notice: r.notice,
     noticeKey: r.noticeKey
   };
@@ -729,15 +661,6 @@ function isMoveBanned(state, pieceId, toCol, toRow) {
   if (state.sideTag !== rs.banSide) return false;
   return rs.banMoves.some((m) => m.pieceId === pieceId && m.toCol === toCol && m.toRow === toRow);
 }
-function recordBanViolation(rs, side) {
-  const key = sideKey(side);
-  rs.banViolations[key] = (rs.banViolations[key] ?? 0) + 1;
-  if (rs.banViolations[key] >= RULE_CONFIG.banViolationLimit) {
-    const other = key === "red" ? "black" : "red";
-    return (rs.banViolations[other] ?? 0) >= RULE_CONFIG.banViolationLimit ? "draw" : "lose";
-  }
-  return null;
-}
 function maxZhuoCount(s) {
   let max = 0;
   for (const k of Object.keys(s.zhuoCounts)) {
@@ -777,10 +700,6 @@ function evaluateRuleAfterMove(beforeState, afterState, move) {
   rs.noticeKey = null;
   const mover = rs[sideKey(moverSide)];
   const opponent = rs[sideKey(opponentSide)];
-  if (rs.banActive && rs.banSide === moverSide) {
-    resetSideCounters(mover);
-    rs.banViolations[sideKey(moverSide)] = 0;
-  }
   const zhuoList = isCheck ? [] : detectZhuo(afterState, moverSide);
   if (move.captured !== -1) {
     resetSideCounters(mover);
@@ -872,13 +791,14 @@ function evaluateRuleAfterMove(beforeState, afterState, move) {
   const oppBan = tryBan(opponentSide);
   const hit = moverBan ?? oppBan;
   const hitSide = moverBan ? moverSide : opponentSide;
+  const banName = (reason) => reason === "LONG_CHECK" ? "\u957F\u5C06" : reason === "LONG_CHASE" ? "\u957F\u6349" : "\u5C06\u6349\u4EA4\u66FF";
   if (hit) {
     rs.banActive = true;
     rs.banSide = hitSide;
     rs.banReason = hit.reason;
     rs.banChaseTargets = hit.targets;
     rs.banMoves = buildBanMoves(afterState, hitSide, hit.reason, hit.targets);
-    rs.notice = hit.reason === "LONG_CHECK" ? "\u957F\u5C06\u7981\u7740\uFF0C\u8BF7\u53D8\u62DB" : hit.reason === "LONG_CHASE" ? "\u957F\u6349\u7981\u7740\uFF0C\u8BF7\u53D8\u62DB" : "\u5C06\u6349\u7981\u7740\uFF0C\u8BF7\u53D8\u62DB";
+    rs.notice = `${banName(hit.reason)}\u5DF2\u8D85\u9650\uFF0C\u8BF7\u5C3D\u5FEB\u53D8\u62DB`;
     rs.noticeKey = `${sideKey(hitSide)}-ban-${hit.reason}`;
   } else {
     rs.banActive = false;
@@ -890,15 +810,15 @@ function evaluateRuleAfterMove(beforeState, afterState, move) {
       const c = rs[sideKey(side)];
       const checkLimit = longCheckLimit(c.jiangPieceIds.length);
       if (c.jiangCount >= checkLimit - 1 && c.jiangCount < checkLimit) {
-        return { text: "\u8BF7\u5C3D\u5FEB\u53D8\u62DB\uFF0C\u907F\u514D\u957F\u5C06\u5224\u8D1F", key: `${sideKey(side)}-jiang-${c.jiangCount}` };
+        return { text: `\u957F\u5C06\u5DF2 ${c.jiangCount} \u7740\uFF0C\u4E0B\u7740\u5C06\u8D85\u9650\uFF0C\u8BF7\u5C3D\u5FEB\u53D8\u62DB`, key: `${sideKey(side)}-jiang-${c.jiangCount}` };
       }
       const zhuoMax = maxZhuoCount(c);
       if (zhuoMax >= RULE_CONFIG.longChase - 1 && zhuoMax < RULE_CONFIG.longChase) {
-        return { text: "\u8BF7\u5C3D\u5FEB\u53D8\u62DB\uFF0C\u907F\u514D\u957F\u6349\u5224\u8D1F", key: `${sideKey(side)}-zhuo-${zhuoMax}` };
+        return { text: `\u957F\u6349\u5DF2 ${zhuoMax} \u7740\uFF0C\u4E0B\u7740\u5C06\u8D85\u9650\uFF0C\u8BF7\u5C3D\u5FEB\u53D8\u62DB`, key: `${sideKey(side)}-zhuo-${zhuoMax}` };
       }
       const jzLimit = checkChaseLimit(c.jiangZhuoPieceIds.length);
       if (c.jiangZhuoLoop >= jzLimit - 1 && c.jiangZhuoLoop < jzLimit) {
-        return { text: "\u8BF7\u5C3D\u5FEB\u53D8\u62DB\uFF0C\u907F\u514D\u5C06\u6349\u5224\u8D1F", key: `${sideKey(side)}-jz-${c.jiangZhuoLoop}` };
+        return { text: `\u5C06\u6349\u4EA4\u66FF\u5DF2 ${c.jiangZhuoLoop} \u7740\uFF0C\u4E0B\u7740\u5C06\u8D85\u9650\uFF0C\u8BF7\u5C3D\u5FEB\u53D8\u62DB`, key: `${sideKey(side)}-jz-${c.jiangZhuoLoop}` };
       }
       return null;
     };
@@ -911,7 +831,7 @@ function evaluateRuleAfterMove(beforeState, afterState, move) {
   return finish(rs, false, "", null);
 }
 
-// utils/chess/GameEngine.ts
+// chinese-chess-client/client/utils/chess/GameEngine.ts
 function createInitialState(firstMoveSide = RED_SIDE) {
   const qiPan = [];
   for (let i = 0; i < BOARD_COLS; i++) {
@@ -957,29 +877,19 @@ function cloneGameState(state) {
 function toPiecePositions(pieces) {
   return pieces.map((p) => ({ col: p.col, row: p.row, alive: p.alive }));
 }
-function getValidMoves(state, pieceId) {
-  if (pieceId < 0 || pieceId > 31) {
-    return Array.from({ length: 9 }, () => Array(10).fill(false));
-  }
+function getSelectableMoves(state, pieceId) {
+  const empty = () => Array.from({ length: BOARD_COLS }, () => Array(BOARD_ROWS).fill(false));
+  if (pieceId < 0 || pieceId > 31) return empty();
   const piece = state.pieces[pieceId];
-  if (!piece.alive) {
-    return Array.from({ length: 9 }, () => Array(10).fill(false));
-  }
+  if (!piece.alive) return empty();
   const pieceSide = pieceId <= 15 ? BLACK_SIDE : RED_SIDE;
-  if (pieceSide !== state.sideTag) {
-    return Array.from({ length: 9 }, () => Array(10).fill(false));
-  }
-  const positions = toPiecePositions(state.pieces);
-  const points = getPathPoints(pieceId, state.qiPan, positions);
+  if (pieceSide !== state.sideTag) return empty();
+  const points = getPathPoints(pieceId, state.qiPan, toPiecePositions(state.pieces));
   points[piece.col][piece.row] = false;
-  for (let c = 0; c < 9; c++) {
-    for (let r = 0; r < 10; r++) {
-      if (points[c][r] && afterMoveStillJiangJun(pieceId, piece.col, piece.row, c, r, state.qiPan, positions)) {
-        points[c][r] = false;
-      }
-    }
-  }
   return points;
+}
+function getValidMoves(state, pieceId) {
+  return getSelectableMoves(state, pieceId);
 }
 function isJiangJun(state, jiangOrShuai) {
   const result = [-1, -1, -1];
@@ -1129,6 +1039,5 @@ function getWinnerSideTagFromReason(newSideTag, reason) {
   createInitialState,
   getValidMoves,
   isMoveBanned,
-  makeMove,
-  recordBanViolation
+  makeMove
 });

@@ -13,7 +13,7 @@
  */
 
 import { type GameState, type PieceState } from './GameEngine';
-import { fillPathPoints, createPathPointsBuffer } from './MoveCheck';
+import { fillPathPoints, createPathPointsBuffer, getPathPoints } from './MoveCheck';
 import { RED_SIDE, BLACK_SIDE, type SideTag, type MoveRecord } from './types';
 import { isMoveBanned } from './RuleEngine';
 
@@ -378,164 +378,102 @@ export function getHistoryCount(state: GameState): number {
   return historyHashCount.get(computeZobristHash(state)) || 0;
 }
 
-// ======================== 快速攻击判定 ========================
 
 /**
- * 快速判定指定位置是否被某方攻击
- * 直接按棋子规则检查，不做全盘模拟
+ * 飞将（白脸将）判定：两将/帅同列且中间无任何棋子时视为互相照面。
+ *
+ * 与引擎 MoveCheck.afterMoveStillJiangJun 的飞将段完全同口径：isSideInCheck
+ * 经 isGeneralAttacked 调用本函数，因此 AI 的合法性过滤会正确地把「走完后造成
+ * 将帅照面」的着法判为非法 —— 这正是飞将军能被 AI 主动走出来的前提。
+ *
+ * 【与 isJiangJun 的分工】isJiangJun（走子前判当前是否被将）只遍历 5..15 /
+ * 21..31 这些非将子，不含照面；afterMoveStillJiangJun（走子后判是否仍被将）
+ * 则额外含照面。本函数属于后者，不得用于前者。
+ *
+ * 【唯一真源在引擎，本函数只是镜像】规则真源是 MoveCheck.afterMoveStillJiangJun
+ * 的飞将段与 GameEngine.isJiangJun；本文件不得再演化成第二套独立实现
+ * （历史上 AI 曾自建 canPieceReach/isSquareAttacked，把将帅当直线攻击者，
+ * 假阳性率极高，直接导致 minimax 的合法性过滤丢弃引擎认可的取胜着法，
+ * 表现为「AI 不飞将绝杀、反而退将或动自己的帅」）。若本函数与引擎判据
+ * 出现分歧，以引擎为准，并跑 node _review/probe_ai_mate.cjs 复现
+ * （期望：漏绝杀 0/25、findImmediateWin 与引擎一致 25/25、假阳性 0），
+ * 同时跑 node _review/probe_diff_head.cjs 确认未外溢到常规对局。
  */
-function isSquareAttacked(
-  qiPan: number[][],
-  targetCol: number,
-  targetRow: number,
-  bySide: SideTag
-): boolean {
-  const enemyStart = bySide === BLACK_SIDE ? 0 : 16;
-  const enemyEnd = bySide === BLACK_SIDE ? 15 : 31;
-
-  // 单次棋盘扫描：遇到敌方棋子立即判定其是否能攻击目标点
-  // 注意：qiPan 为列优先存储，qiPan[col][row]
+function areGeneralsFacing(qiPan: number[][]): boolean {
+  let blackCol = -1, blackRow = -1, redCol = -1, redRow = -1;
   for (let c = 0; c < 9; c++) {
     const colArr = qiPan[c];
     for (let r = 0; r < 10; r++) {
-      const id = colArr[r];
-      if (id >= enemyStart && id <= enemyEnd) {
-        if (canPieceReach(qiPan, id, c, r, targetCol, targetRow)) {
-          return true;
-        }
-      }
+      if (colArr[r] === 0) { blackCol = c; blackRow = r; }
+      else if (colArr[r] === 16) { redCol = c; redRow = r; }
     }
   }
-  return false;
-}
-
-/**
- * 判定棋子是否能从 (fromCol, fromRow) 到达 (toCol, toRow)
- * 使用棋子规则直接判定，不生成所有可达点
- */
-function canPieceReach(
-  qiPan: number[][],
-  pieceId: number,
-  fromCol: number,
-  fromRow: number,
-  toCol: number,
-  toRow: number
-): boolean {
-  if (fromCol === toCol && fromRow === toRow) return false;
-
-  const target = qiPan[toCol][toRow];
-  if (target === pieceId) return false;
-
-  const pieceType = pieceId % 16;
-
-  switch (pieceType) {
-    case 0: { // 将/帅
-      // 飞将规则：同列且中间无子
-      if (fromCol === toCol) {
-        const step = toRow > fromRow ? 1 : -1;
-        for (let r = fromRow + step; r !== toRow; r += step) {
-          if (qiPan[fromCol][r] !== -1) return false;
-        }
-        return true;
-      }
-      // 九宫内移动
-      if (Math.abs(toCol - fromCol) + Math.abs(toRow - fromRow) !== 1) return false;
-      const isRed = pieceId === 16;
-      if (toCol < 3 || toCol > 5) return false;
-      if (isRed) return toRow >= 7 && toRow <= 9;
-      return toRow >= 0 && toRow <= 2;
-    }
-
-    case 1: case 2: { // 士/仕
-      if (Math.abs(toCol - fromCol) !== 1 || Math.abs(toRow - fromRow) !== 1) return false;
-      if (toCol < 3 || toCol > 5) return false;
-      return pieceId <= 15 ? (toRow >= 0 && toRow <= 2) : (toRow >= 7 && toRow <= 9);
-    }
-
-    case 3: case 4: { // 象/相
-      if (Math.abs(toCol - fromCol) !== 2 || Math.abs(toRow - fromRow) !== 2) return false;
-      // 塞象眼
-      const eyeCol = (fromCol + toCol) / 2;
-      const eyeRow = (fromRow + toRow) / 2;
-      if (qiPan[eyeCol][eyeRow] !== -1) return false;
-      // 不能过河
-      return pieceId <= 15 ? toRow <= 4 : toRow >= 5;
-    }
-
-    case 5: case 6: { // 马
-      const dCol = Math.abs(toCol - fromCol);
-      const dRow = Math.abs(toRow - fromRow);
-      if (!((dCol === 1 && dRow === 2) || (dCol === 2 && dRow === 1))) return false;
-      // 蹩马腿
-      if (dCol === 2) {
-        const legCol = (fromCol + toCol) / 2;
-        if (qiPan[legCol][fromRow] !== -1) return false;
-      } else {
-        const legRow = (fromRow + toRow) / 2;
-        if (qiPan[fromCol][legRow] !== -1) return false;
-      }
-      return true;
-    }
-
-    case 7: case 8: { // 车
-      if (fromCol !== toCol && fromRow !== toRow) return false;
-      if (fromCol === toCol) {
-        const step = toRow > fromRow ? 1 : -1;
-        for (let r = fromRow + step; r !== toRow; r += step) {
-          if (qiPan[fromCol][r] !== -1) return false;
-        }
-      } else {
-        const step = toCol > fromCol ? 1 : -1;
-        for (let c = fromCol + step; c !== toCol; c += step) {
-          if (qiPan[c][fromRow] !== -1) return false;
-        }
-      }
-      return true;
-    }
-
-    case 9: case 10: { // 炮
-      if (fromCol !== toCol && fromRow !== toRow) return false;
-      let obstacleCount = 0;
-      if (fromCol === toCol) {
-        const step = toRow > fromRow ? 1 : -1;
-        for (let r = fromRow + step; r !== toRow; r += step) {
-          if (qiPan[fromCol][r] !== -1) obstacleCount++;
-        }
-      } else {
-        const step = toCol > fromCol ? 1 : -1;
-        for (let c = fromCol + step; c !== toCol; c += step) {
-          if (qiPan[c][fromRow] !== -1) obstacleCount++;
-        }
-      }
-      return target !== -1 ? obstacleCount === 1 : obstacleCount === 0;
-    }
-
-    case 11: case 12: case 13: case 14: case 15: { // 兵/卒
-      const isRedPawn = pieceId >= 27;
-      const forward = isRedPawn ? -1 : 1;
-      if (toCol === fromCol && toRow === fromRow + forward) return true;
-      // 过河后可以横走
-      const crossedRiver = isRedPawn ? fromRow <= 4 : fromRow >= 5;
-      if (crossedRiver && toRow === fromRow && Math.abs(toCol - fromCol) === 1) return true;
-      return false;
-    }
-
-    default:
-      return false;
+  if (blackCol < 0 || redCol < 0 || blackCol !== redCol) return false;
+  const top = Math.min(blackRow, redRow);
+  const bottom = Math.max(blackRow, redRow);
+  for (let r = top + 1; r < bottom; r++) {
+    if (qiPan[blackCol][r] !== -1) return false;
   }
+  return true;
 }
 
 /**
  * 检查指定一方是否被将军（其将/帅是否被敌方攻击）
  * 注意：applyMove 后 sideTag 已切换，调用方需明确传入要检测的一方
+ *
+ * 口径统一到引擎：本函数只用于「已走完某步之后，己方是否仍被攻击」的判定，
+ * 必须与引擎 MoveCheck（GameEngine.hasAnyLegalMove / isJueSha / isKunBi 的
+ * 底层判据 afterMoveStillJiangJun）严格一致：
+ *   - 只检查非将子的攻击：红帅被 5..15（黑子）攻击，黑将被 21..31（红子）攻击；
+ *   - 同时包含飞将（白脸将）判定：两将/帅同列且中间无子 ⇒ 视为被攻击。
+ * 早期版本用自建的 isSquareAttacked + canPieceReach 重写这套逻辑，与引擎口径
+ * 存在大量不一致（假阳性方向居多），导致 minimax/quiescence 的合法性过滤把引擎
+ * 认定合法的取胜着法全部丢弃 —— 表现为「AI 明明有一步绝杀却去退将/动自己的帅」。
+ * 宁可多调一次引擎走法生成，也不维护第二套规则实现（宁可慢，不可错）。
  */
 function isSideInCheck(state: GameState, side: SideTag): boolean {
   const generalId = side === RED_SIDE ? 16 : 0;
   const general = state.pieces[generalId];
   if (!general.alive) return true;
+  return isGeneralAttacked(state.qiPan, general.col, general.row, side);
+}
 
-  const enemySide = side === RED_SIDE ? BLACK_SIDE : RED_SIDE;
-  return isSquareAttacked(state.qiPan, general.col, general.row, enemySide);
+/**
+ * 引擎口径的「(col,row) 上的将/帅是否仍被攻击」。
+ *
+ * 直接复用 MoveCheck 的两段判据：
+ *   1) 飞将：两将/帅同列且中间无任何棋子；
+ *   2) 被敌方非将子攻击（红帅看 5..15，黑将看 21..31），用引擎的
+ *      getPathPoints（走法生成）而不是手写的 canPieceReach。
+ */
+function isGeneralAttacked(qiPan: number[][], col: number, row: number, side: SideTag): boolean {
+  // 1) 飞将（白脸将）：两将/帅同列且中间无子
+  if (areGeneralsFacing(qiPan)) return true;
+
+  // 2) 被敌方非将子攻击
+  const attackerStart = side === RED_SIDE ? 5 : 21;
+  const attackerEnd = side === RED_SIDE ? 15 : 31;
+  const positions = getPiecePositions(qiPan);
+  for (let id = attackerStart; id <= attackerEnd; id++) {
+    if (!positions[id].alive) continue;
+    if (getPathPoints(id, qiPan, positions)[col][row]) return true;
+  }
+  return false;
+}
+
+/** 从棋盘重建棋子位置数组（getPathPoints 所需的形状） */
+function getPiecePositions(qiPan: number[][]): Array<{ col: number; row: number; alive: boolean }> {
+  const positions = Array.from({ length: 32 }, () => ({ col: -1, row: -1, alive: false }));
+  for (let c = 0; c < 9; c++) {
+    for (let r = 0; r < 10; r++) {
+      const id = qiPan[c][r];
+      if (id === -1) continue;
+      positions[id].col = c;
+      positions[id].row = r;
+      positions[id].alive = true;
+    }
+  }
+  return positions;
 }
 
 // ======================== 走法生成 ========================
@@ -727,8 +665,69 @@ function isKillerMove(depth: number, move: Move): boolean {
 
 // ======================== Minimax 搜索 ========================
 
-/** 绝杀分数（远大于任何子力分） */
+/**
+ * 绝杀分数（远大于任何子力分）
+ *
+ * 语义：己方视角下，+MATE_SCORE 表示「必胜（绝杀/困毙/吃将）」，
+ * -MATE_SCORE 表示「必败（己方被绝杀/困毙）」，二者均不可被任何评估分超过，
+ * 因此绝杀着法永远排在最前、不会被剪枝误丢。
+ */
 const MATE_SCORE = 1000000;
+
+/** 一步绝杀的实际返回值（在 MATE_SCORE 内预留 ply 偏移量，使更快的绝杀更优） */
+const MATE_IN_1 = MATE_SCORE - 1;
+
+/**
+ * 指定一方是否已无任何合法走法（绝杀前提：被将军；困毙前提：未被将军）
+ * 与 minimax/quiescence 内的合法性过滤完全同口径。
+ */
+function hasNoLegalMove(state: GameState): boolean {
+  const moves = generatePseudoMoves(state);
+  for (const move of moves) {
+    const undo = applyMove(state, move.pieceId, move.toCol, move.toRow);
+    const moverSide = state.sideTag === RED_SIDE ? BLACK_SIDE : RED_SIDE;
+    const illegal = isSideInCheck(state, moverSide);
+    unapplyMove(state, undo);
+    if (!illegal) return false;
+  }
+  return true;
+}
+
+/**
+ * 根节点「一步终局」扫描：在进入迭代加深之前，先把能立刻结束对局的着法找出来。
+ *
+ * 为什么必须单独扫一遍，而不能指望 minimax 自己发现：
+ * minimax 的绝杀分只有在该分支被实际展开到叶子时才产生，而 alpha-beta 剪枝
+ * 会因为兄弟分支先返回高分而提前 cut 掉这条分支 —— 残局中「唯一取胜着法」
+ * 恰恰是最容易被剪掉的那条（它前面的着法往往是 MVV-LVA 分数更高的假着法）。
+ * 于是表现为「AI 明明有一步绝杀却去退将/动自己的帅」。
+ *
+ * 这里在根节点穷举全部着法（数量在百量级，开销可忽略），用与引擎一致的
+ * 终局口径判定：吃将即胜、对方绝杀（被将军且无合法着法）即胜、
+ * 对方困毙（未被将军且无合法着法）亦判负（中国象棋困毙与将死同判负）。
+ * 命中即立刻返回，绝杀着法因此永远排在第一位且不可能被剪掉。
+ */
+function findImmediateWin(state: GameState, moves: Move[]): Move | null {
+  // 优先吃将：直接结束对局，且不吃自己的将
+  for (const move of moves) {
+    const target = state.qiPan[move.toCol][move.toRow];
+    if (target !== 0 && target !== 16) continue;
+    const undo = applyMove(state, move.pieceId, move.toCol, move.toRow);
+    unapplyMove(state, undo);
+    return move;
+  }
+  // 其次找绝杀 / 困毙
+  for (const move of moves) {
+    const undo = applyMove(state, move.pieceId, move.toCol, move.toRow);
+    // 走这步之后 state.sideTag 已切到对方：对方无合法着法即为绝杀/困毙
+    if (hasNoLegalMove(state)) {
+      unapplyMove(state, undo);
+      return move;
+    }
+    unapplyMove(state, undo);
+  }
+  return null;
+}
 
 /**
  * 静态搜索（Quiescence Search）
@@ -929,12 +928,13 @@ async function searchWithTimeBudget(
   let moves = generatePseudoMoves(state);
   if (moves.length === 0) return null;
 
-  // 长将长捉禁着过滤（方案 10.3：禁着期间不得提交禁着）：
-  // 当前走棋方为被禁方时，根节点直接剔除一切禁着着法（将军着/捉目标着/将捉组合着）
+  // 长将长捉超限时的择着偏好（方案 10 娱乐向改造）：
+  // 超限只提示不判负，AI 仍应优先变招——根节点剔除会继续长将/长捉的着法，
+  // 避免把自己拖进僵局（最终由自然限招/互长将互长捉判和收场）
   if (state.ruleState?.banActive && state.ruleState.banSide === state.sideTag) {
     const legal = moves.filter(m => !isMoveBanned(state, m.pieceId, m.toCol, m.toRow));
-    // 全部着法被禁在规则上不可达（引擎 banMoves 仅覆盖将/捉着，必有变招着存在）；
-    // 防御性兜底：若过滤后为空则退回原列表（由校验层兜底）
+    // 全部着法被标红在规则上不可达（引擎 banMoves 仅覆盖将/捉着，必有变招着存在）；
+    // 防御性兜底：若过滤后为空则退回原列表
     if (legal.length > 0) moves = legal;
   }
 
@@ -980,6 +980,20 @@ async function searchWithTimeBudget(
     isRepetitive: boolean; // 是否为重复走法
   }
   const rootMoveEvals: RootMoveEval[] = [];
+
+  // 一步终局优先：吃将 / 绝杀 / 困毙若有，直接返回，不再进入迭代加深。
+  // 这是「绝杀着法永远排第一、绝不会被剪枝掉」的最强保证。
+  const immediateWin = findImmediateWin(state, moves);
+  if (immediateWin) {
+    return {
+      pieceId: immediateWin.pieceId,
+      fromCol: immediateWin.fromCol,
+      fromRow: immediateWin.fromRow,
+      toCol: immediateWin.toCol,
+      toRow: immediateWin.toRow,
+      score: isMaximizing ? MATE_IN_1 : -MATE_IN_1,
+    };
+  }
 
   // 迭代加深
   for (let depth = 1; depth <= maxDepth; depth++) {

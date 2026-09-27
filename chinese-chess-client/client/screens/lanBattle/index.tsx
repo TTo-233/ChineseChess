@@ -25,8 +25,7 @@ import { useFocusEffect } from 'expo-router';
 import { useNavigation, usePreventRemove, type NavigationProp } from '@react-navigation/native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { FontAwesome6 } from '@expo/vector-icons';
-import { createInitialState, applyHandicap, cloneGameState, getValidMoves, makeMove, undoMove, getWinnerSideTag, type GameState } from '@/utils/chess/GameEngine';
-import { isMoveBanned } from '@/utils/chess/RuleEngine';
+import { createInitialState, applyHandicap, cloneGameState, getSelectableMoves, getValidMoves, makeMove, undoMove, getWinnerSideTag, type GameState } from '@/utils/chess/GameEngine';
 import { HandicapBoard } from '@/components/HandicapBoard';
 import { RED_SIDE, BLACK_SIDE } from '@/utils/chess/types';
 import ChessBoard, { CapturedPiecesDrawer } from '@/components/ChessBoard';
@@ -224,7 +223,7 @@ export default function LanBattleScreen() {
   const [jueShaVisible, setJueShaVisible] = useState(false);
   // 终局原因：区分「绝杀/困毙」（播绝杀特效）与「认输/和棋/断线判负/对方离开」（仅普通文字结算）
   const [gameEndReason, setGameEndReason] = useState<'checkmate' | 'resign' | 'draw' | 'disconnect' | 'timeout' | 'leave' | null>(null);
-  // 引擎终局细分原因（juesha/kunbi/changjiang/changzhuo/repetition/red_win/black_win），用于结算文案与特效开关
+  // 引擎终局细分原因（juesha/kunbi/changjiang/repetition/red_win/black_win），用于结算文案与特效开关
   const [gameOverReason, setGameOverReason] = useState<string>('');
   // 准备阶段：房间名、选边与准备状态
   // 房间名初值取路由带入的 roomName（大厅创建/加入时已知），避免首帧退化为「在线对局」兜底文案；
@@ -492,7 +491,7 @@ export default function LanBattleScreen() {
 
   // ===== 对局内低干扰提示条（GameNotice）=====
   // 重构前这 10 处反馈全部走 `Alert.alert`：react-native-web 未实现它，
-  // 导致「禁着提示」「网络异常」等关键提示在 Web 端完全无显示。
+  // 导致「长将长捉超限提示」「网络异常」等关键提示在 Web 端完全无显示。
   // 现统一改为覆盖在棋盘上的 GameNotice（3s 自动淡出，不阻塞落子）。
   const [notice, setNotice] = useState<GameNoticeItem | null>(null);
   const noticeSeqRef = useRef(0);
@@ -1530,10 +1529,11 @@ export default function LanBattleScreen() {
     // 棋子ID 0-15 是黑方，16-31 是红方
     const pieceSideTag = pieceId < 16 ? BLACK_SIDE : RED_SIDE;
 
-    // 点击己方棋子：选中并计算合法落点
+    // 点击己方棋子：选中并计算落点提示
     if (pieceSideTag === sideStringToTag(mySide)) {
       setSelectedPieceId(pieceId);
-      setValidMoves(getValidMoves(gameState, pieceId));
+      // 落点提示仅按棋子自身走法判定（不因被将军而只剩应将点，避免变相提示）
+      setValidMoves(getSelectableMoves(gameState, pieceId));
       return;
     }
 
@@ -1547,24 +1547,16 @@ export default function LanBattleScreen() {
   const handleMove = (toCol: number, toRow: number) => {
     if (selectedPieceId === null || !isMyTurn || phase !== 'playing') return;
 
-    // 目标位置不在合法落点内：取消选中，恢复默认状态
+    // 落点不在棋子走法内（含过期/空选）：取消选中，恢复默认状态
     if (!validMoves || !validMoves[toCol]?.[toRow]) {
       setSelectedPieceId(null);
       setValidMoves(null);
       return;
     }
 
-    // 长将长捉禁着拦截（方案 10.3：禁着期间客户端不得提交禁着）：
-    // 客户端拦截为主，服务端二次校验兜底（绕过客户端直接提交禁着时由服务端计数判负）
-    if (isMoveBanned(gameState, selectedPieceId, toCol, toRow)) {
-      const rs = gameState.ruleState!;
-      const banLabel = rs.banReason === 'LONG_CHECK' ? '长将'
-        : rs.banReason === 'LONG_CHASE' ? '长捉' : '将捉';
-      setSelectedPieceId(null);
-      setValidMoves(null);
-      showNotice(`${banLabel}禁着，请变招`, '连续坚持禁着 3 次将判负', 3600);
-      return;
-    }
+    // 长将长捉超限（方案 10 娱乐向改造）：**不拦截落子、不判负**。
+    // banMoves 仅用于棋盘标红「走这里会继续长将/长捉」，落子照常进行；
+    // 服务端（dist/index.js 的 ruleEngine 二次校验）同样不再拦截禁着。
 
     const result = makeMove(gameState, selectedPieceId, toCol, toRow);
 
@@ -1640,7 +1632,7 @@ export default function LanBattleScreen() {
   };
 
   // 服务端权威走子上报（方案 P0「服务端权威裁决」）：只发着法，
-  // 服务端负责校验（轮次/合法/禁着）并以同一规则引擎 makeMove 裁决与广播
+  // 服务端负责校验（轮次/走法合法）并以同一规则引擎 makeMove 裁决与广播
   const sendPlayerMove = async (move: { pieceId: number; toCol: number; toRow: number }) => {
     // 优先走 WebSocket 实时通道；未连接时回退 HTTP
     const sentViaWs = battleSocketRef.current?.send('move', { move }) ?? false;
@@ -1679,7 +1671,8 @@ export default function LanBattleScreen() {
     if (!gameState) return;
 
     const mySideTag = sideStringToTag(mySide);
-    // 收集所有己方棋子的合法走法（排除长将长捉禁着，方案 10.3）
+    // 收集所有己方棋子的合法走法（超限时优先选「变招」着法避免僵局，方案 10 娱乐向改造：
+    // 这只是择着偏好，不是落子限制——若过滤后为空仍会退回全部合法着法）
     const allMoves: { pieceId: number; col: number; row: number }[] = [];
     for (const piece of gameState.pieces) {
       if (!piece.alive) continue;
@@ -1689,7 +1682,7 @@ export default function LanBattleScreen() {
       const moves = getValidMoves(gameState, piece.id);
       for (let c = 0; c < 9; c++) {
         for (let r = 0; r < 10; r++) {
-          if (moves[c]?.[r] && !isMoveBanned(gameState, piece.id, c, r)) {
+          if (moves[c]?.[r]) {
             allMoves.push({ pieceId: piece.id, col: c, row: r });
           }
         }
@@ -2796,7 +2789,7 @@ export default function LanBattleScreen() {
             </View>
           )}
 
-          {/* 结算浮层：绝杀/困毙播放「绝/杀」特效；长将/长捉判负、认输/和棋/断线判负仅普通文字结算。
+          {/* 结算浮层：绝杀/困毙播放「绝/杀」特效；长将判负（二将一还）、认输/和棋/断线判负仅普通文字结算。
               只告知结果，不带操作按钮——「再来一局 / 退出房间」统一放在底部操作栏，避免重复入口 */}
           {jueShaVisible && (
             <JueShaOverlay
@@ -2805,7 +2798,6 @@ export default function LanBattleScreen() {
               showEffect={
                 gameEndReason === 'checkmate' &&
                 gameOverReason !== 'changjiang' &&
-                gameOverReason !== 'changzhuo' &&
                 gameResult?.isDraw !== true
               }
               resultText={
@@ -2821,17 +2813,15 @@ export default function LanBattleScreen() {
                     )
                     : gameOverReason === 'changjiang'
                       ? (gameResult.isWin ? '对手长将判负，你获胜！' : '你方长将判负')
-                      : gameOverReason === 'changzhuo'
-                        ? (gameResult.isWin ? '对手长捉判负，你获胜！' : '你方长捉判负')
-                        : gameResult.surrenderBy
-                          ? (gameResult.surrenderBy === playerId ? '你选择了认输' : '对手选择了认输')
-                          : gameEndReason === 'leave'
-                            ? (gameResult.isWin ? '对方离开了对局，你获胜' : '你离开了对局')
-                            : gameEndReason === 'disconnect'
-                              ? (gameResult.isWin ? '对方断线，你获胜' : '你断线超时判负')
-                              : gameEndReason === 'timeout'
-                                ? (gameResult.isWin ? '对方超时，你获胜' : '你超时判负')
-                                : gameResult.isWin ? '恭喜获胜！' : '对局失败'
+                      : gameResult.surrenderBy
+                        ? (gameResult.surrenderBy === playerId ? '你选择了认输' : '对手选择了认输')
+                        : gameEndReason === 'leave'
+                          ? (gameResult.isWin ? '对方离开了对局，你获胜' : '你离开了对局')
+                          : gameEndReason === 'disconnect'
+                            ? (gameResult.isWin ? '对方断线，你获胜' : '你断线超时判负')
+                            : gameEndReason === 'timeout'
+                              ? (gameResult.isWin ? '对方超时，你获胜' : '你超时判负')
+                              : gameResult.isWin ? '恭喜获胜！' : '对局失败'
                   : ''
               }
             />
@@ -2852,13 +2842,14 @@ export default function LanBattleScreen() {
             </View>
           )}
 
-          {/* 对局内低干扰提示条（替代重构前的 10 处 Alert.alert，Web 端此前完全不显示）：
+          {/* 对局内低干扰提示条（含长将长捉超限/接近阈值提示，替代重构前的 10 处 Alert.alert，
+              Web 端此前完全不显示）：
               绝对定位在棋盘中心、pointerEvents="box-none" 不阻塞落子，3s 后自动淡出。
               centerY 为 noticeCenterY：棋盘中心换算到本提示条所属 capturedDrawerHost
               坐标系的纵坐标（换算在 noticeCenterY 内完成）。缺测量时传 undefined，
-              组件退回 50% 居中。 */}
+              组件退回 50% 居中。结算浮层展示期间让位，避免与结果文字重叠。 */}
           <GameNotice
-            notice={notice}
+            notice={jueShaVisible ? null : notice}
             centerY={noticeCenterY}
             onHide={hideNotice}
           />

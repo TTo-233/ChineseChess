@@ -26,6 +26,13 @@ pack_client() {
 pack_server() {
   local out="chinese-chess-server_${DATE}.zip"
   rm -f "$out"
+  # ⚠️ 服务端 dist/index.js 是手工打过补丁的构建产物（见 chinese-chess-server/scripts/patch-dist.mjs）。
+  #    打包前强制校验，补丁丢失（重新构建/换版覆盖）时直接阻塞出包，避免把
+  #    「已废弃的禁着拦截 + 连续 3 次判负」逻辑打进部署包。
+  node chinese-chess-server/scripts/patch-dist.mjs --check || {
+    echo "[FAIL] 服务端补丁校验失败，已阻塞打包。请先执行：node chinese-chess-server/scripts/patch-dist.mjs" >&2
+    exit 1
+  }
   # 注意：服务端 dist/index.js 是当前唯一的可运行主体，必须保留
   zip -qr "$out" chinese-chess-server \
     -x 'chinese-chess-server/node_modules/*'

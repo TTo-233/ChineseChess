@@ -27478,27 +27478,10 @@ function actMove(roomId, body) {
     if (!valid[toCol] || !valid[toCol][toRow]) {
       return { status: 400, body: { success: false, message: "\u975E\u6CD5\u8D70\u6CD5" } };
     }
-    // \u957F\u5C06\u957F\u6349\u7981\u7740\u4E8C\u6B21\u6821\u9A8C\uFF08\u65B9\u6848 10.3\uFF09\uFF1A\u8FDE\u7EED 3 \u6B21\u575A\u6301\u7981\u7740\u81EA\u52A8\u5224\u8D1F\uFF08\u65B9\u6848 10.1\uFF09
-    if (ruleEngine.isMoveBanned(state, pieceId, toCol, toRow)) {
-      const rs = state.ruleState;
-      if (rs) {
-        const verdict = ruleEngine.recordBanViolation(rs, stateSideIsRed);
-        if (verdict === "lose" || verdict === "draw") {
-          room.phase = "ended";
-          if (verdict === "draw") {
-            room.winner = null;
-            room.endReason = "draw";
-          } else {
-            room.winner = mySide === "red" ? "black" : "red";
-            room.endReason = "checkmate";
-          }
-          return { status: 200, body: { success: false, gameOver: true, violation: verdict } };
-        }
-      }
-      const violationCount = rs?.banViolations?.[mySide] ?? 0;
-      return { status: 400, body: { success: false, message: "\u7981\u7740\uFF0C\u8BF7\u53D8\u62DB", violations: violationCount } };
-    }
     // \u670D\u52A1\u7AEF\u6743\u5A01\u88C1\u51B3\uFF1A\u4E0E\u5BA2\u6237\u7AEF\u540C\u4E00\u89C4\u5219\u5F15\u64CE\u6267\u884C\u8D70\u5B50\uFF08\u542B\u957F\u5C06\u957F\u6349\u5224\u5B9A\u4E0E\u7EC8\u5C40\uFF09
+    // 长将长捉超限不再拦截落子、不再按违规次数判负（方案 10 娱乐向改造）：
+    // banMoves 仅用于客户端棋盘标红提示；双方僵持不下由自然限招/互长将互长捉判和收场。
+    // ⚠️ 本段由 scripts/patch-dist.mjs 注入，勿手改；dist 换版后需重跑该脚本（见该文件头注释）。
     const result = ruleEngine.makeMove(state, pieceId, toCol, toRow);
     if (room.clocks && room.lastMoveTime) {
       const elapsed = (room.clockPausedAt ?? Date.now()) - room.lastMoveTime;

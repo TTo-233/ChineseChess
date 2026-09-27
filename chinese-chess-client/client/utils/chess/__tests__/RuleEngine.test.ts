@@ -11,9 +11,10 @@ import {
   createInitialState, createFromFen, makeMove, type GameState,
 } from '../GameEngine';
 import {
-  RULE_CONFIG, detectZhuo, isMoveBanned, recordBanViolation,
+  RULE_CONFIG, detectZhuo, isMoveBanned,
   type RuleState,
 } from '../RuleEngine';
+import { getValidMoves } from '../GameEngine';
 import { RED_SIDE, BLACK_SIDE } from '../types';
 
 // ---------------------------------------------------------------------------
@@ -44,7 +45,7 @@ function preset(state: GameState, mutate: (rs: RuleState) => void): GameState {
       red: emptyCounters(), black: emptyCounters(),
       positionKeys: [], naturalMoveCounter: 0, checkCounterInWindow: 0,
       banActive: false, banSide: null, banReason: null, banChaseTargets: [],
-      banMoves: [], banViolations: { red: 0, black: 0 }, notice: null, noticeKey: null,
+      banMoves: [], notice: null, noticeKey: null,
     };
   }
   mutate(state.ruleState);
@@ -80,7 +81,7 @@ describe('方案14 用例1：一子长将 6 着 → 第 7 着禁着', () => {
     expect(isMoveBanned(s, 23, 0, 3)).toBe(false);
   });
 
-  test('连续 3 次坚持禁着 → 自动判负', () => {
+  test('超限后连续长将不判负、不拦截（娱乐向改造：仅红点警示）', () => {
     let s = fen(LONG_CHECK_FEN);
     const seq: Array<[number, number, number]> = [
       [23, 4, 3], [0, 5, 0], [23, 5, 3], [0, 4, 0],
@@ -88,17 +89,17 @@ describe('方案14 用例1：一子长将 6 着 → 第 7 着禁着', () => {
       [23, 4, 3], [0, 5, 0], [23, 5, 3], [0, 4, 0],
     ];
     for (const [p, c, r] of seq) s = play(s, p, c, r);
+    // 第 7/8/9 将继续长将：红点仍在，但**不判负、不终局**
     expect(s.ruleState!.banActive).toBe(true);
-    // 提交禁着被拒 3 次 → 判负
-    expect(recordBanViolation(s.ruleState!, RED)).toBeNull();
-    expect(recordBanViolation(s.ruleState!, RED)).toBeNull();
-    expect(recordBanViolation(s.ruleState!, RED)).toBe('lose');
+    expect(s.gameStatus).toBe('playing');
+    // 超限着法本身就是合法走法（棋子走法内即可落子，不被禁着层拦截）
+    expect(getValidMoves(s, 23)[4][3]).toBe(true);
   });
 });
 
 describe('方案14 用例2/3：两子 12 着 / 三子 18 着交替长将阈值', () => {
   test('用例2：两子交替长将在第 12 将触发禁着，第 13 将被拦', () => {
-    let s = fen(LONG_CHECK_FEN);
+    const s = fen(LONG_CHECK_FEN);
     preset(s, rs => {
       rs.red.jiangCount = 11;
       rs.red.jiangPieceIds = [23, 25]; // 两子参与 → 阈值 12
@@ -115,7 +116,7 @@ describe('方案14 用例2/3：两子 12 着 / 三子 18 着交替长将阈值',
   });
 
   test('用例2 补充：两子长将未达 12 着不禁（第 11 将后仍可继续）', () => {
-    let s = fen(LONG_CHECK_FEN);
+    const s = fen(LONG_CHECK_FEN);
     preset(s, rs => {
       rs.red.jiangCount = 10;
       rs.red.jiangPieceIds = [23, 25];
@@ -125,7 +126,7 @@ describe('方案14 用例2/3：两子 12 着 / 三子 18 着交替长将阈值',
   });
 
   test('用例3：三子及以上长将在第 18 将触发禁着', () => {
-    let s = fen(LONG_CHECK_FEN);
+    const s = fen(LONG_CHECK_FEN);
     preset(s, rs => {
       rs.red.jiangCount = 17;
       rs.red.jiangPieceIds = [23, 25, 27];
@@ -240,7 +241,7 @@ describe('方案14 用例8：将捉同时出现 → 优先算将，清空捉计�
   test('车走一步同时将军与捉子，只记将军并清空此前捉计数', () => {
     // 黑将(4,0) 黑炮(6,3) 红车(3,3) 红帅(3,9)：
     // 车到 (4,3) 后纵向将军黑将 + 横向攻击无根黑炮（两条攻击线）
-    let s = fen('4k4/9/9/3R2c2/9/9/9/9/9/3K5 w');
+    const s = fen('4k4/9/9/3R2c2/9/9/9/9/9/3K5 w');
     preset(s, rs => { rs.red.zhuoCounts = { '9': 3 }; });
     const { newState, isCheck } = makeMove(s, 23, 4, 3); // 车 (3,3)→(4,3)
     expect(isCheck).toBe(true); // 纵向攻击黑将
@@ -258,7 +259,7 @@ describe('方案14 用例8：将捉同时出现 → 优先算将，清空捉计�
 describe('方案14 用例9：双方互相长将 6 着 → 判和', () => {
   test('双方各自连将至 6 判和（后至方触发）', () => {
     // 黑将(4,0) 红车(3,3) 黑车(4,5) 红帅(3,9)，黑先：黑车 (4,5)→(3,5) 将军红帅
-    let s = fen('4k4/9/9/3R5/9/4r4/9/9/9/3K5 b');
+    const s = fen('4k4/9/9/3R5/9/4r4/9/9/9/3K5 b');
     preset(s, rs => {
       rs.red.jiangCount = 6;
       rs.black.jiangCount = 5; // 黑这一将到位 → 双方 6
@@ -270,7 +271,7 @@ describe('方案14 用例9：双方互相长将 6 着 → 判和', () => {
   });
 
   test('互长将进行中（对方 5 将）暂不禁着，等待对方到 6 判和', () => {
-    let s = fen(LONG_CHECK_FEN);
+    const s = fen(LONG_CHECK_FEN);
     preset(s, rs => {
       rs.red.jiangCount = 6;
       rs.black.jiangCount = 5;
@@ -285,7 +286,7 @@ describe('方案14 用例9：双方互相长将 6 着 → 判和', () => {
 
 describe('方案14 用例10：双方互相长捉 6 着 → 判和', () => {
   test('双方各一子连续被捉达 6 判和', () => {
-    let s = fen('4c4/9/5k3/9/4R4/9/9/9/9/3K5 w');
+    const s = fen('4c4/9/5k3/9/4R4/9/9/9/9/3K5 w');
     preset(s, rs => {
       rs.red.zhuoCounts = { '9': 6 };    // 红连捉黑炮 6
       rs.black.zhuoCounts = { '23': 6 }; // 黑连捉红车 6
@@ -322,7 +323,7 @@ describe('方案14 用例11：非将非捉局面重复 5 次 → 判和', () => 
 
 describe('方案14 用例12：自然限招 120 着无吃子 → 判和', () => {
   test('第 120 着无吃子时判和', () => {
-    let s = fen('3ak4/9/9/8p/9/9/P8/9/9/3AK4 w');
+    const s = fen('3ak4/9/9/8p/9/9/P8/9/9/3AK4 w');
     preset(s, rs => { rs.naturalMoveCounter = 119; });
     const { newState, isGameOver, gameOverReason } = makeMove(s, 17, 4, 8);
     expect(isGameOver).toBe(true);
@@ -333,7 +334,7 @@ describe('方案14 用例12：自然限招 120 着无吃子 → 判和', () => {
 
 describe('方案14 用例13：自然限招中将军累计 40 着 → 判和', () => {
   test('窗口内第 40 次将军判和', () => {
-    let s = fen(LONG_CHECK_FEN);
+    const s = fen(LONG_CHECK_FEN);
     preset(s, rs => { rs.checkCounterInWindow = 39; });
     const { newState, isGameOver, gameOverReason } = makeMove(s, 23, 4, 3); // 将军着
     expect(isGameOver).toBe(true);
@@ -344,7 +345,7 @@ describe('方案14 用例13：自然限招中将军累计 40 着 → 判和', ()
 
 describe('方案14 用例14：总步数 400 着 → 判和', () => {
   test('第 400 着判和', () => {
-    let s = fen('3ak4/9/9/8p/9/9/P8/9/9/3AK4 w');
+    const s = fen('3ak4/9/9/8p/9/9/P8/9/9/3AK4 w');
     const filler = { pieceId: 17, fromCol: 3, fromRow: 9, toCol: 4, toRow: 8, capturedPieceId: -1 };
     s.moveHistory = Array.from({ length: 399 }, () => ({ ...filler }));
     const { newState, isGameOver, gameOverReason } = makeMove(s, 17, 4, 8);
@@ -357,7 +358,7 @@ describe('方案14 用例14：总步数 400 着 → 判和', () => {
 describe('方案14 用例15：最后一步将死时自然限招已到 → 判胜不判和', () => {
   test('绝杀优先于自然限招判和', () => {
     // 黑将(4,0) 红兵(3,1)(5,1) 封锁横躲位，红车(3,5) 入 4 列即绝杀
-    let s = fen('4k4/3P1P3/9/9/3R5/9/9/9/9/3K5 w');
+    const s = fen('4k4/3P1P3/9/9/3R5/9/9/9/9/3K5 w');
     preset(s, rs => { rs.naturalMoveCounter = 120; }); // 阈值已过
     const { newState, isGameOver, gameOverReason } = makeMove(s, 23, 4, 5); // 车入 4 列绝杀
     expect(isGameOver).toBe(true);
@@ -421,7 +422,7 @@ describe('方案14 用例19：捉未过河兵 → 不算捉', () => {
 
 describe('方案14 用例20：双方无进攻子力 → 自动判和', () => {
   test('仅剩将士象时第一步后判和', () => {
-    let s = fen('3ak4/9/4b4/9/9/9/9/4B4/9/3AK4 w');
+    const s = fen('3ak4/9/4b4/9/9/9/9/4B4/9/3AK4 w');
     const { newState, isGameOver, gameOverReason } = makeMove(s, 17, 4, 8);
     expect(isGameOver).toBe(true);
     expect(gameOverReason).toBe('no_attacking');
@@ -435,7 +436,7 @@ describe('方案14 用例20：双方无进攻子力 → 自动判和', () => {
 
 describe('方案14 用例21/22：将捉交替阈值禁着', () => {
   test('用例21：一子将捉交替 12 着 → 第 13 着禁着', () => {
-    let s = fen(LONG_CHECK_FEN);
+    const s = fen(LONG_CHECK_FEN);
     preset(s, rs => {
       rs.red.jiangZhuoLoop = 11;
       rs.red.jiangZhuoPieceIds = [23];
@@ -452,7 +453,7 @@ describe('方案14 用例21/22：将捉交替阈值禁着', () => {
   });
 
   test('用例22：多子将捉交替 18 着 → 第 19 着禁着', () => {
-    let s = fen(LONG_CHECK_FEN);
+    const s = fen(LONG_CHECK_FEN);
     preset(s, rs => {
       rs.red.jiangZhuoLoop = 17;
       rs.red.jiangZhuoPieceIds = [23, 25];
@@ -465,7 +466,7 @@ describe('方案14 用例21/22：将捉交替阈值禁着', () => {
   });
 
   test('用例21 补充：一子交替未达 12 不禁', () => {
-    let s = fen(LONG_CHECK_FEN);
+    const s = fen(LONG_CHECK_FEN);
     preset(s, rs => {
       rs.red.jiangZhuoLoop = 10;
       rs.red.jiangZhuoPieceIds = [23];
@@ -477,7 +478,7 @@ describe('方案14 用例21/22：将捉交替阈值禁着', () => {
 
 describe('方案14 用例23：二将一还 → 长将方作负', () => {
   test('长将方连将期间对方还过将，第 6 将直接判负', () => {
-    let s = fen(LONG_CHECK_FEN);
+    const s = fen(LONG_CHECK_FEN);
     preset(s, rs => {
       rs.red.jiangCount = 5;
       rs.red.opponentCheckedDuringRun = true; // 黑在红连将期间还过将
@@ -490,7 +491,7 @@ describe('方案14 用例23：二将一还 → 长将方作负', () => {
   });
 
   test('对照组：对方从未还将 → 单方长将走禁着流程而非直接判负', () => {
-    let s = fen(LONG_CHECK_FEN);
+    const s = fen(LONG_CHECK_FEN);
     preset(s, rs => {
       rs.red.jiangCount = 5;
       rs.red.opponentCheckedDuringRun = false;
@@ -505,42 +506,111 @@ describe('方案14 用例23：二将一还 → 长将方作负', () => {
 describe('方案14 用例24：一方长将一方长捉 → 长将方禁招', () => {
   test('红长将达到阈值时被禁将，双方均不判和', () => {
     // 黑炮(4,0) 黑将(4,1) 红车(3,3) 红帅(3,9)：车入 4 列将军
-    let s = fen('4c4/4k4/9/9/3R5/9/9/9/9/3K5 w');
+    const s = fen('4c4/4k4/9/9/3R5/9/9/9/9/3K5 w');
     preset(s, rs => {
       rs.red.jiangCount = 5;               // 红即将到长将阈值
       rs.black.zhuoCounts = { '23': 5 };   // 黑同时长捉红车（进行中）
     });
-    let { newState, isGameOver } = makeMove(s, 23, 4, 3); // 红第 6 将
-    expect(isGameOver).toBe(false);        // 不判和（黑无连将计数）
+    const mv = makeMove(s, 23, 4, 3);        // 红第 6 将
+    let { newState } = mv;
+    expect(mv.isGameOver).toBe(false);       // 不判和（黑无连将计数）
     const rs = newState.ruleState!;
     expect(rs.banActive).toBe(true);
     expect(rs.banSide).toBe(RED);          // 长将方（红）被禁
     expect(rs.banReason).toBe('LONG_CHECK');
-    // 黑方应将后（轮红），第 7 将被禁
+    // 黑方应将后（轮红），红方第 7 将落点被标红为「超限」警示
     newState = play(newState, 0, 5, 1);
     expect(isMoveBanned(newState, 23, 5, 3)).toBe(true);
+    // 标红只是警示：走法矩阵不受影响，getValidMoves 仍放行（不拦截落子）
+    expect(getValidMoves(newState, 23)[5][3]).toBe(true);
   });
 });
 
 // ---------------------------------------------------------------------------
-// 补充：禁着违规判罚（方案 10.1 / 2.4 BOTH_BAN_REFUSE_CHANGE）
+// 补充：超限不判负（方案 10 娱乐向改造 —— 废除「连续 3 次坚持禁着判负」）
 // ---------------------------------------------------------------------------
 
-describe('补充：坚持禁着违规判罚', () => {
-  test('单方满 3 次判负；对方也满 3 次时判和', () => {
-    const mk = (red: number, black: number): RuleState => ({
+describe('补充：超限仅提示不判负', () => {
+  test('banViolations 计数字段已废除，RuleState 不再包含违规次数', () => {
+    const rs: RuleState = {
       red: emptyCounters(), black: emptyCounters(),
       positionKeys: [], naturalMoveCounter: 0, checkCounterInWindow: 0,
       banActive: true, banSide: RED, banReason: 'LONG_CHECK',
-      banChaseTargets: [], banMoves: [], banViolations: { red, black },
+      banChaseTargets: [], banMoves: [],
       notice: null, noticeKey: null,
-    });
-    // 红第 3 次违规时黑仅 2 次 → 红判负
-    expect(recordBanViolation(mk(2, 2), RED)).toBe('lose');
-    // 黑第 3 次违规时红已满 3 → 双方均拒绝变着 → 判和
-    expect(recordBanViolation(mk(3, 2), BLACK)).toBe('draw');
-    // 未满 3 次 → 继续
-    expect(recordBanViolation(mk(0, 0), RED)).toBeNull();
+    };
+    expect('banViolations' in rs).toBe(false);
+  });
+
+  test('超限后继续长将 20 轮不判负（由互长将/自然限招等判和收场）', () => {
+    let s = fen(LONG_CHECK_FEN);
+    let lastReason = '';
+    // 连将 20 轮（红黑各走）——远超一子长将阈值 6
+    const step = (p: number, c: number, r: number) => {
+      const res = makeMove(s, p, c, r);
+      s = res.newState;
+      if (res.gameOverReason) lastReason = res.gameOverReason;
+    };
+    for (let i = 0; i < 10 && s.gameStatus === 'playing'; i++) {
+      step(23, 4, 3); step(0, 5, 0); step(23, 5, 3); step(0, 4, 0);
+    }
+    // 僵持不下 → 判和收场，绝不是某方长将判负
+    expect(s.gameStatus).toBe('draw');
+    expect(['mutual_long_check', 'mutual_long_chase', 'repetition', 'natural_limit', 'total_limit', 'no_attacking'])
+      .toContain(lastReason);
+  });
+
+  test('倒数第 2 着（长将第 5 着）给出「下着将超限，请尽快变招」提示', () => {
+    // 黑将(4,0) 红车(3,3) 红帅(3,9)：车在 3/4 列交替将军 5 次
+    let s = fen(LONG_CHECK_FEN);
+    const seq: Array<[number, number, number]> = [
+      [23, 4, 3], [0, 5, 0],   // 将1；将躲到 (5,0)
+      [23, 5, 3], [0, 4, 0],   // 将2
+      [23, 4, 3], [0, 5, 0],   // 将3
+      [23, 5, 3], [0, 4, 0],   // 将4
+      [23, 4, 3],               // 将5 —— 阈值 6 的倒数第 2 着
+    ];
+    for (let i = 0; i < seq.length - 1; i++) {
+      s = play(s, seq[i][0], seq[i][1], seq[i][2]);
+    }
+    const [p, c, r] = seq[seq.length - 1];
+    s = play(s, p, c, r);
+    const rs = s.ruleState!;
+    expect(rs.red.jiangCount).toBe(5);
+    expect(rs.banActive).toBe(false);   // 第 5 将尚未超限
+    expect(rs.notice).toBe('长将已 5 着，下着将超限，请尽快变招');
+    expect(rs.noticeKey).toBe('red-jiang-5');
+    // 提示只是文案：不拦截落子，红点为空
+    expect(rs.banMoves).toEqual([]);
+    // 第 6 将（下着）照常能走：车 (4,3)→(5,3) 仍会被将军，只被标红为超限
+    const next = play(s, 0, 5, 0);
+    expect(next.ruleState!.red.jiangCount).toBe(5);
+    expect(getValidMoves(next, 23)[5][3]).toBe(true);
+    expect(getValidMoves(next, 23)[5][3]).toBe(true);
+  });
+
+  test('长捉倒数第 2 着（第 5 捉）同样提示下着将超限', () => {
+    // 黑将(5,2) 黑炮(4,0) 红车(4,4) 红帅(3,9)：车在 3/4 列交替追捉无根炮
+    let s = fen('4c4/9/5k3/9/4R4/9/9/9/9/3K5 w');
+    const seq: Array<[number, number, number]> = [
+      [23, 4, 3], [9, 3, 0],
+      [23, 3, 3], [9, 4, 0],
+      [23, 4, 3], [9, 3, 0],
+      [23, 3, 3], [9, 4, 0],
+      [23, 4, 3],   // 第 5 捉 —— 阈值 6 的倒数第 2 着
+    ];
+    for (const [p, c, r] of seq) s = play(s, p, c, r);
+    const rs = s.ruleState!;
+    expect(rs.red.zhuoCounts['9']).toBe(5);
+    expect(rs.banActive).toBe(false);
+    expect(rs.notice).toBe('长捉已 5 着，下着将超限，请尽快变招');
+    expect(rs.noticeKey).toBe('red-zhuo-5');
+    expect(rs.banMoves).toEqual([]);
+    // 第 6 捉（下着）照常能走：此刻尚未超限，继续追捉的车 (4,3)→(3,3) 合法可走
+    const next = play(s, 9, 3, 0);
+    expect(next.ruleState!.red.zhuoCounts['9']).toBe(5);
+    expect(next.ruleState!.banActive).toBe(false);
+    expect(getValidMoves(next, 23)[3][3]).toBe(true);
   });
 });
 

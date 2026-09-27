@@ -1,3 +1,6 @@
 packages:
   - client
-  - server
+
+# 注意：真正的服务端在仓库根下的 ../chinese-chess-server/，
+# 它是独立的部署包（只有 dist/ 与 ruleEngine.cjs，没有 src/），
+# 不属于本 pnpm workspace，请在其目录内独立执行。

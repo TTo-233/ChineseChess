@@ -53,8 +53,9 @@ interface ChessBoardProps {
   capturedStripOffset?: number;
   /** 吃子/将军特效（seq 变化时重播），null/不传表示无特效 */
   moveEffect?: MoveEffect | null;
-  /** 长将长捉禁着列表（方案 10.1）：被禁方的禁着落点以红色禁止标记高亮，
-   *  仅供当前走子方为被禁方时传入；null/不传表示无禁着 */
+  /** 长将长捉超限落点警示（方案 10 娱乐向改造）：超限方的「继续长将/长捉」落点以红色标记高亮，
+   *  仅供当前走子方为超限方时传入；null/不传表示无超限。
+   *  ⚠️ 纯警示：这些落点**可以正常点击落子**，不拦截、不判负 */
   banMoves?: { pieceId: number; toCol: number; toRow: number }[] | null;
   /** 棋盘容器实际渲染尺寸（缩放后的宽/高）回调：供父级做浮层对齐（如绝杀特效锁定棋盘中心）。
    *  注意：外层容器宽度恒为屏宽，此回调返回的才是棋盘本体的真实宽度。 */
@@ -602,8 +603,8 @@ export default function ChessBoard({
     ];
   }, [hintMove, gameState.pieces, getPos, pieceSize, unitScale]);
 
-  // 渲染长将长捉禁着标记（方案 10.1「棋盘上高亮被禁止的着法」）：
-  // 被禁着落点绘制红色禁止符号（圆环 + 对角斜杠），与提示落点同样不拦截触摸
+  // 渲染长将长捉超限落点警示（方案 10 娱乐向改造「棋盘上高亮会继续长将/长捉的着法」）：
+  // 超限落点绘制红色警示符号（圆环 + 对角斜杠），与提示落点同样不拦截触摸——可正常落子
   const banMarkers = useMemo(() => {
     if (!banMoves || banMoves.length === 0) return null;
     const markSize = Math.max(18, pieceSize * 0.6);

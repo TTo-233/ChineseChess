@@ -299,12 +299,13 @@ function isOnlineMoveLegal(state: GameState, piece: PieceState, toCol: number, t
  * 正常情况下服务端引擎携带对局历史搜索，已会主动规避此类违规着法；此守卫是兜底防线，
  * 覆盖开局库命中（开局库不感知历史）等极端场景，避免 AI 走出立即判负的着法。
  * 走子方因重复局面被判和（不变作和）或获胜（对方违规）属于正常结果，不予拦截。
- * 长将长捉禁着期间（方案 10.3）禁对着法同样拦截，云端开局库不感知禁着状态。
+ * 长将长捉超限期间（方案 10 娱乐向改造）超限着法同样被 AI 择优剔除：超限不判负，
+ * 但走进去会陷入僵局（最终由自然限招/互长将互长捉判和收场）。云端开局库不感知超限状态。
  *
- * @returns true=走法可用；false=走子方会因此着法被判负或违反禁着，应回退本地
+ * @returns true=走法可用；false=走子方会因此着法被判负或触发超限僵局，应回退本地
  */
 function isOnlineMoveRuleSafe(state: GameState, pieceId: number, toCol: number, toRow: number): boolean {
-  // 禁着拦截（走子方为被禁方且该着法在禁着列表内）
+  // 超限着法剔除（走子方为超限方且该着法在超限列表内）——择着偏好，非落子限制
   if (isMoveBanned(state, pieceId, toCol, toRow)) return false;
   const moverSide: SideTag = state.sideTag;
   try {

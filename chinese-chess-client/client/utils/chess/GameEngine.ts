@@ -92,45 +92,67 @@ function toPiecePositions(pieces: PieceState[]) {
 }
 
 /**
- * 获取指定棋子的合法移动位置
- * 成熟规则：在伪合法走法基础上，过滤走后己方将/帅仍被攻击的走法（含飞将规则）
+ * 获取指定棋子的可选落点（仅按棋子自身走法判定）
+ *
+ * 规则口径：车马炮的阻挡、象的塞眼、兵的过河、将帅的九宫、士的斜线等，全部走 MoveCheck 的
+ * 棋子级走法；**不做**"走后己方将/帅仍被攻击（含飞将/白脸将）"的王安全过滤。
+ * 因此被将军时玩家仍能看到该棋子全部走点，既避免了只剩应将点的"变相提示"，
+ * 也允许玩家主动送出将/帅（送将后由对方走完一步即算终局，风险自负）。
+ *
+ * 走子方限制仍然保留：非当前走棋方的棋子不返回落点（界面本就只允许选己方棋子）。
  */
-export function getValidMoves(state: GameState, pieceId: number): boolean[][] {
-  if (pieceId < 0 || pieceId > 31) {
-    return Array.from({ length: 9 }, () => Array(10).fill(false));
-  }
+export function getSelectableMoves(state: GameState, pieceId: number): boolean[][] {
+  const empty = () => Array.from({ length: BOARD_COLS }, () => Array(BOARD_ROWS).fill(false));
+  if (pieceId < 0 || pieceId > 31) return empty();
   const piece = state.pieces[pieceId];
-  if (!piece.alive) {
-    return Array.from({ length: 9 }, () => Array(10).fill(false));
-  }
+  if (!piece.alive) return empty();
 
   // 只有走棋方的棋子才能移动
   const pieceSide = pieceId <= 15 ? BLACK_SIDE : RED_SIDE;
-  if (pieceSide !== state.sideTag) {
-    return Array.from({ length: 9 }, () => Array(10).fill(false));
-  }
+  if (pieceSide !== state.sideTag) return empty();
 
-  const positions = toPiecePositions(state.pieces);
-  const points = getPathPoints(pieceId, state.qiPan, positions);
-
+  const points = getPathPoints(pieceId, state.qiPan, toPiecePositions(state.pieces));
   // 排除自身位置
   points[piece.col][piece.row] = false;
-
-  // 过滤走后己方将/帅仍被攻击（含两将照面）的非法走法
-  for (let c = 0; c < 9; c++) {
-    for (let r = 0; r < 10; r++) {
-      if (points[c][r] && afterMoveStillJiangJun(pieceId, piece.col, piece.row, c, r, state.qiPan, positions)) {
-        points[c][r] = false;
-      }
-    }
-  }
-
   return points;
 }
 
 /**
- * 检查是否被将军
+ * 获取指定棋子的可落点（走法裁决口径，与 getSelectableMoves 同一套规则）
+ *
+ * 成熟规则：仅按棋子自身走法判定（车马炮阻挡、象眼、兵过河等），不过滤"走后己方被将军"。
+ * 本函数是走子执行 / AI 走法 / 服务端校验的唯一口径，getValidMoves 与 getSelectableMoves
+ * 的返回值始终一致——保留 getValidMoves 这个名字只为兼容既有调用点与 ruleEngine.cjs 导出。
+ */
+export function getValidMoves(state: GameState, pieceId: number): boolean[][] {
+  return getSelectableMoves(state, pieceId);
+}
+
+/**
+ * 检查是否被将军（走子**前**的局面）
  * @returns [被将军方(0=黑将,16=红帅,-1=无), 攻击棋子1(-1=无), 攻击棋子2(-1=无)]
+ *
+ * ============================================================================
+ * 【唯一真源 / SINGLE SOURCE OF TRUTH】与 afterMoveStillJiangJun 同属三端
+ * （UI / AI 引擎 / 服务端裁决）合法着法判定的唯一真源。
+ * 任何修改必须同步三端，并跑 node _review/probe_diff_head.cjs 验证：
+ * 「消失的可选点」为 0、「合法着法指纹差异」为 0、「终局判定差异」为 0。
+ * 服务端产物 chinese-chess-server/ruleEngine.cjs 由
+ * client/utils/chess/ruleEngine.bundle.ts 经 esbuild 重新打包生成，勿手改。
+ *
+ * 【特别注意 · 不得当作 bug 修掉的语义】本函数**不检查将帅照面**。
+ * 下方两个循环只扫 5..15（红子，攻击红帅 16）与 21..31（黑子，攻击黑将 0）
+ * 这些非将子，敌方将/帅不在扫描区间内 —— 所以"将帅照面"在这里不算被将军。
+ * 照面由 afterMoveStillJiangJun 的飞将段单独判定（走子后），或由 AIEngine 的
+ * areGeneralsFacing 判定。切勿在重构成统一走法生成函数时把照面并入本函数：
+ * 引擎语义下"走完造成照面"的着法是**合法**的（实测走完后 isJiangJun=false、
+ * hasAnyLegalMove=true），并进去会让一批合法着法凭空消失。
+ *
+ * 与 afterMoveStillJiangJun 的分工：
+ *   · 本函数  = 静态判据，回答"当前这个局面谁在被将"。
+ *   · after…  = 动态判据，回答"假设走了这步，己方是否还会被将"（含飞将段）。
+ * AI 引擎的 isSideInCheck / isGeneralAttacked 必须同时覆盖这两段语义。
+ * ============================================================================
  */
 export function isJiangJun(state: GameState, jiangOrShuai: number): number[] {
   const result = [-1, -1, -1];

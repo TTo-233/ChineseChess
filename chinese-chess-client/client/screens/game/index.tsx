@@ -16,7 +16,7 @@ import {
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Screen } from '@/components/Screen';
-import { AppDialog } from '@/components/Modal';
+import { AppDialog, GameNotice, type GameNoticeItem } from '@/components/Modal';
 import { useSafeRouter, useSafeSearchParams } from '@/hooks/useSafeRouter';
 import { useNavigation } from 'expo-router';
 import { FontAwesome6 } from '@expo/vector-icons';
@@ -28,6 +28,7 @@ import { MOVE_EFFECT_DURATION_MS } from '@/components/MoveEffectOverlay';
 import {
   createInitialState,
   createFromFen,
+  getSelectableMoves,
   getValidMoves,
   makeMove,
   undoMove,
@@ -36,7 +37,7 @@ import {
 } from '@/utils/chess/GameEngine';
 import { getBestMoveAsync, precomputeHint, cancelHintPonder, recordHistoryHash, clearHistoryHash, computeZobristHash } from '@/utils/chess/AIEngine';
 import { getHybridBestMove, getHybridHintMove, getOnlineAiStatus, type AISource, type HybridMoveResult } from '@/utils/chess/aiDispatcher';
-import { isMoveBanned, recordBanViolation, enumerateLegalMoves } from '@/utils/chess/RuleEngine';
+import { isMoveBanned, enumerateLegalMoves } from '@/utils/chess/RuleEngine';
 import { playSound, playJiangJunSound, unloadAllSounds, preloadSounds, preloadGameEndSounds } from '@/utils/SoundManager';
 import { RED_SIDE, BLACK_SIDE } from '@/utils/chess/types';
 import { saveGame, loadGame, deleteSave, type GameSave } from '@/utils/GameSave';
@@ -244,8 +245,10 @@ export default function GameScreen() {
       note: `难度·${diffLabel}`,
     }).catch(() => undefined);
   }, [isEndgame, currentPlayerSide, difficulty]);
-  // 残局闯关：本局胜负（win=玩家过关 / lose=挑战失败），用于结算按钮区分
-  const endgameResultRef = useRef<'win' | 'lose' | null>(null);
+  // 残局闯关：本局结局（win=玩家过关 / lose=被将死或棋差 / draw=未能在限招内取胜），
+  // 用于结算按钮与文案区分。draw 必须与 lose 区分：自然限招/无进攻子力/重复局面
+  // 判和都不是「闯关成功」，也不能当成「挑战失败，再接再厉」的战败提示。
+  const endgameResultRef = useRef<'win' | 'lose' | 'draw' | null>(null);
   // 吃子/将军特效（含连续将军节流策略）
   const { moveEffect, triggerMoveEffect } = useMoveEffect();
 
@@ -334,20 +337,17 @@ export default function GameScreen() {
   // 棋盘内容宿主顶边相对页面内容顶边的 Y（含顶部栏与顶部安全区）：预算封顶时用于推算可用高度
   const [drawerHostY, setDrawerHostY] = useState(0);
 
-  // 长将长捉规则提示横幅（接近阈值"请尽快变招"/达到阈值"禁着请变招"/违规警告，
-  // 方案 10.3 / 12）：短暂展示后自动消失
-  const [ruleNotice, setRuleNotice] = useState<string | null>(null);
-  const ruleNoticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // 长将长捉规则提示（接近阈值"请尽快变招"/达到阈值"禁着请变招"/违规警告，
+  // 方案 10.3 / 12）：与联机对战一致，统一用覆盖在棋盘中央的 GameNotice 横幅
+  // （centerY 的换算依赖下方 jueshaBoardFrame，故放在它之后）
+  const [ruleNotice, setRuleNotice] = useState<GameNoticeItem | null>(null);
+  const ruleNoticeSeqRef = useRef(0);
   const showRuleNotice = useCallback((text: string) => {
-    setRuleNotice(text);
-    if (ruleNoticeTimerRef.current) clearTimeout(ruleNoticeTimerRef.current);
-    ruleNoticeTimerRef.current = setTimeout(() => setRuleNotice(null), 3500);
+    // key 自增：即使用户连点触发同一文案，也保证重新计时
+    ruleNoticeSeqRef.current += 1;
+    setRuleNotice({ key: `rule-${ruleNoticeSeqRef.current}`, text });
   }, []);
-  useEffect(() => {
-    return () => {
-      if (ruleNoticeTimerRef.current) clearTimeout(ruleNoticeTimerRef.current);
-    };
-  }, []);
+  const hideRuleNotice = useCallback(() => setRuleNotice(null), []);
 
   // 棋盘高度预算 + 垂直定位留白（二分求解，口径与抽屉真实尺寸一致）：
   // 条件 1 —— 棋盘顶边上方常驻预留「AI 角标行(30) + 摘要条悬浮区(38+30) + 抽屉展开高度」，
@@ -418,6 +418,14 @@ export default function GameScreen() {
     };
   }, [boardFrame, boardSize]);
 
+  // 长将长捉提示条（GameNotice）的棋盘中心纵坐标：挂载点 capturedDrawerHost 与
+  // boardFrame 的测量基准（根容器）相差 drawerHostY，需换算到同一坐标系；
+  // 缺测量时返回 undefined，由 GameNotice 退回容器 50% 居中（口径同联机对战页）
+  const ruleNoticeCenterY = useMemo(() => {
+    if (!jueshaBoardFrame) return undefined;
+    return jueshaBoardFrame.y + jueshaBoardFrame.height / 2 - drawerHostY;
+  }, [jueshaBoardFrame, drawerHostY]);
+
   // 动画
   const shakeAnim = useRef(new Animated.Value(0)).current;
 
@@ -481,8 +489,9 @@ export default function GameScreen() {
         setAiDepth(aiMove.depth ?? null);
         setAiEngine(aiMove.engine ?? null);
 
-        // 长将长捉禁着防御（方案 10.3）：AI 搜索根节点已过滤禁着、云端着法经调度器
-        // 守卫拦截，此处为最后兜底——若仍返回禁着着法则改走任意非禁着合法着
+        // 长将长捉超限时的 AI 择优（方案 10 娱乐向改造）：落子本身不再被拦截，
+        // 但 AI 仍优先选择「变招」着法（搜索根节点已过滤超限着、云端着法经调度器
+        // 守卫过滤），此处为最后兜底——AI 不会主动去送长将/长捉僵局。
         if (isMoveBanned(currentState, aiMove.pieceId, aiMove.toCol, aiMove.toRow)) {
           const alternatives = enumerateLegalMoves(currentState, currentState.sideTag)
             .filter(m => !isMoveBanned(currentState, m.pieceId, m.toCol, m.toRow));
@@ -498,7 +507,7 @@ export default function GameScreen() {
           aiMove.toRow
         );
 
-        // 规则提示（AI 走子触发，如"AI 长将禁着，请变招"等待玩家应对的场景）
+        // 规则提示（AI 走子触发，如"长将已 N 着，下着将超限"等待玩家应对的场景）
         if (newState.ruleState?.notice) {
           showRuleNotice(newState.ruleState.notice);
         }
@@ -554,10 +563,15 @@ export default function GameScreen() {
           setGameOverReason(gameOverReason);
           setJueShaVisible(true);
           // AI 走棋终局不一定 AI 胜（AI 长将未变招时判 AI 负）→ 引擎判定真实胜方
-          const aiWon = getWinnerSideTag(newState) === aiSideTag;
+          const isDraw = newState.gameStatus === 'draw';
+          // 和棋必须先于胜负判定：getWinnerSideTag 对和棋返回 null，
+          // 若不先拦下，aiWon 恒为 false 会被误记成「玩家过关」。
+          const aiWon = !isDraw && getWinnerSideTag(newState) === aiSideTag;
           if (isEndgame) {
-            endgameResultRef.current = aiWon ? 'lose' : 'win'; // AI 胜=挑战失败；AI 被判负=挑战成功
-            if (!aiWon && currentEndgame) {
+            // AI 被判负（玩家守和成功）才算闯关成功；和棋与玩家战败都算失败。
+            // 注意：只有真正 win 才写通关记录，draw 绝不能调 markLevelCompleted。
+            endgameResultRef.current = isDraw ? 'draw' : aiWon ? 'lose' : 'win';
+            if (!isDraw && !aiWon && currentEndgame) {
               // AI 被判负等同玩家过关：同样记录通关与评级（本路径玩家未消耗提示）
               if (currentEndgame.levelIndex >= 0) {
                 markLevelCompleted(currentEndgame.levelIndex, ENDGAME_HINT_LIMIT - endgameHintLeft);
@@ -615,10 +629,10 @@ export default function GameScreen() {
       if (!isPlayerPiece) return;
 
       setSelectedPieceId(pieceId);
-      const moves = getValidMoves(gameState, pieceId);
+      // 落点提示仅按棋子自身走法判定（不因被将军而只剩应将点，避免变相提示）
+      const moves = getSelectableMoves(gameState, pieceId);
       setValidMoves(moves);
-      return;
-    }
+      return;    }
 
     // 如果点击的是对方棋子，且已选中己方棋子，尝试吃子
     if (selectedPieceId !== null && validMoves) {
@@ -654,8 +668,8 @@ export default function GameScreen() {
 
   // 执行走棋
   const executeMove = useCallback(async (pieceId: number, toCol: number, toRow: number) => {
-    // 兜底校验：落点必须在该棋子当前合法走法内（基于棋子本身走法 + 王安全过滤），
-    // 即使界面落点状态过期，也杜绝任何非法落子
+    // 兜底校验：落点必须在该棋子的走法规则内（仅棋子自身走法，不含王安全过滤）。
+    // 即使界面落点状态过期，也杜绝任何不合规则的落子
     const legalMoves = getValidMoves(gameState, pieceId);
     if (!legalMoves[toCol]?.[toRow]) {
       setSelectedPieceId(null);
@@ -663,41 +677,10 @@ export default function GameScreen() {
       return;
     }
 
-    // 长将长捉禁着拦截（方案 10.1/10.3：禁着期间客户端不得提交禁着）：
-    // 点击禁着点 → 提示"请变招"并累计违规；连续 3 次坚持禁着自动判负
-    if (isMoveBanned(gameState, pieceId, toCol, toRow)) {
-      const rs = gameState.ruleState!;
-      const playerSideTag = currentPlayerSide === 'red' ? RED_SIDE : BLACK_SIDE;
-      const banLabel = rs.banReason === 'LONG_CHECK' ? '长将'
-        : rs.banReason === 'LONG_CHASE' ? '长捉' : '将捉';
-      const violation = recordBanViolation(rs, playerSideTag);
-      if (violation === 'lose' || violation === 'draw') {
-        // 连续 3 次坚持禁着 → 自动判负（方案 10.1）；双方均拒绝变着 → 判和（方案 2.4）
-        const reason = violation === 'draw' ? 'repetition'
-          : rs.banReason === 'LONG_CHECK' ? 'changjiang' : 'changzhuo';
-        const finalState: GameState = {
-          ...gameState,
-          gameStatus: violation === 'draw' ? 'draw'
-            : playerSideTag === RED_SIDE ? 'black_win' : 'red_win',
-        };
-        setGameState(finalState);
-        setGameOverReason(reason);
-        setJueShaVisible(true);
-        endgameResultRef.current = 'lose';
-        if (isEndgame) {
-          deleteEndgameBattle();
-        } else {
-          deleteSave();
-          savePveReplay(finalState, false);
-        }
-        showRuleNotice(violation === 'draw' ? '双方均拒绝变着，判和' : `${banLabel}违规三次，判负`);
-        return;
-      }
-      const count = rs.banViolations[currentPlayerSide] ?? 0;
-      showRuleNotice(`${banLabel}禁着，请变招（已违规 ${count} 次，满 3 次判负）`);
-      return;
-    }
-
+    // 长将长捉超限（方案 10 娱乐向改造）：**不拦截落子、不判负**。
+    // 达到长将 6/12/18 或长捉 6 着后，仅由 banMoves 在棋盘上标红提示
+    // 「走这里会继续长将/长捉」，同时提示条提醒尽快变招；
+    // 双方僵持不下由自然限招（120 着）与互长将/互长捉判和收场。
     clearHint(); // 走子后提示失效
     cancelHintPonder(); // 玩家走棋：立即中止后台提示预计算，算力让给 AI 思考
     const { newState, captured, isCheck, isGameOver, gameOverReason } = makeMove(
@@ -748,7 +731,7 @@ export default function GameScreen() {
       // 所有对局结束原因均播放绝杀特效，特效持续显示（含按钮）
       setGameOverReason(gameOverReason);
       setJueShaVisible(true);
-      // 走棋方不一定获胜（长将/长捉判负、不变作和）→ 统一由引擎判定胜方
+      // 走棋方不一定获胜（二将一还时长将方判负、不变作和）→ 统一由引擎判定胜方
       const isDraw = newState.gameStatus === 'draw';
       const playerWon = !isDraw && getWinnerSideTag(newState) === playerSideTag;
       if (isEndgame && currentEndgame) {
@@ -764,8 +747,12 @@ export default function GameScreen() {
             // 自定义残局：同样按提示次数记录金/银/铜冠评级
             markCustomCompleted(currentEndgame.customId, ENDGAME_HINT_LIMIT - endgameHintLeft);
           }
+        } else if (isDraw) {
+          // 残局闯关：和棋（自然限招/无进攻子力/重复局面）＝ 未能按时取胜，不是战败
+          endgameResultRef.current = 'draw';
+          deleteEndgameBattle();
         } else {
-          // 残局闯关：玩家走棋被判负（如长将未变招）或和棋 → 挑战失败
+          // 残局闯关：玩家走棋被判负（如长将未变招）→ 挑战失败
           endgameResultRef.current = 'lose';
           deleteEndgameBattle();
         }
@@ -1162,14 +1149,6 @@ export default function GameScreen() {
               </View>
             </View>
 
-            {/* 长将长捉规则提示横幅（方案 12 文案）：接近阈值/禁着/违规警告 */}
-            {ruleNotice && !jueShaVisible && (
-              <View style={styles.ruleNoticeBanner}>
-                <FontAwesome6 name="triangle-exclamation" size={14} color="#8a5a00" />
-                <Text style={styles.ruleNoticeText}>{ruleNotice}</Text>
-              </View>
-            )}
-
             {/* 棋盘几何测量包裹层：绝杀特效据此锁定棋盘中心/底边（collapsable=false 保证 Android 可测量） */}
             <View ref={boardRef} onLayout={measureBoardFrame} collapsable={false}>
             <ChessBoard
@@ -1293,6 +1272,15 @@ export default function GameScreen() {
             )}
           </View>
           </View>
+
+          {/* 长将长捉规则提示（方案 12 文案）：接近阈值/禁着/违规警告。
+              与联机对战页同款 GameNotice —— 绝对定位在棋盘中心、pointerEvents="box-none"
+              不阻塞落子、3s 后自动淡出；绝杀特效展示期间让位避免与结算文字重叠。 */}
+          <GameNotice
+            notice={jueShaVisible ? null : ruleNotice}
+            centerY={ruleNoticeCenterY}
+            onHide={hideRuleNotice}
+          />
         </View>
 
         {/* 绝杀特效（含结果与按钮，替代结算弹窗） */}
@@ -1308,16 +1296,22 @@ export default function GameScreen() {
             : gameOverReason === 'total_limit' ? '达到总步数上限，判和！'
             : gameOverReason === 'no_attacking' ? '双方无进攻子力，判和！'
             : '双方不变，和棋！';
-          // 残局闯关结算：胜利 → 下一关（若有）+ 返回选关；失败/和棋 → 重新挑战 + 返回选关
+          // 残局闯关结算：胜利 → 下一关（若有）+ 返回选关；和棋/失败 → 重新挑战 + 返回选关
           if (isEndgame && currentEndgame) {
-            const won = endgameResultRef.current === 'win';
+            const outcome = endgameResultRef.current;
+            const won = outcome === 'win';
+            // 和棋单独成句：残局里没在限招内取胜就是挑战超时，不该显示成「闯关成功」，
+            // 也不该复用「挑战失败，再接再厉」的战败口吻。
+            const drawResultText = `挑战超时，请重试（${drawText}）`;
             const hasNext = currentEndgame.levelIndex >= 0 && currentEndgame.levelIndex + 1 < BUILTIN_ENDGAMES.length;
             return (
               <JueShaOverlay
                 visible={jueShaVisible}
                 boardFrame={jueshaBoardFrame}
                 showEffect={showJueEffect}
-                resultText={won ? '闯关成功！' : isDrawGame ? drawText : '挑战失败，再接再厉！'}
+                resultText={
+                  won ? '闯关成功！' : outcome === 'draw' ? drawResultText : '挑战失败，再接再厉！'
+                }
                 onNextLevel={won && hasNext ? handleNextLevel : undefined}
                 onPlayAgain={won && hasNext ? undefined : handlePlayAgain}
                 primaryText={won ? '再玩一次' : '重新挑战'}
@@ -1326,7 +1320,7 @@ export default function GameScreen() {
               />
             );
           }
-          // 规则终局的判负方：gameStatus 的胜方对面即违规方（长将/长捉）
+          // 规则终局的判负方：gameStatus 的胜方对面即违规方（二将一还时长将方判负）
           const ruleLoserName = gameState.gameStatus === 'black_win' ? '红方' : '黑方';
           return (
             <JueShaOverlay
@@ -1340,8 +1334,6 @@ export default function GameScreen() {
                   ? (gameState.sideTag === RED_SIDE ? '红方' : '黑方') + '被困毙！'
                   : gameOverReason === 'changjiang'
                   ? ruleLoserName + '长将判负！'
-                  : gameOverReason === 'changzhuo'
-                  ? ruleLoserName + '长捉判负！'
                   : isDrawGame
                   ? drawText
                   : ((gameOverReason === 'red_win' && currentPlayerSide === 'red') ||
@@ -1403,26 +1395,6 @@ export default function GameScreen() {
 }
 
 const styles = StyleSheet.create({
-  // 长将长捉规则提示横幅（接近阈值/禁着/违规警告）
-  ruleNoticeBanner: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 6,
-    alignSelf: 'center',
-    backgroundColor: '#FFF7E0',
-    borderWidth: 1,
-    borderColor: '#E8C96A',
-    borderRadius: 8,
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-    marginBottom: 6,
-    maxWidth: '92%',
-  },
-  ruleNoticeText: {
-    fontSize: FONT.body,
-    color: '#8a5a00',
-    flexShrink: 1,
-  },
   container: {
     flex: 1,
     backgroundColor: COLORS.bg,

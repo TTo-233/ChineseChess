@@ -6,8 +6,9 @@
  * - 每步走子后的判定流程（方案 5）：将军检测 → 捉子检测 → 计数更新 → 重复检测 → 阈值检查
  * - 捉子检测（方案 7）：走子后能够造成下一着吃掉对方无根子（假根视为无根），
  *   带特殊子力豁免（兵卒将帅长捉允许、未过河兵卒不算、单/双炮捉车不算、同类互献不算）
- * - 禁着与变招（方案 10）：达到阈值后强制禁着（banMoves 列表），变招后自动解除，
- *   连续 3 次坚持禁着自动判负（双方均拒绝变着判和）
+ * - 长将长捉超限（方案 10，娱乐向改造）：达到阈值后**不拦截落子、不判负**，
+ *   仅生成 banMoves 红点警示并在提示条中提醒「请尽快变招」；双方僵持不下由
+ *   自然限招/互长将互长捉判和收场（方案 2.1.2 / 2.2.3 / 2.4）
  * - 判和体系（方案 2.4）：互长将/互长捉/非将非捉重复 5 次/自然限招 120 着/
  *   将军累计 40 着/总步数 400 着/双方无进攻子力
  * - 二将一还（方案 2.1.3）：对方还过将时长将方直接判负
@@ -17,7 +18,7 @@
  * - 纯函数、无 UI 依赖，客户端（人机/残局/联机/复盘）与服务端（ruleEngine.cjs）共用
  * - RuleState 挂载于 GameState.ruleState 随状态序列化，断线重连/存档恢复天然支持
  * - 本模块不依赖 GameEngine（避免循环依赖），基础走法能力直接构建于 MoveCheck 之上
- * - 性能：单步判定 < 50ms（方案 15.1）；detectZhuo 攻击图单次构建、banMoves 仅禁着时生成
+ * - 性能：单步判定 < 50ms（方案 15.1）；detectZhuo 攻击图单次构建、banMoves 仅超限时生成
  */
 
 import {
@@ -52,8 +53,6 @@ export const RULE_CONFIG = {
   checkCountLimit: 40,
   /** 双方累计总着数上限（方案 2.4） */
   totalMoveLimit: 400,
-  /** 连续坚持禁着自动判负次数（方案 10.1） */
-  banViolationLimit: 3,
 } as const;
 
 // ---------------------------------------------------------------------------
@@ -371,7 +370,6 @@ export function createInitialRuleState(state: GameState): RuleState {
     banReason: null,
     banChaseTargets: [],
     banMoves: [],
-    banViolations: { red: 0, black: 0 },
     notice: null,
     noticeKey: null,
   };
@@ -400,7 +398,6 @@ export function cloneRuleState(r: RuleState): RuleState {
     banReason: r.banReason,
     banChaseTargets: [...r.banChaseTargets],
     banMoves: r.banMoves.map(m => ({ ...m })),
-    banViolations: { ...r.banViolations },
     notice: r.notice,
     noticeKey: r.noticeKey,
   };
@@ -416,7 +413,7 @@ function resetSideCounters(s: SideRuleCounters) {
 }
 
 // ---------------------------------------------------------------------------
-// 禁着
+// 禁着（娱乐向改造：仅红点警示，不拦截、不判负）
 // ---------------------------------------------------------------------------
 
 /** 长将允许着数（按参与子数分档：1 子 6 / 2 子 12 / 3 子及以上 18，方案 2.1.1） */
@@ -432,10 +429,13 @@ function checkChaseLimit(pieceCount: number): number {
 }
 
 /**
- * 生成禁着列表（方案 10.2）：banActive 时枚举被禁方全部合法着法，按 banReason 分类：
+ * 生成禁着列表（方案 10.2）：超限时枚举该方全部合法着法，按 banReason 分类标红：
  * - LONG_CHECK：模拟后构成将军的着法
  * - LONG_CHASE：模拟后捉到触发阈值目标子的着法
- * - CHECK_CHASE：模拟后构成将军或有效捉的着法（禁将捉组合，必须变招）
+ * - CHECK_CHASE：模拟后构成将军或有效捉的着法（将捉组合）
+ *
+ * ⚠️ 娱乐向改造：这些点**仅用于棋盘标红警示**，不再阻止落子、不计入违规、
+ * 不会导致判负。它们是「你走这里就会继续长将/长捉」的预告，不是禁止标记。
  */
 function buildBanMoves(state: GameState, banSide: SideTag, banReason: BanReason, chaseTargets: number[]): BanMove[] {
   const bans: BanMove[] = [];
@@ -454,7 +454,12 @@ function buildBanMoves(state: GameState, banSide: SideTag, banReason: BanReason,
   return bans;
 }
 
-/** 指定着法当前是否为禁着（提交前校验；非禁着激活或非被禁方恒为 false） */
+/**
+ * 指定着法当前是否被标红为「超限着法」（超限时枚举出该方全部会继续长将/长捉的落点）。
+ *
+ * ⚠️ 娱乐向改造：本函数**不再用于拦截落子**，只保留给 UI 查询「某点是否已被标红」
+ * 与 AI 的可选提示用。落子是否合法一律以 getValidMoves（棋子自身走法）为准。
+ */
 export function isMoveBanned(state: GameState, pieceId: number, toCol: number, toRow: number): boolean {
   const rs = state.ruleState;
   if (!rs || !rs.banActive || rs.banReason == null) return false;
@@ -463,17 +468,13 @@ export function isMoveBanned(state: GameState, pieceId: number, toCol: number, t
 }
 
 /**
- * 记录一次坚持禁着的违规（提交被拒后调用）。
- * @returns 'lose' 该方判负；'draw' 双方均拒绝变着判和（BOTH_BAN_REFUSE_CHANGE）；null 继续
+ * 上一着是否让该方「变招」（即上一着没有继续长将/长捉）——超限状态下 UI 用它
+ * 决定是否清除红点。变招 = 该方计数被清零（见 evaluateRuleAfterMove 的 resetSideCounters）。
  */
-export function recordBanViolation(rs: RuleState, side: SideTag): 'lose' | 'draw' | null {
-  const key = sideKey(side);
-  rs.banViolations[key] = (rs.banViolations[key] ?? 0) + 1;
-  if (rs.banViolations[key] >= RULE_CONFIG.banViolationLimit) {
-    const other = key === 'red' ? 'black' : 'red';
-    return (rs.banViolations[other] ?? 0) >= RULE_CONFIG.banViolationLimit ? 'draw' : 'lose';
-  }
-  return null;
+export function isBanCleared(state: GameState, side: SideTag): boolean {
+  const rs = state.ruleState;
+  if (!rs || !rs.banActive) return true;
+  return rs.banSide !== side;
 }
 
 // ---------------------------------------------------------------------------
@@ -539,15 +540,9 @@ export function evaluateRuleAfterMove(
   const mover = rs[sideKey(moverSide)];
   const opponent = rs[sideKey(opponentSide)];
 
-  // --- 变招解除（方案 4.2：BAN_ACTIVE + 玩家变招 → NORMAL） ---
-  // 被禁方走出非禁着（着法已被提交说明通过了校验层拦截）= 变招 → 清空其计数；
-  // 防御：若被禁方的禁着着法意外到达此处（校验层失效），同样清零并交由计数重建
-  if (rs.banActive && rs.banSide === moverSide) {
-    resetSideCounters(mover);
-    rs.banViolations[sideKey(moverSide)] = 0;
-  }
-
   // --- 计数更新（方案 3） ---
+  // 娱乐向改造下「变招」不再有拦截层兜底，改由下面的计数分支自然完成：
+  // 走一着不将不捉（或吃子）即 resetSideCounters(mover) → 红点随之消失。
   const zhuoList = isCheck ? [] : detectZhuo(afterState, moverSide);
 
   if (move.captured !== -1) {
@@ -649,15 +644,15 @@ export function evaluateRuleAfterMove(
     return finish(rs, true, 'changjiang', moverSide);
   }
 
-  // --- 禁着判定（强制变招，方案 10） ---
-  // 对双方分别检查阈值：对方超阈值时其禁着必须保留——对方上一步触发的禁着
+  // --- 长将长捉超限判定（方案 10，娱乐向改造：仅提示 + 红点，不拦截不判负） ---
+  // 对双方分别检查阈值：对方超限时其红点必须保留——对方上一步触发的超限
   // 不应因本方闲着而消失（直到对方变招清零计数）。本方（刚走子方）优先。
   const tryBan = (side: SideTag): { reason: BanReason; targets: number[] } | null => {
     const c = rs[sideKey(side)];
     const opp = rs[sideKey(!side as SideTag)];
     // 长将阈值：一子 6 / 两子 12 / 三子及以上 18（方案 2.1.1）
     if (c.jiangCount >= longCheckLimit(c.jiangPieceIds.length)) {
-      // 互相长将进行中（对方连将至 5+）：暂不禁着，待对方达到 6 判和（方案 2.1.2）
+      // 互相长将进行中（对方连将至 5+）：暂不提示超限，待对方到 6 判和（方案 2.1.2）
       if (opp.jiangCount < RULE_CONFIG.mutualLongCheckDraw - 1) {
         return { reason: 'LONG_CHECK', targets: [] };
       }
@@ -668,7 +663,7 @@ export function evaluateRuleAfterMove(
       .filter(k => c.zhuoCounts[k] >= RULE_CONFIG.longChase)
       .map(k => Number(k));
     if (targets.length > 0) {
-      // 互相长捉进行中（对方也有 5+ 捉计数）：暂不禁，待对方到 6 判和（方案 2.2.3）
+      // 互相长捉进行中（对方也有 5+ 捉计数）：暂不提示，待对方到 6 判和（方案 2.2.3）
       if (maxZhuoCount(opp) < RULE_CONFIG.mutualLongChaseDraw - 1) {
         return { reason: 'LONG_CHASE', targets };
       }
@@ -686,15 +681,19 @@ export function evaluateRuleAfterMove(
   const hit = moverBan ?? oppBan;
   const hitSide = moverBan ? moverSide : opponentSide;
 
+  /** 超限名称（长将 / 长捉 / 将捉交替），用于提示文案 */
+  const banName = (reason: BanReason): string =>
+    reason === 'LONG_CHECK' ? '长将' : reason === 'LONG_CHASE' ? '长捉' : '将捉交替';
+
   if (hit) {
+    // 超限：**不拦截落子、不判负**。仅生成红点警示并给出「请尽快变招」提示。
+    // 双方继续僵持不下的收场由自然限招（120 着）与互长将/互长捉判和承担。
     rs.banActive = true;
-    rs.banSide = hitSide; // 该方下一次走子时受限
+    rs.banSide = hitSide; // 红点标记该方「会继续长将/长捉」的落点
     rs.banReason = hit.reason;
     rs.banChaseTargets = hit.targets;
     rs.banMoves = buildBanMoves(afterState, hitSide, hit.reason, hit.targets);
-    rs.notice = hit.reason === 'LONG_CHECK'
-      ? '长将禁着，请变招'
-      : hit.reason === 'LONG_CHASE' ? '长捉禁着，请变招' : '将捉禁着，请变招';
+    rs.notice = `${banName(hit.reason)}已超限，请尽快变招`;
     rs.noticeKey = `${sideKey(hitSide)}-ban-${hit.reason}`;
   } else {
     rs.banActive = false;
@@ -703,20 +702,21 @@ export function evaluateRuleAfterMove(
     rs.banChaseTargets = [];
     rs.banMoves = [];
 
-    // 接近阈值提示（倒数第 2 着，方案 10.3 / 12；刚走子方优先，其次对方）
+    // 接近阈值提示（倒数第 2 着，方案 10.3 / 12；刚走子方优先，其次对方）：
+    // 提醒玩家「下一着就会超限」，超限后不再判负但会陷入僵局
     const noticeFor = (side: SideTag): { text: string; key: string } | null => {
       const c = rs[sideKey(side)];
       const checkLimit = longCheckLimit(c.jiangPieceIds.length);
       if (c.jiangCount >= checkLimit - 1 && c.jiangCount < checkLimit) {
-        return { text: '请尽快变招，避免长将判负', key: `${sideKey(side)}-jiang-${c.jiangCount}` };
+        return { text: `长将已 ${c.jiangCount} 着，下着将超限，请尽快变招`, key: `${sideKey(side)}-jiang-${c.jiangCount}` };
       }
       const zhuoMax = maxZhuoCount(c);
       if (zhuoMax >= RULE_CONFIG.longChase - 1 && zhuoMax < RULE_CONFIG.longChase) {
-        return { text: '请尽快变招，避免长捉判负', key: `${sideKey(side)}-zhuo-${zhuoMax}` };
+        return { text: `长捉已 ${zhuoMax} 着，下着将超限，请尽快变招`, key: `${sideKey(side)}-zhuo-${zhuoMax}` };
       }
       const jzLimit = checkChaseLimit(c.jiangZhuoPieceIds.length);
       if (c.jiangZhuoLoop >= jzLimit - 1 && c.jiangZhuoLoop < jzLimit) {
-        return { text: '请尽快变招，避免将捉判负', key: `${sideKey(side)}-jz-${c.jiangZhuoLoop}` };
+        return { text: `将捉交替已 ${c.jiangZhuoLoop} 着，下着将超限，请尽快变招`, key: `${sideKey(side)}-jz-${c.jiangZhuoLoop}` };
       }
       return null;
     };

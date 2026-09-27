@@ -1,6 +1,28 @@
 /**
  * 走棋规则检查 - 移植自 C# SuanFa/MoveCheck.cs
  * 负责计算每个棋子的合法移动位置
+ *
+ * ============================================================================
+ * 【唯一真源 / SINGLE SOURCE OF TRUTH】
+ * 本文件是三端（UI / AI 引擎 / 服务端裁决）走法与王安全判定的唯一实现：
+ *   · getPathPoints            —— 棋子自身走法（不含王安全语义）
+ *   · afterMoveStillJiangJun  —— 走完后是否仍被将军（含飞将/白脸将段）
+ * 任何一端都不得另写一套等价实现；服务端产物 chinese-chess-server/ruleEngine.cjs
+ * 由 chinese-chess-client/client/utils/chess/ruleEngine.bundle.ts 经 esbuild
+ * 重新打包生成（node _review/build_ruleengine.cjs），不要直接手改产物。
+ *
+ * 修改本文件后必须：
+ *   1. 同步三端语义（UI 走 GameEngine，AI 走 AIEngine.isGeneralAttacked，
+ *      服务端走 ruleEngine.cjs）。
+ *   2. 跑 node _review/probe_diff_head.cjs —— 随机局面新旧差分，要求
+ *      「消失的可选点」= 0、「合法着法指纹差异」= 0、「终局判定差异」= 0。
+ *
+ * 【不得当作 bug 修掉的语义】「将帅照面」在引擎里不是「被将军」。
+ * isJiangJun（GameEngine.ts）只扫非将子，不含照面；照面由本文件的
+ * afterMoveStillJiangJun 飞将段（走子后）与 AIEngine.areGeneralsFacing
+ * 单独判定。引擎语义下「走完造成照面」的着法是合法的，未来收口成统一
+ * 走法生成函数时不得把它并入攻击判定，否则会凭空禁掉一批合法着法。
+ * ============================================================================
  */
 
 import { BOARD_COLS, BOARD_ROWS } from './types';
@@ -61,7 +83,7 @@ export function fillPathPoints(
       break;
     case 5: case 6: case 21: case 22:
       // 马的移动
-      calcMa(col, row, moveQiZi, qiPan, points, piecePositions);
+      calcMa(col, row, moveQiZi, qiPan, points);
       break;
     case 3: case 4: case 19: case 20:
       // 相/象的移动
@@ -73,7 +95,7 @@ export function fillPathPoints(
       break;
     case 0: case 16:
       // 将/帅的移动
-      calcJiang(col, row, moveQiZi, qiPan, points, piecePositions);
+      calcJiang(col, row, moveQiZi, qiPan, points);
       break;
     case 9: case 10: case 25: case 26:
       // 炮的移动
@@ -96,6 +118,24 @@ export function fillPathPoints(
  * @param qiPan 当前棋盘数据 (9x10)
  * @param piecePositions 所有棋子位置 [{col, row, alive}]
  * @returns 返回 bool 二维数组 [9][10]，true 表示可以移动到该位置
+ *
+ * ============================================================================
+ * 【唯一真源 / SINGLE SOURCE OF TRUTH】本文件内所有 calcXxx 与
+ * afterMoveStillJiangJun 共用同一份走法口径，三端（UI / AI 引擎 / 服务端裁决）
+ * 都经由本函数取点，不允许任何一端另写一套。
+ *
+ * 口径边界（本函数**只**按棋子自身走法判定，不含任何王安全语义）：
+ *   · 不判断"走完是否被将军"——那由 afterMoveStillJiangJun 负责，属于
+ *     GameEngine.hasAnyLegalMove / isJueSha / isKunbi 的范畴。
+ *   · 不含飞将/白脸将语义。送将、甚至走完造成将帅照面，本函数都照常返回 true
+ *     （见 afterMoveStillJiangJun 顶部注释里"照面不是被将军"的说明）。
+ *   故 getValidMoves / getSelectableMoves 直接返回本函数的结果，送将合法。
+ *
+ * 任何修改必须同步三端，并跑 node _review/probe_diff_head.cjs 验证
+ * （"消失的可选点"必须为 0；合法着法指纹与终局判定差异必须为 0）。
+ * AI 引擎若出现"看不到必杀着法 / 漏看飞将"类问题，先怀疑调用方是否
+ * 绕过了本函数自建攻击判定（历史教训见 _review/probe_ai_mate.cjs）。
+ * ============================================================================
  */
 export function getPathPoints(
   moveQiZi: number,
@@ -132,11 +172,8 @@ function calcChe(col: number, row: number, moveQiZi: number, qiPan: number[][], 
 
 function calcMa(
   col: number, row: number, moveQiZi: number, qiPan: number[][],
-  points: boolean[][], piecePositions: Array<{ col: number; row: number; alive: boolean }>
+  points: boolean[][]
 ) {
-  // 检查将帅同列时是否为唯一棋子（蹩马腿的特殊情况）
-  if (justOneIsThis(moveQiZi, qiPan, piecePositions)) return;
-
   // 上
   if (row > 1 && qiPan[col][row - 1] === -1) {
     if (col > 0 && !isTongBang(moveQiZi, qiPan[col - 1][row - 2])) points[col - 1][row - 2] = true;
@@ -160,8 +197,6 @@ function calcMa(
 }
 
 function calcXiang(col: number, row: number, moveQiZi: number, qiPan: number[][], points: boolean[][]) {
-  if (justOneIsThis(moveQiZi, qiPan, [])) return;
-
   let side = 0;
   if (row <= 4) side = 5; // 上方相/象边界 0-4，下方相/象边界 5-9
 
@@ -186,8 +221,6 @@ function calcXiang(col: number, row: number, moveQiZi: number, qiPan: number[][]
 }
 
 function calcShi(col: number, row: number, moveQiZi: number, qiPan: number[][], points: boolean[][]) {
-  if (justOneIsThis(moveQiZi, qiPan, [])) return;
-
   let side = 0;
   if (row <= 4) side = 7;
 
@@ -203,75 +236,37 @@ function calcShi(col: number, row: number, moveQiZi: number, qiPan: number[][], 
   }
 }
 
+/**
+ * 将/帅的移动：九宫内直行一步（不越河、不出宫）
+ *
+ * 注意：此处不再做「两将照面（飞将/白脸将）」过滤。落点是否会造成照面属于
+ * 「走后己方将/帅是否仍被攻击」，与本棋子自身走法无关；若在此处依据对方
+ * 将/帅所在列及中间是否有子来裁剪落点，可选落点就会随对方将/帅位置变化，
+ * 形成变相提示。照面走法是否合法由 GameEngine 在终局判定
+ * （isJiangJun / hasAnyLegalMove / isJueSha / isKunBi）时统一裁决。
+ */
 function calcJiang(
   col: number, row: number, moveQiZi: number, qiPan: number[][],
-  points: boolean[][], piecePositions: Array<{ col: number; row: number; alive: boolean }>
+  points: boolean[][]
 ) {
   let side = 0;
   if (row <= 4) side = 7;
 
-  const jiang0Col = piecePositions[0].col;
-  const jiang0Row = piecePositions[0].row;
-  const jiang16Col = piecePositions[16].col;
-  const jiang16Row = piecePositions[16].row;
-
   // 下方
-  if (row !== (9 - side)) {
-    if (!isTongBang(moveQiZi, qiPan[col][row + 1])) {
-      if (jiang0Col !== jiang16Col) {
-        points[col][row + 1] = true;
-      } else {
-        if (moveQiZi === 0) {
-          for (let i = jiang0Row + 2; i < jiang16Row; i++) {
-            if (qiPan[col][i] !== -1) { points[col][row + 1] = true; break; }
-          }
-        }
-        if (moveQiZi === 16) {
-          points[col][row + 1] = true;
-        }
-      }
-    }
+  if (row !== (9 - side) && !isTongBang(moveQiZi, qiPan[col][row + 1])) {
+    points[col][row + 1] = true;
   }
   // 上方
-  if (row !== (7 - side)) {
-    if (!isTongBang(moveQiZi, qiPan[col][row - 1])) {
-      if (jiang0Col !== jiang16Col) {
-        points[col][row - 1] = true;
-      } else {
-        if (moveQiZi === 0) {
-          points[col][row - 1] = true;
-        }
-        if (moveQiZi === 16) {
-          for (let i = jiang0Row + 1; i < jiang16Row - 1; i++) {
-            if (qiPan[col][i] !== -1) { points[col][row - 1] = true; break; }
-          }
-        }
-      }
-    }
+  if (row !== (7 - side) && !isTongBang(moveQiZi, qiPan[col][row - 1])) {
+    points[col][row - 1] = true;
   }
   // 左方
-  if (col > 3) {
-    if (!isTongBang(moveQiZi, qiPan[col - 1][row])) {
-      if (((col - 1) === jiang0Col) || ((col - 1) === jiang16Col)) {
-        for (let i = jiang0Row + 1; i < jiang16Row; i++) {
-          if (qiPan[col - 1][i] !== -1) { points[col - 1][row] = true; break; }
-        }
-      } else {
-        points[col - 1][row] = true;
-      }
-    }
+  if (col > 3 && !isTongBang(moveQiZi, qiPan[col - 1][row])) {
+    points[col - 1][row] = true;
   }
   // 右方
-  if (col < 5) {
-    if (!isTongBang(moveQiZi, qiPan[col + 1][row])) {
-      if (((col + 1) === jiang0Col) || ((col + 1) === jiang16Col)) {
-        for (let i = jiang0Row + 1; i < jiang16Row; i++) {
-          if (qiPan[col + 1][i] !== -1) { points[col + 1][row] = true; break; }
-        }
-      } else {
-        points[col + 1][row] = true;
-      }
-    }
+  if (col < 5 && !isTongBang(moveQiZi, qiPan[col + 1][row])) {
+    points[col + 1][row] = true;
   }
 }
 
@@ -315,48 +310,25 @@ function calcPao(col: number, row: number, moveQiZi: number, qiPan: number[][], 
 }
 
 function calcHeiZu(col: number, row: number, moveQiZi: number, qiPan: number[][], points: boolean[][]) {
+  // 未过河（row <= 4）不得横走
   if (row < 9 && !isTongBang(moveQiZi, qiPan[col][row + 1])) {
     points[col][row + 1] = true;
   }
-  if (!justOneIsThis(moveQiZi, qiPan, []) && row <= 9 && row > 4) {
+  if (row > 4) {
     if (col > 0 && !isTongBang(moveQiZi, qiPan[col - 1][row])) points[col - 1][row] = true;
     if (col < 8 && !isTongBang(moveQiZi, qiPan[col + 1][row])) points[col + 1][row] = true;
   }
 }
 
 function calcHongBing(col: number, row: number, moveQiZi: number, qiPan: number[][], points: boolean[][]) {
+  // 未过河（row >= 5）不得横走
   if (row > 0 && !isTongBang(moveQiZi, qiPan[col][row - 1])) {
     points[col][row - 1] = true;
   }
-  if (!justOneIsThis(moveQiZi, qiPan, []) && row >= 0 && row < 5) {
+  if (row < 5) {
     if (col > 0 && !isTongBang(moveQiZi, qiPan[col - 1][row])) points[col - 1][row] = true;
     if (col < 8 && !isTongBang(moveQiZi, qiPan[col + 1][row])) points[col + 1][row] = true;
   }
-}
-
-/**
- * 将帅在同一列时，检查本棋子是否是将帅之间的唯一棋子
- */
-function justOneIsThis(
-  qiZi: number, qiPan: number[][],
-  piecePositions: Array<{ col: number; row: number; alive: boolean }>
-): boolean {
-  if (piecePositions.length === 0) return false;
-  const j0Col = piecePositions[0].col;
-  const j0Row = piecePositions[0].row;
-  const j16Col = piecePositions[16].col;
-  const j16Row = piecePositions[16].row;
-
-  if (j0Col !== j16Col) return false;
-  if (piecePositions[qiZi].col !== j0Col) return false;
-  if (piecePositions[qiZi].row < j0Row) return false;
-  if (piecePositions[qiZi].row > j16Row) return false;
-
-  let count = 0;
-  for (let i = j0Row + 1; i < j16Row; i++) {
-    if (qiPan[j0Col][i] !== -1) count++;
-  }
-  return count === 1;
 }
 
 /**
@@ -388,7 +360,32 @@ export function isKilledPoint(
 }
 
 /**
- * 棋子移动到指定位置后，本方是否还被将军
+ * 棋子移动到指定位置后，本方是否还被将军。
+ *
+ * ============================================================================
+ * 【唯一真源 / SINGLE SOURCE OF TRUTH】三端合法着法判定的唯一依据。
+ * 本函数是 GameEngine.hasAnyLegalMove / isJueSha / isKunBi 的底层判据，
+ * 也是 AIEngine.isGeneralAttacked 逐行对齐的参照（见下）。任何修改必须：
+ *   1. 同步三端——UI（chinese-chess-client/client/utils/chess/）、AI 引擎
+ *      （AIEngine.isGeneralAttacked）、服务端裁决（chinese-chess-server/
+ *      ruleEngine.cjs，由 client/utils/chess/ruleEngine.bundle.ts 经 esbuild
+ *      重新打包生成，勿直接手改产物）。
+ *   2. 跑 node _review/probe_diff_head.cjs 验证——它对随机局面做新旧差分，
+ *      要求"新增可选点"之外「消失的可选点」为 0、「合法着法指纹差异」与
+ *      「终局判定差异」均为 0。放宽规则会显著增加可选点，属预期；
+ *      但若指纹或终局判定出现非零差异，说明改动外溢到了不该动的地方。
+ *
+ * 【特别注意 · 不得当作 bug 修掉的语义】"将帅照面"在引擎里不是"被将军"。
+ * 本函数用两段独立的逻辑分别判定，二者语义不同、不可互相替代或合并：
+ *   · 飞将/白脸将段（下方 :338-355）：两将/帅同列且中间无子 ⇒ 判 true，
+ *     拦的是"走完之后自己把己方将帅送到对方炮口上"。
+ *   · 被攻击段（下方 :357+）：只扫 5..15（红子）与 21..31（黑子）这些
+ *     **非将子**，用 getPathPoints 判是否够得着。敌方将/帅（0 / 16）不在
+ *     扫描区间内——即"敌方将帅照面攻击我方将帅"在这一段里根本不算被将。
+ * 换言之，照面是否算"被将"完全取决于上面那段的独立判定，不要在重构成
+ * 统一走法生成函数时顺手把它并进攻击判定，那会让所有原本合法的照面着法
+ * 突然变成非法（历史上 AI 曾因此漏掉大量真实取胜着，见 _review/probe_ai_mate.cjs）。
+ * ============================================================================
  */
 export function afterMoveStillJiangJun(
   qiZi: number, x0: number, y0: number, x1: number, y1: number,
