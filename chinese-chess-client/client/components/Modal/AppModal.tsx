@@ -191,8 +191,14 @@ const styles = StyleSheet.create({
   mask: {
     flex: 1,
     zIndex: Z_INDEX.overlay,
-    // Android 上棋盘内部存在 elevation 层，仅 zIndex 不足以盖住，需同时给 elevation
-    elevation: ELEVATION.overlay,
+    // ⚠️ 这里刻意【不设】elevation。
+    // 遮罩是整屏透明/半透明底板，它本就在最顶层，elevation 对遮挡关系没有任何贡献；
+    // 但 Android 会把设了 elevation>0 的 View 提升为独立 RenderNode 离屏合成层。
+    // 遮罩一旦被提升，弹窗出现时底层页面会被拆成多个合成层逐层 alpha 混合，
+    // 在部分机型/色彩空间下会在合成层边界产生 1px 硬边的偏亮竖条（实机截图量到
+    // 屏幕中心 640 处约 108px 宽、幅度 2~24 级的亮带，且不覆盖不透明的弹窗卡片）。
+    // 真正的层级需求只是「卡片不能被棋盘内部 elevation 浮层压住」，
+    // 那一层由 styles.card 上的 elevation 承担，遮罩无需提升。
   },
   maskCenter: {
     backgroundColor: COLORS.modalOverlay,
