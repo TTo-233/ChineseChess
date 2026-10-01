@@ -7,7 +7,6 @@ import {
   StyleSheet,
   Animated,
   Easing,
-  Image,
   Dimensions,
   BackHandler,
   AppState,
@@ -33,9 +32,12 @@ import JueShaOverlay from '@/components/JueShaOverlay';
 import { AppDialog, AppModal, GameNotice, ModalButton, modalButtonRowStyle, type GameNoticeItem } from '@/components/Modal';
 import { useMoveEffect } from '@/hooks/useMoveEffect';
 import { useBoardFrame } from '@/hooks/useBoardFrame';
+import { useBattleClock } from '@/hooks/useBattleClock';
+import { useBattleStateSync } from '@/hooks/useBattleStateSync';
 import { playJiangJunSound, playSound, preloadSounds, unloadAllSounds } from '@/utils/SoundManager';
 import { getOnlineServerUrl } from '@/utils/serverConfig';
 import { BattleSocket } from '@/utils/battleSocket';
+import { isActionNotSent, BattleActionRejectedError, type BattleActionType, type BattleMove } from '@/utils/battleProtocol';
 import { saveReplay } from '@/utils/replayStorage';
 import { useBoardLayoutBudget, capHostHeightToViewport } from '@/utils/chess/capturedDrawerMetrics';
 import { boardAlignedRowStyle } from '@/utils/chess/boardContentWidth';
@@ -156,6 +158,14 @@ function EmojiBubble({ emoji, lifetime }: { emoji: string; lifetime: number }) {
   );
 }
 
+/**
+ * 对局页阶段机。
+ *
+ * ⚠️ `'countdown'` 是**保留值**：全仓库没有任何 setPhase('countdown')，它当前恒不成立。
+ * 选边倒計时用的是独立的 `countdown` 数字 state（阶段仍为 'reveal'）。下面的判断保留
+ * 该值是出于防御（若将来把选边倒计时提升为独立阶段即可直接生效），不要据此推断
+ * "存在一个倒计时阶段"。
+ */
 type GamePhase = 'waiting' | 'reveal' | 'countdown' | 'playing' | 'ended';
 
 export default function LanBattleScreen() {
@@ -178,7 +188,6 @@ export default function LanBattleScreen() {
     /** 房间名：由大厅创建/加入时随路由带入，保证首帧标题即为真实房间名（无需等轮询回填） */
     roomName?: string;
     side: string;
-    isHost: boolean;
   }>();
 
   const [gameState, setGameState] = useState<GameState>(createInitialState());
@@ -252,7 +261,6 @@ export default function LanBattleScreen() {
   const myReadyRef = useRef(false);
   // 进行中的准备请求数：>0 时忽略新的连点，防止并发请求互相覆盖
   const readyInFlightRef = useRef(0);
-  const rematchInFlightRef = useRef(false); // 重新对局请求在途标记：防止连点并发
   // 「返回房间」10s 兜底倒计时的剩余秒数：结算后开始计时（无论玩家是否已点），
   // 归零即自动切到房间准备界面，避免停在结算页干等对手。
   const [returnRoomCountdown, setReturnRoomCountdown] = useState<number | null>(null);
@@ -286,12 +294,11 @@ export default function LanBattleScreen() {
   const countdownTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   // 吃子/将军特效（含连续将军节流策略）
   const { moveEffect, triggerMoveEffect } = useMoveEffect();
-  // 轮询中识别"对手刚走了一步"：记录已见的着法数，结合最后一步的棋子归属避免自己走棋重复触发
-  const seenHistoryLenRef = useRef(0);
   // 本端走子乐观更新保护：上传在途时轮询可能先拿到走子前的旧局面，直接覆盖会让棋子
   // "回退"、待上传落地后又"重新移动"。记录本端着法后的着法数与时间，轮询到更旧的局面
   // 时跳过覆盖，直到服务端追上（着法数 >= 本端）再恢复同步；超时则判定上传失败放弃保护。
-  const pendingSyncRef = useRef<{ historyLen: number; at: number } | null>(null);
+  // 具体的判定与「只延迟局面块」的处理在 hooks/useBattleStateSync 内。
+  const pendingSyncRef = useRef<{ historyLen: number; at: number; snapshot: GameState } | null>(null);
   // 被吃棋子明细抽屉展开的一侧（null=收起），抽屉渲染在顶部标题行正下方
   const [capturedDrawerSide, setCapturedDrawerSide] = useState<'opponent' | 'mine' | null>(null);
   // 棋盘可用纵向空间实测（宽屏/纵向空间不足时限制棋盘尺寸，避免挤占标题行与底部按钮）
@@ -416,13 +423,13 @@ export default function LanBattleScreen() {
   const roomHandicapRef = useRef<number[]>([]); // 上传初始局面时同步取用，避免闭包陈旧
   const roomIncrementRef = useRef(0); // 加秒（秒），设置弹窗预填用
   const roomByoyomiRef = useRef(0); // 读秒（秒），0=关闭；时钟芯片读秒阶段展示与设置弹窗预填用
-  // 局时时钟快照（服务端权威）：钟面余量（ms）+ 锚点 lastMoveTime/serverNow + 当前走棋方 + 协商暂停锚点
-  interface ClockSnap { red: number; black: number; lastMoveTime: number; sideTag: boolean; clockPausedAt: number | null }
-  const clockSnapRef = useRef<ClockSnap | null>(null);
-  // 时钟展示文本（1s 本地插值刷新）：null 表示本房间未启用局时
-  const [clockText, setClockText] = useState<{ mine: string | null; opp: string | null; mineUrgent: boolean; oppUrgent: boolean }>({ mine: null, opp: null, mineUrgent: false, oppUrgent: false });
+  // 局时时钟快照（服务端权威）与钟面文本由 hooks/useBattleClock 提供，
+  // 见下方 useBattleClock 调用处的说明
   const [turnTimeLeft, setTurnTimeLeft] = useState(0); // 当前回合剩余秒数
   const lastMoveTimeRef = useRef<number>(0);
+  // 房间设置镜像 ref：供 useBattleStateSync 在回调（非渲染期）中读取最新值
+  const turnTimeLimitRef = useRef(0);
+  turnTimeLimitRef.current = turnTimeLimit;
 
   const roomId = params.roomId;
   const playerId = params.playerId;
@@ -796,260 +803,145 @@ export default function LanBattleScreen() {
     }, [roomId, playerId, sendReconnect, handleSessionGone])
   );
 
-  // 统一处理服务端对局状态（HTTP 轮询响应与 WebSocket state 推送共用）
-  const applyServerState = (raw: Record<string, unknown>) => {
-    const data = raw as {
-      gameState?: GameState;
-      phase?: string;
-      gameStartTime?: number | null;
-      winner?: string | null;
-      surrenderBy?: string | null;
-      endReason?: 'checkmate' | 'resign' | 'draw' | 'disconnect' | 'leave' | null;
-      lastMoveTime?: number | null;
-      disconnectedPlayerId?: string | null;
-      disconnectTime?: number | null;
-      pendingUndo?: { playerId: string; requestTime: number } | null;
-      undoResult?: { playerId: string; agreed: boolean; reason: string } | null;
-      pendingDraw?: { playerId: string; requestTime: number } | null;
-      drawResult?: { playerId: string; agreed: boolean; reason: string } | null;
-      emojiMessages?: { id: string; playerId: string; emoji: string }[];
-      // 基本用时加秒制：服务端时钟域时间戳、房间设置、双方剩余毫秒
-      serverNow?: number;
-      settings?: { baseTimeSeconds?: number; incrementSeconds?: number; byoyomiSeconds?: number; handicap?: number[] };
-      clocks?: { red: number; black: number } | null;
-      clockPausedAt?: number | null; // 悔棋/求和协商暂停锚点（服务端时钟域）
-      undoRefusals?: Record<string, number>; // 各玩家本局悔棋被对方连续拒绝次数（≥2 封禁悔棋入口）
-      drawRefusals?: Record<string, number>; // 各玩家本局求和被对方连续拒绝次数（≥2 封禁求和入口）
-      // 结算后各玩家「已返回房间」记录（playerId → 返回时刻，服务端时钟）
-      returnedToRoom?: Record<string, number>;
-      players?: { id: string; name: string; side: string | null; connected: boolean }[];
-    };
+  // 局时时钟的本地插值（1s 走钟 + 读秒/警示展示）。实现见 hooks/useBattleClock：
+  // 它只在 phase === 'playing' 期间持有定时器，并把扣减算术暴露为纯函数 computeClockText。
+  // 必须声明在 useBattleStateSync 之前：后者要通过 clockSnapRef 写入服务端快照。
+  const { clockText, clockSnapRef } = useBattleClock({
+    phase,
+    mySide,
+    serverTimeOffsetRef,
+    byoyomiRef: roomByoyomiRef,
+  });
 
-    // 同步 emoji 表情消息：独立于 gameState 处理，准备阶段（未开局、gameState 为空）同样生效。
-    // 否则进入房间后、正式开局前发送的表情无法被对方接收（对方/多设备回显均走此入口，按 id 去重）。
-    if (Array.isArray(data.emojiMessages)) {
-      for (const m of data.emojiMessages) {
-        if (m && typeof m.id === 'string' && typeof m.emoji === 'string' && !seenEmojiIdsRef.current.has(m.id)) {
-          addActiveEmoji({ id: m.id, playerId: m.playerId, emoji: m.emoji });
+  // 服务端负载 → 页面状态的统一处理（HTTP 轮询响应与 WebSocket state 推送共用）。
+  //
+  // 实现见 hooks/useBattleStateSync：与观战页共用同一套字段映射，并保证
+  // 「本端走子乐观保护」只延迟**局面块**，而 returnedToRoom / 结算 / 重赛跟随 /
+  // 协商 / 断线 / 表情等控制信息在任何情况下都照常处理。
+  // 旧实现在乐观保护分支直接 return（退出整个函数），会在该着法被服务端拒绝
+  // （拒绝时不广播 state）后连续 8 秒丢弃所有状态推送，界面静默卡在旧画面。
+  const {
+    applyPayload: applyServerState,
+    markOptimisticMove,
+    rollbackOptimisticMove,
+    handleActionRejected,
+    resetSyncBaseline,
+  } = useBattleStateSync({
+    selfId: playerId,
+    // mySide 可能因选边结果/重赛而变化，故传取值函数而非快照
+    resolveMySide: () => mySideRef.current,
+    currentPhase: () => phaseRef.current,
+    rematchFollowedFallback: () => returnFallbackFiredRef.current,
+    serverTimeOffsetRef,
+    lastMoveTimeRef,
+    turnTimeLimitRef,
+    byoyomiRef: roomByoyomiRef,
+    clockSnapRef,
+    pendingMoveRef: pendingSyncRef,
+    pendingUndoRef: undoPendingRef,
+    pendingDrawRef: drawPendingRef,
+    undoBlockedRef,
+    drawBlockedRef,
+    selfDisconnectedRef,
+    requestReconnect: () => { void sendReconnect(); },
+    setGameState,
+    setBaseTimeSeconds,
+    roomIncrementRef,
+    roomByoyomiRef,
+    roomHandicapRef,
+    setRoomHandicap,
+    setUndoBlocked,
+    setDrawBlocked,
+    setUndoPending,
+    setDrawPending,
+    setUndoRequestFromOpponent,
+    setDrawRequestFromOpponent,
+    setOpponentDisconnected,
+    setDisconnectCountdown,
+    handlers: {
+      // 局面已应用（未被乐观保护延迟）：同步最近一步光环、对手走棋特效与音效
+      onBoardApplied: ({ state, historyLen, prevHistoryLen }) => {
+        // 最近一步光环：以服务端着法序列为准，仅在着法数变化时更新，避免无效重渲染
+        if (historyLen !== prevHistoryLen) {
+          const lastRecord = historyLen > 0 ? state.moveHistory[historyLen - 1] : null;
+          setLastMove(
+            lastRecord
+              ? {
+                  fromCol: lastRecord.fromCol,
+                  fromRow: lastRecord.fromRow,
+                  toCol: lastRecord.toCol,
+                  toRow: lastRecord.toRow,
+                }
+              : null
+          );
         }
-      }
-    }
-
-    // 房间重置为 waiting 时负载里没有 gameState，故把 newState 提到 if 之外，
-    // 供下方与 gameState 无关的阶段判断（如结算步数）使用
-    const newState = data.gameState;
-    if (newState) {
-      // 乐观更新保护：本端刚走子且上传在途时，服务端可能仍是走子前的旧局面，
-      // 直接覆盖会让棋子回退、待上传落地后又重新移动。服务端未追上本端着法数时跳过本轮覆盖。
-      if (pendingSyncRef.current) {
-        const pending = pendingSyncRef.current;
-        const incomingLen = newState.moveHistory?.length ?? 0;
-        if (incomingLen >= pending.historyLen) {
-          // 服务端已包含本端着法（或更多），解除保护恢复正常同步
-          pendingSyncRef.current = null;
-        } else if (Date.now() - pending.at < 8000) {
-          // 仍是走子前的旧局面（上传未落地）→ 本轮跳过覆盖，下轮重试
-          return;
-        } else {
-          // 长时间未见本端着法，判定上传失败 → 放弃保护，按服务端局面恢复
-          pendingSyncRef.current = null;
-        }
-      }
-
-      setGameState(newState);
-
-      // 同步「最近一步」光环：以服务端着法序列为准，覆盖对方走棋与悔棋回退场景
-      // （自己走棋已在本地 handleMove 乐观设置，服务端追上后此处与之一致；仅在着法数变化时更新，避免无效重渲染）
-      const historyLen = newState.moveHistory.length;
-      if (historyLen !== seenHistoryLenRef.current) {
-        const lastRecord = historyLen > 0 ? newState.moveHistory[historyLen - 1] : null;
-        setLastMove(lastRecord ? {
-          fromCol: lastRecord.fromCol,
-          fromRow: lastRecord.fromRow,
-          toCol: lastRecord.toCol,
-          toRow: lastRecord.toRow,
-        } : null);
-      }
-
-      // 对手走棋检测：着法数增加且最后一步是对手棋子 → 触发吃子/将军特效
-      // （自己走棋已在本地 handleMove 触发，悔棋使着法数减少不满足条件）
-      if (historyLen > seenHistoryLenRef.current) {
-        const last = newState.moveHistory[historyLen - 1];
+        // 对手走棋检测：着法数增加且最后一步是对方的棋子 → 触发吃子/将军特效
+        // （自己走棋已在本地 handleMove 触发；悔棋使着法数减少，不满足条件）
+        if (historyLen <= prevHistoryLen) return;
+        const last = state.moveHistory[historyLen - 1];
         const mySideTag = sideStringToTag(mySideRef.current);
         // pieceId 16-31 为红方、0-15 为黑方；与本方阵营不同即对手所走
         const isOpponentMove = mySideTag ? last.pieceId < 16 : last.pieceId >= 16;
-        if (isOpponentMove) {
-          // 终局（对方绝杀/困毙我方）时不播，由绝杀特效接管
-          triggerMoveEffect(last.capturedPieceId, newState.isCheck, data.phase === 'ended');
-          // 对手走子音效：将军时播男声将军语音（内置节流），否则吃子/走子音（终局不播）
-          if (data.phase !== 'ended') {
-            if (newState.isCheck) {
-              playJiangJunSound();
-            } else if (last.capturedPieceId !== -1) {
-              playSound('eat');
-            } else {
-              playSound('go');
-            }
+        if (!isOpponentMove) return;
+        // 终局（对方绝杀/困毙我方）时不播，由绝杀特效接管
+        triggerMoveEffect(last.capturedPieceId, state.isCheck, phaseRef.current === 'ended');
+        // 对手走子音效：将军时播男声将军语音（内置节流），否则吃子/走子音（终局不播）
+        if (phaseRef.current !== 'ended') {
+          if (state.isCheck) {
+            playJiangJunSound();
+          } else if (last.capturedPieceId !== -1) {
+            playSound('eat');
+          } else {
+            playSound('go');
           }
         }
-        seenHistoryLenRef.current = historyLen;
-      } else if (historyLen < seenHistoryLenRef.current) {
-        // 悔棋后着法数回退，同步基线避免漏检后续对手走棋
-        seenHistoryLenRef.current = historyLen;
-      }
-
-      // 同步服务端回合计时点（对方走棋/悔棋后重置我方限时倒计时）
-      if (data.lastMoveTime) {
-        lastMoveTimeRef.current = data.lastMoveTime;
-      }
-
-      // 服务端时钟校正（WS 推送通道；轮询通道在 checkRoom 内处理）
-      if (typeof data.serverNow === 'number') {
-        serverTimeOffsetRef.current = data.serverNow - Date.now();
-      }
-
-      // 房间对战设置同步（基本用时+加秒制/让子）：开局后房主不可再改，开局前以最新值为准
-      if (data.settings) {
-        setBaseTimeSeconds(data.settings.baseTimeSeconds || 0);
-        roomIncrementRef.current = data.settings.incrementSeconds || 0;
-        roomByoyomiRef.current = data.settings.byoyomiSeconds || 0;
-        if (Array.isArray(data.settings.handicap)) {
-          roomHandicapRef.current = data.settings.handicap;
-          setRoomHandicap(data.settings.handicap);
-        }
-      }
-
-      // 局时时钟快照同步（服务端权威钟面 + 锚点；本地 1s 插值展示，收到新快照自动校正）
-      if (data.clocks && typeof data.lastMoveTime === 'number' && newState) {
-        clockSnapRef.current = {
-          red: data.clocks.red,
-          black: data.clocks.black,
-          lastMoveTime: data.lastMoveTime,
-          sideTag: newState.sideTag,
-          clockPausedAt: typeof data.clockPausedAt === 'number' ? data.clockPausedAt : null,
-        };
-      } else if (!data.clocks) {
-        clockSnapRef.current = null;
-      }
-
-      // 协商封禁状态同步（先于下方结果提示读取）：本局连续被对方拒绝 2 次后分别禁用悔棋/求和入口
-      if (data.undoRefusals && typeof data.undoRefusals === 'object') {
-        const count = (data.undoRefusals as Record<string, number>)[playerId];
-        const blocked = typeof count === 'number' && count >= 2;
-        undoBlockedRef.current = blocked;
-        setUndoBlocked(blocked);
-      }
-      if (data.drawRefusals && typeof data.drawRefusals === 'object') {
-        const count = (data.drawRefusals as Record<string, number>)[playerId];
-        const blocked = typeof count === 'number' && count >= 2;
-        drawBlockedRef.current = blocked;
-        setDrawBlocked(blocked);
-      }
-
-      // 对方发起的悔棋请求 → 弹出确认框
-      setUndoRequestFromOpponent(!!(data.pendingUndo && data.pendingUndo.playerId !== playerId));
-
-      // 我方发起的悔棋请求有了处理结果
-      if (data.undoResult && data.undoResult.playerId === playerId && undoPendingRef.current) {
-        undoPendingRef.current = false;
-        setUndoPending(false);
-        if (!data.undoResult.agreed) {
-          const refusedMsg = undoBlockedRef.current
-            ? '对方拒绝了悔棋请求，本局不能再发起悔棋'
-            : '对方拒绝了悔棋请求';
-          showNotice(data.undoResult.reason === 'timeout' ? '对方未响应，悔棋请求已取消' : refusedMsg);
-        }
-        // 同意时局面已通过上方同步，无需额外操作
-      } else if (!data.pendingUndo && undoPendingRef.current) {
-        // 请求因对方走棋等原因失效且无处理结果 → 静默清除
-        undoPendingRef.current = false;
-        setUndoPending(false);
-      }
-
-      // 对方发起的求和请求 → 弹出确认框
-      setDrawRequestFromOpponent(!!(data.pendingDraw && data.pendingDraw.playerId !== playerId));
-
-      // 我方发起的求和请求有了处理结果
-      if (data.drawResult && data.drawResult.playerId === playerId && drawPendingRef.current) {
-        drawPendingRef.current = false;
-        setDrawPending(false);
-        if (!data.drawResult.agreed) {
-          const refusedMsg = drawBlockedRef.current
-            ? '对方拒绝了求和请求，本局不能再发起求和'
-            : '对方拒绝了求和请求';
-          showNotice(data.drawResult.reason === 'timeout' ? '对方未响应，求和请求已取消' : refusedMsg);
-        }
-        // 同意时通过下方 phase === 'ended'（无胜负方）同步和棋结算
-      } else if (!data.pendingDraw && drawPendingRef.current) {
-        // 请求因对方走棋等原因失效且无处理结果 → 静默清除
-        drawPendingRef.current = false;
-        setDrawPending(false);
-      }
-
-      // 检查对方是否断线
-      if (data.disconnectedPlayerId && data.disconnectedPlayerId !== playerId) {
-        setOpponentDisconnected(true);
-        // 计算剩余等待时间
-        if (data.disconnectTime) {
-          const elapsed = Math.floor((Date.now() - data.disconnectTime) / 1000);
-          const remaining = Math.max(0, 60 - elapsed);
-          setDisconnectCountdown(remaining);
-        }
-      } else {
-        setOpponentDisconnected(false);
-        setDisconnectCountdown(60);
-      }
-      // 发现自己被标记断线（如切后台导致心跳超时）：本页面正存活接收状态，立即显式上报重连
-      if (data.disconnectedPlayerId === playerId) {
+      },
+      onEnded: ({ winner, isDraw, surrenderBy, endReason, moveCount, duration }) => {
+        setGameResult({
+          winner,
+          isWin: !isDraw && winner === mySideRef.current,
+          duration,
+          moveCount: moveCount || 0,
+          surrenderBy,
+          isDraw,
+        });
+        setPhase('ended');
+        setGameEndReason(endReason);
+        // 所有结束方式都展示结算界面；其中仅绝杀/困毙播放「绝/杀」特效，
+        // 认输/和棋/断线判负由 showEffect 控制为普通文字结算
+        setJueShaVisible(true);
+      },
+      // 房间已被重置为等待中：是否跟随回到准备界面取决于**本端**是否已表态
+      // （本端点过「返回房间」或结算兜底倒计时已归零才跟随，否则留在结算页）
+      onRematchFollowed: () => resetForRematch(),
+      onOpponentReturned: returned => setOpponentReturned(returned),
+      onEmoji: message => addActiveEmoji(message),
+      onUndoResult: (result, blocked) => {
+        showNotice(
+          result.reason === 'timeout'
+            ? '对方未响应，悔棋请求已取消'
+            : blocked
+              ? '对方拒绝了悔棋请求，本局不能再发起悔棋'
+              : '对方拒绝了悔棋请求'
+        );
+      },
+      onDrawResult: (result, blocked) => {
+        showNotice(
+          result.reason === 'timeout'
+            ? '对方未响应，求和请求已取消'
+            : blocked
+              ? '对方拒绝了求和请求，本局不能再发起求和'
+              : '对方拒绝了求和请求'
+        );
+      },
+      onSelfMarkedDisconnected: () => {
         // 记录「本端曾因断线被标记」：若后续房间被解散，终态文案据此显示为断线判负
         selfDisconnectedRef.current = true;
-        sendReconnect();
-      }
-    } // ← 关闭 if (data.gameState)
-
-    // 结算后「已返回房间」记录：据此提示对手是否已回房间（互不干扰语义的可视化）
-    if (data.returnedToRoom && typeof data.returnedToRoom === 'object' && Array.isArray(data.players)) {
-      const rec = data.returnedToRoom as Record<string, number>;
-      const opponentId = (data.players as { id: string }[]).find((p) => p.id !== playerId)?.id;
-      setOpponentReturned(!!opponentId && !!rec[opponentId]);
-    }
-
-    // 检查对局是否结束（对方认输、断线超时、走棋绝杀或对方同意求和）
-    // 注意：这两段刻意置于 if (data.gameState) 之外——房间被重置为 waiting 时负载里
-    // 没有 gameState，若关在里面本端会永远停在 ended 结算页。
-    if (data.phase === 'ended') {
-      const isDraw = !data.winner; // 无胜负方 = 和棋
-      const isWin = !isDraw && data.winner === mySideRef.current;
-      setGameResult({
-        winner: data.winner ?? null,
-        isWin,
-        duration: data.gameStartTime ? Date.now() - data.gameStartTime : 0,
-        moveCount: newState?.moveHistory?.length || 0,
-        surrenderBy: data.surrenderBy ?? null,
-        isDraw,
-      });
-      setPhase('ended');
-      // 终局原因：服务端明确下发；缺失时按结果兜底推断（和棋/认输可判，其余有胜负方的按绝杀处理）
-      const endReason = data.endReason ?? (isDraw ? 'draw' : data.surrenderBy ? 'resign' : 'checkmate');
-      setGameEndReason(endReason);
-      // 所有结束方式都展示结算界面；其中仅绝杀/困毙播放「绝/杀」特效，
-      // 认输/和棋/断线判负由 showEffect 控制为普通文字结算
-      setJueShaVisible(true);
-    } else if (data.phase === 'waiting' && phaseRef.current === 'ended') {
-      // 房间已被重置为等待中。是否跟随回到准备界面取决于**本端**是否已表态：
-      // - 本端点过「返回房间」或结算兜底倒计时已归零（returnFallbackFiredRef）→ 跟随；
-      // - 仅对手表态 → 留在结算页（对方已返回房间提示），实现双方互不干扰。
-      // 旧实现无条件 resetForRematch()，正是「对方也被返回房间」的根因。
-      const returned = (data.returnedToRoom ?? {}) as Record<string, number>;
-      if (returned[playerId] || returnFallbackFiredRef.current) {
-        resetForRematch();
-      } else {
-        // 对方已回房间但本端未表态：与 checkRoom 分支保持一致——**不收起结算页**，
-        // 保住本端「返回房间」入口直到自己的倒计时归零（早期实现在此收起浮层，
-        // 导致对手一返回，本端倒计时中途按钮变占位——即 m02128 报告的 BUG）。
-      }
-    }
-  };
+      },
+      // 动作被服务端拒绝或长时间无回执：局面乐观更新已回退、在途协商状态已清理
+      onActionFailure: message => showNotice(message),
+    },
+  });
 
   // 保持 ref 指向最新的处理函数（轮询/WS 回调经 ref 调用，避免依赖抖动导致 effect 重建）
   useEffect(() => {
@@ -1068,10 +960,25 @@ export default function LanBattleScreen() {
       },
       // 服务端判定重连无意义（房间已销毁/本人已被移出房间）：立刻切终态 UI 并给出返回大厅入口。
       // 该回执是断线判负后房间解散时本端唯一的权威信号，必须消费，否则页面会永远停在棋盘上。
-      onFatalError: message => {
+      // kind='network'（自动重连用尽）只是长时间离线：会话可能仍有效，绝不能切终态，
+      // 否则会误报"房间已关闭"并停掉心跳/轮询；只提示用户，回前台或重新聚焦会重新开始重连。
+      onFatalError: (message, kind) => {
         setWsConnected(false);
+        if (kind === 'network') {
+          showNotice('网络连接已断开', '请检查网络后返回本页面，将自动重新连接', 5000);
+          return;
+        }
         handleSessionGone(message.includes('不在房间') ? 'removed' : 'room-closed');
       },
+      // 服务端拒绝了本端动作（非 request() 通道，如带 reqId 的即时动作）：统一回退乐观更新并提示
+      onActionRejected: info => {
+        handleActionRejected(
+          new BattleActionRejectedError(info.action ?? 'move', info.status, info.message)
+        );
+      },
+      // 协议级失败（「观战者无法执行该操作」「未知消息类型」等）：此前被静默丢弃，
+      // 表现为「点了没反应」。服务端文案本身就是面向用户的，直接透出。
+      onError: message => showNotice(message),
     });
     battleSocketRef.current = socket;
     // 同步当前可见性：后台标签页刷新/直接打开对局链接时，连接建立后首个心跳就要带 hidden=true
@@ -1171,8 +1078,11 @@ export default function LanBattleScreen() {
 
   // 上传初始局面并开局（仅上传方/接管方执行一次）
   const uploadInitialGame = async () => {
+    // 注意：这里**不能**提前置 uploadedRef.current = true。
+    // 服务端已把上传收紧为「仅房内玩家、且仅在本局尚无着法时接受」，
+    // 若本端在房间还没登记进玩家时就抢先上传，会被 403 拒绝，而房间的棋盘仍是空的，
+    // 对局会永远卡住。改为「确认服务端已采用本端局面的那一刻」才置位。
     if (uploadedRef.current) return;
-    uploadedRef.current = true;
     try {
       const base = await getOnlineServerUrl();
       /**
@@ -1208,10 +1118,21 @@ export default function LanBattleScreen() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ playerId, gameState: initialState }),
       });
+      // 上传后必须**读回校验**，不能假定成功。服务端该接口由补丁收紧为
+      // 「仅房内玩家 + 本局尚无着法」才接受（403 见 patch-dist.mjs 的「初始局面上传收紧」）：
+      //   - 本端尚未被登记进房间 → 403，此时服务端棋盘仍为空，必须留出重试机会；
+      //   - 房间已有一份（他人上传的）棋盘 → 服务端已可开局，无需再传，也不必重试。
+      // 旧实现只看 fetch 是否抛异常，因此 403 被当成成功、且 uploadedRef 在请求前就置了位，
+      // 结果是「服务端没有棋盘 / 客户端也无法再补传」的永久不同步。
+      const verify = await fetch(`${base}/api/v1/lan/rooms/${roomId}/gameState`);
+      const verified = await verify.json();
+      const accepted = !!verified?.gameState;
+      if (accepted) uploadedRef.current = true;
+      else console.warn('初始局面尚未被服务端接受，将留待重试同步:', verified);
       gameStartTimeRef.current = Date.now();
     } catch (error) {
+      // uploadedRef 未置位，故本次失败天然允许后续轮询/接管重试
       console.error('同步初始状态失败:', error);
-      uploadedRef.current = false; // 允许接管/重试
     }
   };
 
@@ -1572,9 +1493,10 @@ export default function LanBattleScreen() {
     }
 
     const piece = gameState.pieces[selectedPieceId];
+    // 记录乐观更新：上传落地前轮询不得用旧局面覆盖（防棋子回退重走）。
+    // 同时保存走子前快照，供服务端拒绝/无回执时回退（见 handleActionRejected）
+    markOptimisticMove(result.newState.moveHistory.length, gameState);
     setGameState(result.newState);
-    // 记录乐观更新：上传落地前轮询不得用旧局面覆盖（防棋子回退重走）
-    pendingSyncRef.current = { historyLen: result.newState.moveHistory.length, at: Date.now() };
     setSelectedPieceId(null);
     setValidMoves(null);
     setLastMove({
@@ -1631,39 +1553,63 @@ export default function LanBattleScreen() {
     setTurnTimeLeft(turnTimeLimit);
   };
 
-  // 服务端权威走子上报（方案 P0「服务端权威裁决」）：只发着法，
-  // 服务端负责校验（轮次/走法合法）并以同一规则引擎 makeMove 裁决与广播
-  const sendPlayerMove = async (move: { pieceId: number; toCol: number; toRow: number }) => {
-    // 优先走 WebSocket 实时通道；未连接时回退 HTTP
-    const sentViaWs = battleSocketRef.current?.send('move', { move }) ?? false;
-    if (sentViaWs) return;
+  // 动作类型 → HTTP 兜底端点（与 WebSocket 消息类型同名）
+  const HTTP_ACTION_PATH: Record<BattleActionType, string> = {
+    move: 'gameState',
+    surrender: 'surrender',
+    undo: 'undo',
+    undoResponse: 'undoResponse',
+    draw: 'draw',
+    drawResponse: 'drawResponse',
+    emoji: 'emoji',
+  };
+
+  // 统一的动作发送：WS 优先并等待服务端 ack，失败时按语义分流。
+  //
+  // 旧实现只判断「帧是否发出」（send() 的返回值），服务端是否接受完全无人知晓：
+  // 服务端在 status >= 400 时**不广播 state**，于是被拒绝的动作（不是你的回合 /
+  // 非法走法 / 对方已连续拒绝 2 次 …）既没有回退也没有提示，界面静默卡住。
+  //
+  // 现在按三类失败分流（见 utils/battleProtocol）：
+  //   · 帧未发出        → 回退 HTTP（连接不可用时的兜底）
+  //   · 服务端明确拒绝   → 绝不回退 HTTP（会绕过裁决），回退本地乐观更新并提示
+  //   · 等待回执超时     → 结果未知，同样回退本地乐观更新并提示，不盲目重试
+  const sendBattleAction = async (type: BattleActionType, payload: Record<string, unknown>) => {
+    // 连接可用时经 WS 等待服务端裁决；不可用则直接走 HTTP 兜底
+    const socket = battleSocketRef.current;
+    let deliveredOverWs = false;
+    if (socket?.isConnected) {
+      try {
+        await socket.request(type, payload);
+        deliveredOverWs = true;
+      } catch (error) {
+        // 帧未发出（刚断开）→ 交给 HTTP 兜底；服务端拒绝/超时 → 回退乐观更新并提示
+        if (!isActionNotSent(error)) {
+          handleActionRejected(error);
+          return;
+        }
+      }
+    }
+    if (deliveredOverWs) return;
+
+    // HTTP 兜底：仅在本端无法经 WS 送达时使用
     try {
       const base = await getOnlineServerUrl();
-      await fetch(`${base}/api/v1/lan/rooms/${roomId}/gameState`, {
+      await fetch(`${base}/api/v1/lan/rooms/${roomId}/${HTTP_ACTION_PATH[type]}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ playerId, move }),
+        body: JSON.stringify({ playerId, ...payload }),
       });
     } catch (error) {
-      console.error('上传走子失败:', error);
+      console.error(`发送动作失败(${type}):`, error);
+      showNotice('网络异常，操作发送失败');
     }
   };
 
-  // 同步游戏状态（初始局面上传专用：走子走 sendPlayerMove）
-  const syncGameState = async (state: GameState, gameOver?: boolean, winner?: string) => {
-    // 优先走 WebSocket 实时通道；未连接时回退 HTTP
-    const sentViaWs = battleSocketRef.current?.send('move', { gameState: state, gameOver, winner }) ?? false;
-    if (sentViaWs) return;
-    try {
-      const base = await getOnlineServerUrl();
-      await fetch(`${base}/api/v1/lan/rooms/${roomId}/gameState`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ playerId, gameState: state, gameOver, winner }),
-      });
-    } catch (error) {
-      console.error('同步游戏状态失败:', error);
-    }
+  // 服务端权威走子上报（方案 P0「服务端权威裁决」）：只发着法，
+  // 服务端负责校验（轮次/走法合法）并以同一规则引擎 makeMove 裁决与广播
+  const sendPlayerMove = async (move: BattleMove) => {
+    await sendBattleAction('move', { move });
   };
 
   // 超时随机走一步棋
@@ -1707,9 +1653,9 @@ export default function LanBattleScreen() {
       playSound('go');
     }
 
+    // 记录乐观更新（含走子前快照，供服务端拒绝时回退）
+    markOptimisticMove(result.newState.moveHistory.length, gameState);
     setGameState(result.newState);
-    // 记录乐观更新：上传落地前轮询不得用旧局面覆盖（防棋子回退重走）
-    pendingSyncRef.current = { historyLen: result.newState.moveHistory.length, at: Date.now() };
     setSelectedPieceId(null);
     setValidMoves(null);
     // 同步「最近一步」光环（超时随机走棋与手动走棋一致，展示落点光环）
@@ -1775,64 +1721,6 @@ export default function LanBattleScreen() {
     return () => clearInterval(timer);
   }, [phase, turnTimeLimit, isMyTurn]);
 
-  // 局时时钟展示（基本用时 + 加秒制/读秒制）：以服务端快照为锚点做 1s 本地插值；仅当前走棋方的钟走动。
-  // 读秒制下基本用时耗尽后进入读秒阶段：芯片显示「读 M:SS」（每步完整读秒时长），读秒 ≤10s 变红警示
-  useEffect(() => {
-    if (phase !== 'playing') return;
-
-    const formatClock = (ms: number): string => {
-      const totalSec = Math.max(0, Math.ceil(ms / 1000));
-      const m = Math.floor(totalSec / 60);
-      const s = totalSec % 60;
-      return `${m}:${s.toString().padStart(2, '0')}`;
-    };
-
-    const tick = () => {
-      const snap = clockSnapRef.current;
-      if (!snap) {
-        setClockText(prev => (prev.mine === null && prev.opp === null ? prev : { mine: null, opp: null, mineUrgent: false, oppUrgent: false }));
-        return;
-      }
-      // 服务端校正时间：lastMoveTime/serverNow 均为服务端时钟域，比较需加偏移
-      // 悔棋/求和协商期间：以暂停锚点为「现在」，时钟显示冻结在暂停时刻
-      const correctedNow = Date.now() + serverTimeOffsetRef.current;
-      const anchorNow = snap.clockPausedAt ?? correctedNow;
-      const elapsed = Math.max(0, anchorNow - snap.lastMoveTime);
-      const toMove: 'red' | 'black' = snap.sideTag === RED_SIDE ? 'red' : 'black';
-      const byoMs = roomByoyomiRef.current * 1000;
-      const myTag = sideStringToTag(mySideRef.current);
-      const myColor: 'red' | 'black' = myTag === RED_SIDE ? 'red' : 'black';
-      const oppColor: 'red' | 'black' = myColor === 'red' ? 'black' : 'red';
-
-      // 某方的芯片展示：走棋方实时扣减；读秒制下基本用时耗尽显示读秒剩余（非走棋方静态展示完整读秒时段）
-      const displayFor = (color: 'red' | 'black'): { text: string; urgent: boolean } => {
-        const moving = toMove === color;
-        const net = moving ? snap[color] - elapsed : snap[color];
-        if (net > 0) {
-          return { text: formatClock(net), urgent: moving && net <= 30000 };
-        }
-        if (byoMs > 0) {
-          const byoRemain = moving ? byoMs + net : byoMs;
-          return { text: `读${formatClock(byoRemain)}`, urgent: moving && byoRemain <= 10000 };
-        }
-        return { text: formatClock(0), urgent: moving };
-      };
-
-      const mineD = displayFor(myColor);
-      const oppD = displayFor(oppColor);
-      const next = { mine: mineD.text, opp: oppD.text, mineUrgent: mineD.urgent, oppUrgent: oppD.urgent };
-      setClockText(prev =>
-        prev.mine === next.mine && prev.opp === next.opp && prev.mineUrgent === next.mineUrgent && prev.oppUrgent === next.oppUrgent
-          ? prev
-          : next
-      );
-    };
-
-    tick();
-    const timer = setInterval(tick, 1000);
-    return () => clearInterval(timer);
-  }, [phase]);
-
   // 复盘自动保存：对局进入 ended（绝杀/困毙/认输/断线判负/超时判负）时保存完整着法到本地历史，每局仅一次
   useEffect(() => {
     if (phase !== 'ended' || !gameResult || replaySavedRef.current) return;
@@ -1857,35 +1745,8 @@ export default function LanBattleScreen() {
   // 认输
   const handleSurrender = async () => {
     setShowSurrenderModal(false);
-    // 优先 WebSocket 实时通道；结算界面由服务端状态广播推送驱动
-    const sentViaWs = battleSocketRef.current?.send('surrender', {}) ?? false;
-    if (sentViaWs) return;
-    try {
-      const base = await getOnlineServerUrl();
-      const response = await fetch(`${base}/api/v1/lan/rooms/${roomId}/surrender`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ playerId }),
-      });
-      const data = await response.json();
-
-      if (data.success) {
-        const isWin = data.winner === mySide;
-        setGameResult({
-          winner: data.winner,
-          isWin,
-          duration: data.duration || gameDuration,
-          moveCount: data.moveCount || gameState.moveHistory.length,
-          surrenderBy: data.surrenderBy,
-        });
-        setPhase('ended');
-        // 认输：仅普通文字结算，不播绝杀特效
-        setGameEndReason('resign');
-        setJueShaVisible(true);
-      }
-    } catch (error) {
-      console.error('认输失败:', error);
-    }
+    // 结算界面由服务端状态广播推送驱动（ack 仅用于暴露「服务端拒绝/超时」）
+    await sendBattleAction('surrender', {});
   };
 
   // 悔棋（需对方同意）：撤销双方各一步，目标局面随请求提交给服务端
@@ -1901,51 +1762,17 @@ export default function LanBattleScreen() {
     const proposed = afterOpponent ? undoMove(afterOpponent) : null;
     if (!proposed) return;
 
-    // 优先 WebSocket 实时通道；处理结果由服务端状态广播推送
-    const sentViaWs = battleSocketRef.current?.send('undo', { proposedState: proposed }) ?? false;
-    if (sentViaWs) {
-      undoPendingRef.current = true;
-      setUndoPending(true);
-      return;
-    }
-
-    try {
-      const base = await getOnlineServerUrl();
-      const response = await fetch(`${base}/api/v1/lan/rooms/${roomId}/undo`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ playerId, proposedState: proposed }),
-      });
-      const data = await response.json();
-
-      if (data.success) {
-        undoPendingRef.current = true;
-        setUndoPending(true);
-      } else {
-        showNotice(data.message || '悔棋请求失败');
-      }
-    } catch (error) {
-      console.error('悔棋失败:', error);
-      showNotice('网络异常，悔棋请求发送失败');
-    }
+    // 先进入「等待对方同意」态：服务端拒绝或超时时由 handleActionRejected 回退该态
+    undoPendingRef.current = true;
+    setUndoPending(true);
+    await sendBattleAction('undo', { proposedState: proposed });
   };
 
   // 响应对方的悔棋请求
   const handleUndoResponse = async (agreed: boolean) => {
     setUndoRequestFromOpponent(false);
-    // 优先 WebSocket 实时通道；处理结果由服务端状态广播推送
-    const sentViaWs = battleSocketRef.current?.send('undoResponse', { agreed }) ?? false;
-    if (sentViaWs) return;
-    try {
-      const base = await getOnlineServerUrl();
-      await fetch(`${base}/api/v1/lan/rooms/${roomId}/undoResponse`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ playerId, agreed }),
-      });
-    } catch (error) {
-      console.error('响应悔棋请求失败:', error);
-    }
+    // 处理结果由服务端状态广播推送；ack 仅用于暴露「服务端拒绝/超时」
+    await sendBattleAction('undoResponse', { agreed });
   };
 
   // 求和（需对方同意）：发送求和请求，对方同意则以和棋结束对局
@@ -1956,67 +1783,16 @@ export default function LanBattleScreen() {
       return;
     }
 
-    // 优先 WebSocket 实时通道；处理结果由服务端状态广播推送
-    const sentViaWs = battleSocketRef.current?.send('draw', {}) ?? false;
-    if (sentViaWs) {
-      drawPendingRef.current = true;
-      setDrawPending(true);
-      return;
-    }
-
-    try {
-      const base = await getOnlineServerUrl();
-      const response = await fetch(`${base}/api/v1/lan/rooms/${roomId}/draw`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ playerId }),
-      });
-      const data = await response.json();
-
-      if (data.success) {
-        drawPendingRef.current = true;
-        setDrawPending(true);
-      } else {
-        showNotice(data.message || '求和请求失败');
-      }
-    } catch (error) {
-      console.error('求和失败:', error);
-      showNotice('网络异常，求和请求发送失败');
-    }
+    // 先进入「等待对方同意」态：服务端拒绝或超时时由 handleActionRejected 回退该态
+    drawPendingRef.current = true;
+    setDrawPending(true);
+    await sendBattleAction('draw', {});
   };
 
-  // 响应对方的求和请求：同意则本地立即进入和棋结算（请求方通过轮询同步）
+  // 响应对方的求和请求：和棋结算由服务端状态广播推送驱动
   const handleDrawResponse = async (agreed: boolean) => {
     setDrawRequestFromOpponent(false);
-    // 优先 WebSocket 实时通道；和棋结算由服务端状态广播推送驱动
-    const sentViaWs = battleSocketRef.current?.send('drawResponse', { agreed }) ?? false;
-    if (sentViaWs) return;
-    try {
-      const base = await getOnlineServerUrl();
-      const response = await fetch(`${base}/api/v1/lan/rooms/${roomId}/drawResponse`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ playerId, agreed }),
-      });
-      const data = await response.json();
-
-      if (data.success && agreed) {
-        setGameResult({
-          winner: null,
-          isWin: false,
-          duration: gameStartTimeRef.current ? Date.now() - gameStartTimeRef.current : 0,
-          moveCount: gameStateRef.current.moveHistory.length,
-          surrenderBy: null,
-          isDraw: true,
-        });
-        setPhase('ended');
-        // 和棋：仅普通文字结算，不播绝杀特效
-        setGameEndReason('draw');
-        setJueShaVisible(true);
-      }
-    } catch (error) {
-      console.error('响应求和请求失败:', error);
-    }
+    await sendBattleAction('drawResponse', { agreed });
   };
 
   // ===== 对局内 emoji 表情互动 =====
@@ -2052,25 +1828,10 @@ export default function LanBattleScreen() {
     setEmojiPickerOpen(false);
     const id = `${playerId}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
     addActiveEmoji({ id, playerId, emoji });
-    // 优先 WebSocket 实时通道；对方经服务端广播实时收到（按 id 去重）
-    const sentViaWs = battleSocketRef.current?.send('emoji', { emoji, id }) ?? false;
-    if (sentViaWs) return;
-    try {
-      const base = await getOnlineServerUrl();
-      /**
-       * 服务端文件：server/src/routes/lanGame.ts
-       * 接口：POST /api/v1/lan/rooms/:roomId/emoji
-       * Body 参数：playerId: string, emoji: string, id: string
-       */
-      await fetch(`${base}/api/v1/lan/rooms/${roomId}/emoji`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ playerId, emoji, id }),
-      });
-    } catch (error) {
-      console.error('发送表情失败:', error);
-    }
-  }, [playerId, roomId, addActiveEmoji]);
+    // 对方经服务端广播实时收到（按 id 去重）；ack 仅用于暴露「服务端拒绝/超时」
+    await sendBattleAction('emoji', { emoji, id });
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- sendBattleAction 每次渲染重建，纳入依赖会破坏本回调的稳定语义
+  }, [playerId, addActiveEmoji]);
 
   // 我方活跃表情（显示在我方名称左侧）/ 对方活跃表情（显示在对方名称右侧）
   const myEmojis = useMemo(() => activeEmojis.filter(e => e.playerId === playerId), [activeEmojis, playerId]);
@@ -2192,8 +1953,7 @@ export default function LanBattleScreen() {
     setSidePickStage(false);
     setSidePickVisible(false);
     setSidePickResultMode(false);
-    seenHistoryLenRef.current = 0;
-    pendingSyncRef.current = null; // 清除走子乐观更新保护基线
+    resetSyncBaseline(); // 清除走子乐观保护基线（含回滚快照）
     selfDisconnectedRef.current = false; // 新一局重新计算断线状态（避免沿用上一局的断线判负文案）
     replaySavedRef.current = false; // 重新对局允许再次自动保存复盘
     // 求和协商状态重置
@@ -2209,44 +1969,6 @@ export default function LanBattleScreen() {
     setEmojiPickerOpen(false);
     setActiveEmojis([]);
     seenEmojiIdsRef.current = new Set();
-  };
-
-  // 重新对局（房间级重置）：必须等服务端重置落地后再本地重置——否则本地已回准备阶段而服务端仍是
-  // ended，此刻点准备会被 400 拒绝并回滚（表现为「准备跳回」）。respondAction 成功
-  // 即广播，对手经 WS 即时同步，无需额外走 WS 通道
-  const handleRematch = async () => {
-    if (rematchInFlightRef.current) return; // 防连点：服务端虽已幂等，仍避免无谓并发请求
-    rematchInFlightRef.current = true;
-    try {
-      const base = await getOnlineServerUrl();
-      /**
-       * 服务端文件：server/src/routes/lanGame.ts
-       * 接口：POST /api/v1/lan/rooms/:roomId/rematch
-       * Body 参数：playerId: string
-       */
-      const response = await fetch(`${base}/api/v1/lan/rooms/${roomId}/rematch`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ playerId }),
-      });
-      const data = await response.json();
-      if (!data.success) {
-        console.error('重新对局被服务端拒绝:', data);
-        // 成员身份类拒绝（已被移出房间/房间不存在）：切终态 UI，避免卡在结算页点了没反应
-        const msg = typeof data?.message === 'string' ? data.message : '';
-        if (msg.includes('不在房间') || msg.includes('房间不存在')) {
-          handleSessionGone(msg.includes('房间不存在') ? 'room-closed' : 'removed');
-        }
-        return;
-      }
-    } catch (error) {
-      console.error('重新对局失败:', error);
-      return;
-    } finally {
-      rematchInFlightRef.current = false;
-    }
-    // 服务端已确认重置 → 重置本地状态
-    resetForRematch();
   };
 
   // 结算后的「返回房间」：把本端退回房间准备界面，随后可自行准备/选边。

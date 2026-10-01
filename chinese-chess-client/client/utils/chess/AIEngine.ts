@@ -4,12 +4,16 @@
  * 参考 ElephantEye 等开源象棋引擎的评估思路：
  * 1. 标准子力价值体系（车600 马270 炮300 士/象120 兵60/120）
  * 2. 精细位置加成表（基于象棋理论，与棋子价值成比例）
- * 3. 机动性评估（可走路径数量影响子力发挥）
- * 4. 王安全评估（士象完整性、将帅暴露度）
- * 5. 静态搜索（Quiescence Search）— 消除水平线效应
- * 6. 杀手走法启发（Killer Move Heuristic）— 提高剪枝效率
- * 7. 置换表（Transposition Table）— 避免重复搜索
- * 8. 迭代加深 + 时间预算 — 保证固定时间内返回最佳结果
+ * 3. 王安全评估（士象完整性、将帅暴露度）
+ * 4. 静态搜索（Quiescence Search）— 消除水平线效应
+ * 5. 杀手走法启发（Killer Move Heuristic）— 提高剪枝效率
+ * 6. 历史重复局面惩罚 — 抑制循环走法（见 evaluate 内的 historyHashCount 用法）
+ * 7. 迭代加深 + 时间预算 — 保证固定时间内返回最佳结果
+ *
+ * ⚠️ 本引擎**没有置换表（Transposition Table）**，也**没有机动性评估**：
+ * 二者曾写在文件头的能力清单里，但代码从未实现（接手时不要按注释找）。
+ * 现有的 historyHashCount 只是"局面出现次数计数器"，用于重复局面惩罚，
+ * 不存储搜索结果、不做剪枝，与置换表无关。
  */
 
 import { type GameState, type PieceState } from './GameEngine';
@@ -235,13 +239,10 @@ function evaluate(state: GameState, currentSide: SideTag): number {
     }
   }
 
-  // 2. 机动性评估（仅在搜索深度较浅时计算，避免性能损耗）
-  // 注：机动性计算较昂贵，只在叶子节点使用
-
-  // 3. 王安全评估
+  // 2. 王安全评估
   score += evaluateKingSafety(state);
 
-  // 4. 历史重复局面惩罚（Zobrist 哈希检测）
+  // 3. 历史重复局面惩罚（Zobrist 哈希检测）
   // 仅当局面已真正重复（历史出现 >= 2 次）才惩罚：这是反循环机制，
   // 只应对后期重复走法；出现过 1 次的正常局面完全不受干扰。
   // 纯最佳模式（提示）同样生效：游戏规则中 4 步循环重复 3 次即判负（连杀），
@@ -369,13 +370,6 @@ export function recordHistoryHash(state: GameState): void {
  */
 export function clearHistoryHash(): void {
   historyHashCount.clear();
-}
-
-/**
- * 查询当前局面在历史中出现的次数
- */
-export function getHistoryCount(state: GameState): number {
-  return historyHashCount.get(computeZobristHash(state)) || 0;
 }
 
 
@@ -552,6 +546,39 @@ function generatePseudoMoves(state: GameState): Move[] {
 }
 
 // ======================== 原地走棋/撤销（带增量哈希） ========================
+
+/**
+ * 搜索用的私有状态副本。
+ *
+ * 搜索核心（applyMove/unapplyMove）是**原地改写**的，这是它比每次浅拷贝快一个量级的
+ * 原因，必须保留。但它此前直接改写**调用方传入的对象**——而调用方传入的正是
+ * screens/game 的 React state 对象。搜索在根节点走法之间会 `await setTimeout(0)`
+ * 周期性让出主线程（getBestMoveAsync 30ms / 提示预计算 8ms），让出期间棋盘停留在
+ * 搜索树某一步的局面；此时若 React 重渲染（如 setAiThinking 等状态更新触发），
+ * 页面就会短暂显示出搜索树内的错误局面（闪棋）。
+ *
+ * 因此在进入搜索前复制一份：搜索在副本上原地改写，调用方的对象始终保持原样。
+ * 只需复制会被改写的部分（棋盘、棋子、哈希、走棋方）——搜索全程不写 moveHistory /
+ * ruleState，但为避免与其它持有者共享引用被间接改写，一并做浅层复制。
+ */
+function cloneForSearch(state: GameState): GameState {
+  return {
+    ...state,
+    qiPan: state.qiPan.map(col => [...col]),
+    pieces: state.pieces.map(p => ({ ...p })),
+    moveHistory: state.moveHistory.map(m => ({ ...m })),
+    ruleState: state.ruleState
+      ? {
+          ...state.ruleState,
+          positionKeys: [...state.ruleState.positionKeys],
+          banChaseTargets: [...state.ruleState.banChaseTargets],
+          banMoves: state.ruleState.banMoves.map(m => ({ ...m })),
+          red: { ...state.ruleState.red, jiangPieceIds: [...state.ruleState.red.jiangPieceIds], jiangZhuoPieceIds: [...state.ruleState.red.jiangZhuoPieceIds], zhuoCounts: { ...state.ruleState.red.zhuoCounts } },
+          black: { ...state.ruleState.black, jiangPieceIds: [...state.ruleState.black.jiangPieceIds], jiangZhuoPieceIds: [...state.ruleState.black.jiangZhuoPieceIds], zhuoCounts: { ...state.ruleState.black.zhuoCounts } },
+        }
+      : state.ruleState,
+  };
+}
 
 interface UndoInfo {
   pieceId: number;
@@ -1251,7 +1278,8 @@ export async function getBestMoveAsync(
   // 周期性让出主线程（与后台提示搜索一致）：残局闯关固定走本地 AI，hard 预算长达 2.5s，
   // 若全程同步阻塞会冻结 JS 线程，导致走子音效的音频桥接消息无法送达、AI 落子无声；
   // 分片让出后搜索期间音频/UI 保持响应，落子音效正常播放（搜索逻辑与结果不受影响）
-  return searchWithTimeBudget(state, maxDepth, timeBudget, 30);
+  // 在私有副本上搜索：让出期间调用方（React state）不会被改写成搜索树的中间局面
+  return searchWithTimeBudget(cloneForSearch(state), maxDepth, timeBudget, 30);
 }
 
 // ======================== 提示预计算（后台思考 / Ponder） ========================
@@ -1317,7 +1345,8 @@ const HINT_YIELD_INTERVAL_MS = 8;
 async function runHintSearch(state: GameState): Promise<AIMoveResult | null> {
   pureBestMode = true;
   try {
-    return await searchWithTimeBudget(state, MAX_DEPTH.hard, TIME_BUDGET.hard, HINT_YIELD_INTERVAL_MS);
+    // 同样在私有副本上搜索：提示预计算在后台与玩家操作并行，更不能改写 live state
+    return await searchWithTimeBudget(cloneForSearch(state), MAX_DEPTH.hard, TIME_BUDGET.hard, HINT_YIELD_INTERVAL_MS);
   } finally {
     pureBestMode = false;
   }

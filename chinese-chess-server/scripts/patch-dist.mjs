@@ -7,15 +7,19 @@
  * dist/index.js 只能手工修改，而手工修改会在下一次「重新打包/换版本」时被覆盖，
  * 导致改动丢失 —— 所以每一条改动都必须在本脚本里留一份可重放的补丁。
  *
- * 本脚本当前承载两条补丁（都幂等、都进 --check 闸门）：
+ * 本脚本当前承载四条补丁（都幂等、都进 --check 闸门）：
  *
  *   补丁一「长将长捉不拦截」：删掉服务端对禁着的二次拦截与「连续 3 次判负」。
  *     丢失症状：客户端能走的着法被服务端以 400「禁着，请变招」拒绝。
  *   补丁二「畸形 FEN 行宽校验」：在进入 Pikafish WASM 之前拦下行宽 ≠ 9 的 FEN。
  *     丢失症状：畸形 FEN 让 WASM 越界写内存（memory access out of bounds），
  *     4 个 worker 一起崩，/api/v1/ai/move 返回 500、/api/v1/ai/stats 的 ready 掉到 3。
+ *   补丁三/四「初始局面上传校验」：收紧旧协议的完整局面上传分支
+ *     （POST /rooms/:roomId/gameState 不带 move）。
+ *     丢失症状：**任何人只要知道 6 位房间号，就能匿名改写对局棋盘、甚至伪造胜负**
+ *     （详见下方补丁三头部的完整分析）。
  *
- * 本文件因此是这两条规则的**唯一权威载体**：
+ * 本文件因此是这几条规则的**唯一权威载体**：
  *   1. 补丁是**幂等**的：已打过则 no-op，不会重复注入。
  *   2. 补丁是**可校验**的：`node scripts/patch-dist.mjs --check`
  *      会被 scripts/start.mjs 在每次启动前自动执行；任一补丁丢失则拒绝启动。
@@ -103,6 +107,109 @@ const FEN_GUARD = [
   '  }',
 ].join('\n');
 
+// ==================== 补丁三/四：初始局面上传校验（越权改写对局棋盘） ====================
+/**
+ * 背景（已核查的漏洞）：actMove 的「旧协议」分支——即 `POST /rooms/:roomId/gameState`
+ * 的 body 带 gameState 而不带 move 时——**没有任何门控**：不校验阶段、不校验座位、
+ * 甚至不读 playerId（只需房间号），直接 `room.gameState = gameState;` 并把随请求带来的
+ * `gameOver`/`winner` 写进房间终局状态。
+ *
+ * 该分支的唯一合法用途是「上传初始局面」：开局时由选边方用 `applyHandicap(createInitialState())`
+ * 的结果建立棋盘，此后所有着法都走 actMove 新协议分支（服务端规则引擎权威裁决）。
+ * 但旧分支在任何阶段都可达，于是：
+ *   - 任何人只需知道 6 位房间号，就能 POST 一个完整局面改写正在进行中的棋盘，并立即广播给
+ *     双方与所有观战者（房间号是 Math.floor(1e5 + Math.random()*9e5)，≤90 万，可枚举）；
+ *   - 附加 `{"gameOver":true,"winner":"red"}` 即可凭空终局、伪造胜负；`winner:"draw"` 伪造和棋；
+ *   - 该写入还会顺手清掉 pendingUndo/pendingDraw，掐断正在进行的悔棋/求和协商；
+ *   - 服务端之后会**以这个被污染的棋盘继续裁决**（下一手用 ruleEngine 校验该棋盘）；
+ *   - actStart 不重置 room.gameState，因此 waiting 阶段种下的伪造局面会存活进新对局。
+ * （另一条 WS `move` 通道同样能进这个分支，但 WS 侧有座位与观战者校验，HTTP 侧完全没有。）
+ *
+ * 客户端确认：唯一调用方是 lanBattle 的 uploadInitialGame，body 为 `{playerId, gameState}`，
+ * 其中 gameState 是 `applyHandicap(createInitialState(), 房间让子)`——**moveHistory 必为空数组**，
+ * 且请求确实带 playerId，因此下面的收紧不会误伤这条唯一合法路径。
+ */
+const UPLOAD_PATCH_NOTE = '初始局面上传收紧：仅房内玩家、且仅在本局尚未产生任何着法时可上传（防匿名改写棋盘/伪造胜负）';
+
+/**
+ * 注入点：旧协议分支里「真正开始产生副作用」的第一行，即时钟扣减条件的判断。
+ * ⚠️ 不要锚 `room.gameState = gameState;`：那会把校验放在时钟扣减**之后**，
+ * 被拒绝的请求仍会先改写 room.clocks。必须锚在副作用块之前。
+ * ⚠️ 也不要用多行锚点（例如把上方注释一起写进来）：实测该分支的注释与代码之间
+ * 夹着一行只含空白的行，多行锚点永远匹配不上（首次实现踩过这个坑）。
+ */
+const UPLOAD_ANCHOR = '  if (room.clocks && nextMoveCount > prevMoveCount && room.lastMoveTime) {';
+
+/**
+ * 注入的保护块 + 原锚点行。校验必须在**任何副作用之前**（含时钟扣减），
+ * 且被拒绝时直接 return（不得穿透到下方的 lastMoveTime/pendingUndo/pendingDraw
+ * 清理与 gameOver 终局副作用）。
+ * 幂等标记是首行完整注释，因此 diff/裁剪工具只会整除整段。
+ */
+const UPLOAD_GUARD = [
+  `  // ${UPLOAD_PATCH_NOTE}。`,
+  '  // 理由：该分支是「旧协议完整局面上传」，唯一合法用途是建立初始局面；',
+  '  // 若不加这道校验，任何人仅凭房间号就能越过规则引擎直接改写对局棋盘并伪造胜负。',
+  '  // 约束「本局尚无着法」而非「阶段为 waiting」：waiting 阶段 room.gameState 本就为 null，',
+  '  // 而在线对局在选边公示结束前就可能已把 phase 置为 playing，此时客户端上传的正是第一个局面，',
+  '  // 若改判 phase 会把唯一合法上传路径一起拒掉、导致对局永远没有棋盘。',
+  '  // ⚠️ 本段由 scripts/patch-dist.mjs 注入，勿手改；dist 换版后需重跑该脚本。',
+  '  var uploader = room.players && room.players.find(function (p) { return p.id === body.playerId; });',
+  '  if (!uploader) {',
+  '    return { status: 403, body: { success: false, error: "forbidden", message: "\\u4EC5\\u623F\\u95F4\\u5185\\u73A9\\u5BB6\\u53EF\\u4E0A\\u4F20\\u521D\\u59CB\\u5C40\\u9762" } };',
+  '  }',
+  '  if (prevMoveCount !== 0 || nextMoveCount !== 0) {',
+  '    return { status: 403, body: { success: false, error: "forbidden", message: "\\u672C\\u5C40\\u5DF2\\u4EA7\\u751F\\u7740\\u6CD5\\uFF0C\\u4E0D\\u63A5\\u53D7\\u5B8C\\u6574\\u5C40\\u9762\\u4E0A\\u4F20" } };',
+  '  }',
+  UPLOAD_ANCHOR,
+].join('\n');
+
+/** 补丁四：删掉旧协议分支里由请求体驱动的终局副作用（初始局面永不可能是终局） */
+const GAME_OVER_ANCHOR = 'if (gameOver && winner) {';
+
+/**
+ * 从块首往前吃掉紧邻的注释行与空行，让删除范围包含说明该块的注释。
+ * @returns {number} 块首（含前置注释）的起始下标
+ */
+function findLeadingCommentStart(src, blockStart) {
+  let lineStart = src.lastIndexOf('\n', blockStart - 1) + 1;
+  let start = lineStart;
+  for (;;) {
+    if (lineStart === 0) break;
+    const prevLineStart = src.lastIndexOf('\n', lineStart - 2) + 1;
+    const prevLine = src.slice(prevLineStart, lineStart - 1);
+    if (!/^\s*(\/\/|$)/.test(prevLine)) break;
+    start = prevLineStart;
+    lineStart = prevLineStart;
+  }
+  return start;
+}
+
+/** 删除旧协议分支里的 `if (gameOver && winner) { ... }` 整块；幂等（已删则原样返回） */
+function removeGameOverBlock(src) {
+  const at = src.indexOf(GAME_OVER_ANCHOR);
+  if (at < 0) return src;
+  const blockStart = findLeadingCommentStart(src, src.lastIndexOf('\n', at) + 1);
+  const end = findBlockEnd(src, at);
+  const cutEnd = src[end] === '\n' ? end + 1 : end;
+  return src.slice(0, blockStart) + src.slice(cutEnd);
+}
+
+/**
+ * 注入补丁三/四：先删掉请求体驱动的终局副作用，再把上传校验插到落盘赋值之前。
+ * 幂等：uploadPatched 为真则原样返回。
+ * @returns {string} 注入后的源码
+ */
+function insertUploadGuard(src) {
+  if (analyzeUpload(src).uploadPatched) return src;
+  let out = removeGameOverBlock(src);
+  if (!out.includes(UPLOAD_ANCHOR)) {
+    throw new Error('找不到初始局面上传的落盘赋值锚点；dist 可能已换版');
+  }
+  out = out.replace(UPLOAD_ANCHOR, UPLOAD_GUARD);
+  return out;
+}
+
 /**
  * 从 `start` 处的 `if (...) {` 起，按花括号配平找出整块 if 语句的结束位置。
  * @returns {number} 结束花括号之后的下标
@@ -160,6 +267,31 @@ function analyzeFen(src) {
   };
 }
 
+/** 补丁三/四（初始局面上传校验）的状态分析 */
+function analyzeUpload(src) {
+  const hasUploadGuard = src.includes(UPLOAD_PATCH_NOTE);
+  const hasUploadAnchor = src.includes(UPLOAD_ANCHOR);
+  const hasGameOverBlock = src.includes(GAME_OVER_ANCHOR);
+  return {
+    hasUploadGuard,
+    hasUploadAnchor,
+    hasGameOverBlock,
+    uploadPatched: hasUploadGuard && hasUploadAnchor && !hasGameOverBlock,
+  };
+}
+
+/**
+ * 补丁三/四的稳定不变量：**补丁标记的存在必须与「防伪保护确实生效」完全同真同假**。
+ * 用它做写盘闸门（而不是单独查几个标记），可以同时挡住两类事故：
+ *   - 标记丢了但拦截逻辑还在 → 已生效的保护会在下次基于上游新版 dist 重新打补丁时
+ *     被静默跳过（replace 不命中，不报错），保护悄悄消失；
+ *   - 标记在但拦截逻辑丢了 → --check 会误报「已打补丁」，实际大门敞开。
+ */
+function uploadInvariantHolds(src, expectedPatched) {
+  const s = analyzeUpload(src);
+  return s.uploadPatched === expectedPatched;
+}
+
 /**
  * 注入补丁二：模块级 `isFenBoardShapeValid` 辅助函数 + /move 路由内的 400 拦截块。
  * 幂等：已注入（FEN_PATCH_NOTE 存在）则原样返回。
@@ -192,10 +324,18 @@ function main() {
   const src = fs.readFileSync(DIST, 'utf8');
 
   // ------------------------------------------------------------------
+  // 统一换行为 LF（一次性、幂等）：dist/index.js 历史上是 CRLF，而部分补丁锚点是
+  // 多行字面量（含 `\n`，如补丁三的落盘赋值锚点），CRLF 会让它们永远匹配不上。
+  // 逐条锚点去兼容 \r?\n 既啰嗦又容易漏，这里改成「先规范化、再打补丁」。
+  // 该改动只涉及换行符，不影响 JavaScript 语义；规范化后，产物里每条补丁的锚点
+  // 都只在一种换行约定下书写，长期更稳。已规范化时这里是 no-op。
+  // ------------------------------------------------------------------
+  let working = src.replace(/\r\n/g, '\n');
+
+  // ------------------------------------------------------------------
   // 补丁二（畸形 FEN 拦截）：纯增量 + 幂等，与补丁一的处理互不依赖，
   // 所以先跑。--check 时同样参与闸门：缺任一条补丁都拒绝启动。
   // ------------------------------------------------------------------
-  let working = src;
   let fenChanged = false;
   if (!analyzeFen(working).fenPatched) {
     if (checkOnly) {
@@ -218,16 +358,51 @@ function main() {
     fenChanged = true;
   }
 
-  // 写盘 + 读回校验的统一出口：两条补丁的标记都必须齐备。
+  // ------------------------------------------------------------------
+  // 补丁三/四（初始局面上传校验）：同样是纯增量 + 幂等，独立于补丁一。
+  // --check 时也参与闸门——这条是安全性修复，缺失必须拒绝启动。
+  // ------------------------------------------------------------------
+  let uploadChanged = false;
+  if (!analyzeUpload(working).uploadPatched) {
+    if (checkOnly) {
+      fail(
+        '⚠️ dist/index.js 缺少「初始局面上传收紧」补丁！\n' +
+        '  旧协议的完整局面上传分支没有门控：任何人只要知道 6 位房间号，就能匿名改写\n' +
+        '  进行中的对局棋盘，并用 gameOver/winner 伪造胜负。\n' +
+        '  修复：node scripts/patch-dist.mjs',
+      );
+    }
+    try {
+      working = insertUploadGuard(working);
+    } catch (e) {
+      fail(`注入「初始局面上传收紧」补丁失败：${e.message}`);
+    }
+    if (!uploadInvariantHolds(working, true)) {
+      fail('注入后的产物状态不符合预期，已放弃写入（dist/index.js 未被修改）');
+    }
+    uploadChanged = true;
+  }
+
+  // 写盘 + 读回校验的统一出口：补丁标记与真实性的不变量都必须成立。
   const commit = (next, message) => {
     fs.writeFileSync(DIST, next, 'utf8');
     const reread = fs.readFileSync(DIST, 'utf8');
     if (!reread.includes(PATCH_NOTE) || !reread.includes(FEN_PATCH_NOTE)) {
       fail('写入后读回校验失败，dist/index.js 可能处于未知状态，请检查');
     }
+    if (!uploadInvariantHolds(reread, true)) {
+      fail('写入后读回校验失败（初始局面上传保护未生效），请检查 dist/index.js');
+    }
     console.log(message);
     return true;
   };
+
+  // 本轮改动摘要：另两条补丁是纯增量的，任何一次执行都可能顺带把它们补上，
+  // 输出必须如实反映，否则「no-op」字样会掩盖刚刚发生的安全修复。
+  const extras = [];
+  if (fenChanged) extras.push('FEN 行宽校验补丁');
+  if (uploadChanged) extras.push('初始局面上传收紧补丁');
+  const withExtras = msg => (extras.length ? `${msg}；已注入 ${extras.join(' + ')}` : msg);
 
   const before = analyze(working);
 
@@ -236,8 +411,8 @@ function main() {
   // 产物本身逻辑是对的（已无拦截），所以只补标记、不动逻辑。
   if (restoreMarker) {
     if (before.patched) {
-      const msg = fenChanged ? 'patch-dist: 补丁标记已存在；已注入 FEN 行宽校验补丁' : 'patch-dist: 补丁标记已存在，无需处理（no-op）';
-      return fenChanged ? commit(working, msg) : (console.log(msg), true);
+      const msg = withExtras('patch-dist: 补丁标记已存在，无需处理（no-op）');
+      return extras.length ? commit(working, msg) : (console.log(msg), true);
     }
     if (before.hasAnchor || before.hasRecordBanViolation) {
       fail('--restore-marker 只适用于「拦截块已删、标记丢失」的状态；当前产物里还有禁着拦截逻辑，请直接执行 node scripts/patch-dist.mjs');
@@ -250,12 +425,7 @@ function main() {
     if (!after.patched || after.hasAnchor || after.hasRecordBanViolation) {
       fail('补标记后的产物状态不符合预期，已放弃写入（dist/index.js 未被修改）');
     }
-    return commit(
-      markerSrc,
-      fenChanged
-        ? 'patch-dist: 已补回补丁标记（拦截块本就缺失，未改动逻辑）+ FEN 行宽校验补丁'
-        : 'patch-dist: 已补回补丁标记（拦截块本就缺失，未改动逻辑）',
-    );
+    return commit(markerSrc, withExtras('patch-dist: 已补回补丁标记（拦截块本就缺失，未改动逻辑）'));
   }
 
   // --- 情形 1：已打过补丁 ---
@@ -266,9 +436,8 @@ function main() {
         '  请从版本库恢复 dist/index.js 后重跑：node scripts/patch-dist.mjs',
       );
     }
-    return fenChanged
-      ? commit(working, 'patch-dist: 禁着拦截补丁已存在；已注入 FEN 行宽校验补丁')
-      : (console.log('patch-dist: 补丁已存在，无需处理（no-op）'), true);
+    const msg = withExtras('patch-dist: 禁着拦截补丁已存在，无需重复注入');
+    return extras.length ? commit(working, msg) : (console.log(msg), true);
   }
 
   // --- 情形 2：只有 --check ---
@@ -324,7 +493,7 @@ function main() {
   return commit(
     patched,
     `patch-dist: 已删除禁着拦截块 ${cutEnd - blockStart} B` +
-      (fenChanged ? '，并注入 FEN 行宽校验补丁' : '（no-op）') +
+      (extras.length ? `，并注入 ${extras.join(' + ')}` : '（no-op）') +
       `（dist/index.js ${Buffer.byteLength(src)} B -> ${Buffer.byteLength(patched)} B）`,
   );
 }
@@ -343,13 +512,20 @@ export {
   main,
   analyze,
   analyzeFen,
+  analyzeUpload,
   findBlockEnd,
+  findLeadingCommentStart,
   insertMarker,
   insertFenGuard,
+  insertUploadGuard,
+  removeGameOverBlock,
   DIST,
   PATCH_NOTE,
   ANCHOR,
   FEN_PATCH_NOTE,
   FEN_ANCHOR,
   FEN_HELPER_ANCHOR,
+  UPLOAD_PATCH_NOTE,
+  UPLOAD_ANCHOR,
+  GAME_OVER_ANCHOR,
 };

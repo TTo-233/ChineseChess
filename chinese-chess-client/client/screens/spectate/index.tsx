@@ -19,6 +19,8 @@ import { useMoveEffect } from '@/hooks/useMoveEffect';
 import { playJiangJunSound, playSound, preloadSounds, unloadAllSounds } from '@/utils/SoundManager';
 import { getOnlineServerUrl } from '@/utils/serverConfig';
 import { BattleSocket } from '@/utils/battleSocket';
+import { useBattleStateSync } from '@/hooks/useBattleStateSync';
+import { type BattlePlayer } from '@/utils/battleProtocol';
 import { useBoardLayoutBudget, capHostHeightToViewport } from '@/utils/chess/capturedDrawerMetrics';
 import { boardAlignedRowStyle } from '@/utils/chess/boardContentWidth';
 import { useBoardStyle } from '@/utils/chess/boardStyleStore';
@@ -43,12 +45,8 @@ const screenWidth = Dimensions.get('window').width;
 // 窗口高度：用于把棋盘宿主实测高度封顶到视口内，打断宽屏纵向溢出的正反馈
 const windowHeight = Dimensions.get('window').height;
 
-interface RoomPlayer {
-  id: string;
-  name: string;
-  side: string | null;
-  ready: boolean;
-}
+// 观战页只读取 id / name / side：直接改用协议层类型，避免本地接口与负载形状重复定义
+type RoomPlayer = BattlePlayer;
 
 // 服务端权威钟面（毫秒）+ 插值锚点：与在线对局同口径，观战端据此展示双方局时
 interface ClockSnap {
@@ -123,10 +121,8 @@ export default function SpectateScreen() {
   const byoyomiRef = useRef(0);
   // 活跃表情：按首次接收时间本地计时，超时移除（与服务端 EMOJI_TTL 无关，纯展示生命周期）
   const [activeEmojis, setActiveEmojis] = useState<{ id: string; playerId: string; emoji: string; receivedAt: number }[]>([]);
-  const seenEmojiIdsRef = useRef<Set<string>>(new Set());
 
   const { moveEffect, triggerMoveEffect } = useMoveEffect();
-  const seenHistoryLenRef = useRef(0);
   // 被吃棋子明细抽屉展开的一侧（null=收起），抽屉渲染在顶部标题行正下方（与人机对战一致）
   const [capturedDrawerSide, setCapturedDrawerSide] = useState<'opponent' | 'mine' | null>(null);
   const phaseRef = useRef<SpectatePhase>('connecting');
@@ -190,106 +186,61 @@ export default function SpectateScreen() {
     setPhase(p);
   }, []);
 
-  // 应用服务端返回的对局快照：更新局面、玩家、阶段，并检测新走棋触发特效
-  const applySnapshot = useCallback((data: {
-    gameState?: GameState | null;
-    players?: RoomPlayer[];
-    phase?: string;
-    winner?: string | null;
-    spectatorCount?: number;
-    clocks?: { red: number; black: number } | null;
-    clockPausedAt?: number | null;
-    lastMoveTime?: number;
-    serverNow?: number;
-    settings?: { turnTimeLimit?: number; byoyomiSeconds?: number } | null;
-    emojiMessages?: { id: string; playerId: string; emoji: string }[];
-    returnedToRoom?: ReturnedRecord;
-  }) => {
-    if (!mountedRef.current) return;
-
-    if (Array.isArray(data.players)) setPlayers(data.players);
-    if (typeof data.spectatorCount === 'number') setSpectatorCount(data.spectatorCount);
-
-    // 服务端时钟校正：所有与服务端时间戳的比较统一走校正时间（否则局时/步时会随时钟漂移）
-    if (typeof data.serverNow === 'number') {
-      serverTimeOffsetRef.current = data.serverNow - Date.now();
-    }
-
-    // 房间读秒与步时设置同步
-    if (data.settings) {
-      if (typeof data.settings.turnTimeLimit === 'number') setTurnTimeLimit(data.settings.turnTimeLimit);
-      if (typeof data.settings.byoyomiSeconds === 'number') byoyomiRef.current = data.settings.byoyomiSeconds;
-    }
-
-    // 表情同步：服务端按 id 下发，本地按 id 去重（WS 与轮询双通道都会带，按 id 幂等）
-    if (Array.isArray(data.emojiMessages)) {
-      for (const m of data.emojiMessages) {
-        if (!m || typeof m.id !== 'string' || typeof m.emoji !== 'string') continue;
-        if (seenEmojiIdsRef.current.has(m.id)) continue;
-        seenEmojiIdsRef.current.add(m.id);
-        setActiveEmojis(prev =>
-          [...prev, { id: m.id, playerId: m.playerId, emoji: m.emoji, receivedAt: Date.now() }]
-        );
-      }
-    }
-
-    // 步时倒计时锚点：对方走棋/悔棋后服务端刷新 lastMoveTime
-    if (typeof data.lastMoveTime === 'number' && data.lastMoveTime > 0) {
-      lastMoveTimeRef.current = data.lastMoveTime;
-    }
-
-    // 局时钟面快照（服务端权威毫秒 + 锚点）：与在线对局同口径，本地 1s 插值展示
-    if (data.clocks && typeof data.clocks.red === 'number' && typeof data.clocks.black === 'number' && data.gameState) {
-      clockSnapRef.current = {
-        red: data.clocks.red,
-        black: data.clocks.black,
-        lastMoveTime: typeof data.lastMoveTime === 'number' ? data.lastMoveTime : Date.now(),
-        sideTag: data.gameState.sideTag,
-        clockPausedAt: typeof data.clockPausedAt === 'number' ? data.clockPausedAt : null,
-      };
-    } else if (!data.clocks) {
-      // 对局未启用局时（或房间被重置）：清空展示，避免残留上一局残留时间
-      clockSnapRef.current = null;
-    }
-
-    // 对局阶段流转
-    if (data.phase === 'ended') {
-      setWinner(data.winner ?? null);
-      setPhaseSafe('ended');
-    } else if (data.phase === 'waiting') {
-      // 对局被重新开一局（rematch），观战结束
-      if (phaseRef.current === 'playing' || phaseRef.current === 'ended') {
-        setPhaseSafe('restarted');
-      }
-    } else if (data.phase === 'playing') {
-      setPhaseSafe('playing');
-    }
-
-    if (data.gameState) {
-      const newState = data.gameState;
-      setGameState(newState);
-
-      // 走棋检测：着法数增加 → 触发吃子/将军特效与音效
-      const historyLen = newState.moveHistory.length;
-      if (historyLen > seenHistoryLenRef.current) {
-        const last = newState.moveHistory[historyLen - 1];
-        triggerMoveEffect(last.capturedPieceId, newState.isCheck, data.phase === 'ended');
-        // 走子音效：将军时播男声将军语音（内置节流），否则吃子/走子音（终局不播）
-        if (data.phase !== 'ended') {
-          if (newState.isCheck) {
-            playJiangJunSound();
-          } else if (last.capturedPieceId !== -1) {
-            playSound('eat');
-          } else {
-            playSound('go');
-          }
+  // 服务端负载 → 页面状态：与在线对局共用同一实现（hooks/useBattleStateSync）。
+  // 合并前本页另有一份 applySnapshot，与 lanBattle 的 applyServerState 已分叉
+  // （观战侧无乐观保护、不读 returnedToRoom），且缺少「控制信息不受局面延迟影响」的保证。
+  // 观战者不参与对局动作，故不注入乐观保护/协商/断线标记相关配置。
+  const { applyPayload: applySnapshot } = useBattleStateSync({
+    selfId: spectatorIdRef.current,
+    // 观战页的阶段由本页自己的状态机管理，仅供 Hook 判断「结算 → 重赛」迁移
+    currentPhase: () => phaseRef.current,
+    // 观战页 enter 是异步的，响应可能晚于卸载；经 mountedRef 丢弃已卸载后的帧
+    isActive: () => mountedRef.current,
+    serverTimeOffsetRef,
+    lastMoveTimeRef,
+    byoyomiRef,
+    clockSnapRef,
+    setGameState,
+    setPlayers,
+    setSpectatorCount,
+    setTurnTimeLimit,
+    handlers: {
+      // 阶段流转（服务端驱动）：结束 → 结算页；重开一局 → 提示观战已结束
+      onPhaseChange: ({ serverPhase, prevPhase }) => {
+        if (serverPhase === 'ended') {
+          setPhaseSafe('ended');
+        } else if (serverPhase === 'waiting') {
+          // 对局被重新开一局（rematch），观战结束
+          if (prevPhase === 'playing' || prevPhase === 'ended') setPhaseSafe('restarted');
+        } else if (serverPhase === 'playing') {
+          setPhaseSafe('playing');
         }
-        seenHistoryLenRef.current = historyLen;
-      } else if (historyLen < seenHistoryLenRef.current) {
-        seenHistoryLenRef.current = historyLen;
-      }
-    }
-  }, [setPhaseSafe, triggerMoveEffect]);
+      },
+      onEnded: info => setWinner(info.winner),
+      onEmoji: message =>
+        setActiveEmojis(prev => [
+          ...prev,
+          { id: message.id, playerId: message.playerId, emoji: message.emoji, receivedAt: Date.now() },
+        ]),
+      // 局面已应用：着法数增加 → 触发吃子/将军特效与音效
+      onBoardApplied: ({ state, isNewMove }) => {
+        if (!isNewMove) return;
+        const last = state.moveHistory[state.moveHistory.length - 1];
+        if (!last) return;
+        const ended = phaseRef.current === 'ended';
+        triggerMoveEffect(last.capturedPieceId, state.isCheck, ended);
+        // 走子音效：将军时播男声将军语音（内置节流），否则吃子/走子音（终局不播）
+        if (ended) return;
+        if (state.isCheck) {
+          playJiangJunSound();
+        } else if (last.capturedPieceId !== -1) {
+          playSound('eat');
+        } else {
+          playSound('go');
+        }
+      },
+    },
+  });
 
   // 局时展示：服务端快照为锚点做 1s 本地插值（仅走棋方钟走动；悔棋/求和协商期以暂停锚点冻结）
   // 观战端不做任何超时判负——判负由服务端裁定，观战只如实呈现钟面。
@@ -363,12 +314,6 @@ export default function SpectateScreen() {
     return () => clearInterval(timer);
   }, [activeEmojis.length]);
 
-  // applySnapshot 的最新引用（供 WS/轮询回调使用，避免把不稳定的依赖塞进 effect 依赖数组）
-  const applySnapshotRef = useRef(applySnapshot);
-  useEffect(() => {
-    applySnapshotRef.current = applySnapshot;
-  });
-
   // 预加载常用音效并预热音频模式（观战同样播放走子音效，避免首声漏播）；退出观战时释放全部音效
   useEffect(() => {
     preloadSounds();
@@ -420,12 +365,26 @@ export default function SpectateScreen() {
       roomId,
       spectatorIdRef.current,
       {
-        onState: data => applySnapshotRef.current(data),
-        onStatusChange: connected => setWsConnected(connected),
-        onFatalError: message => {
+        onState: data => applySnapshot(data),
+        onStatusChange: connected => {
+          setWsConnected(connected);
+          // 连上即清除断线提示/错误遮罩：否则一次瞬时网络故障的提示会永久留在页面上
+          if (connected) setErrorMsg('');
+        },
+        onFatalError: (message, kind) => {
+          setWsConnected(false);
+          // kind='network'（自动重连用尽）只是长时间离线：会话可能仍有效，
+          // 切 error 终态会误报"无法进入观战"并停掉 2s 兜底轮询，故只提示不切阶段。
+          if (kind === 'network') {
+            setErrorMsg('网络连接已断开，请检查网络后重新进入观战');
+            return;
+          }
           setErrorMsg(message || '无法进入观战');
           setPhaseSafe('error');
         },
+        // 协议级失败帧（「观战者无法执行该操作」「未知消息类型」等）：观战侧无操作可做，
+        // 但仍要透出，否则服务端拒绝时页面毫无反应。观战页的错误态是终态展示，故只记文案。
+        onError: message => setErrorMsg(message),
       },
       'spectator',
     );
@@ -435,7 +394,7 @@ export default function SpectateScreen() {
       spectateSocketRef.current = null;
       socket.close();
     };
-  }, [roomId, setPhaseSafe]);
+  }, [roomId, setPhaseSafe, applySnapshot]);
 
   // 轮询对局状态（开放端点）：WebSocket 兜底通道，仅在 WS 未连接时启用
   useEffect(() => {
@@ -455,7 +414,7 @@ export default function SpectateScreen() {
         const data = await response.json();
         // GET /gameState 返回的是对局负载本体（无 success 包装字段），
         // 旧写法 if (data.success) 恒为假，导致 WS 断线后的轮询兜底从未生效
-        if (data && Array.isArray(data.players)) applySnapshotRef.current(data);
+        if (data && Array.isArray(data.players)) applySnapshot(data);
       } catch {
         // 轮询瞬时失败忽略，下一轮重试
       } finally {
@@ -463,7 +422,7 @@ export default function SpectateScreen() {
       }
     }, 2000);
     return () => clearInterval(timer);
-  }, [roomId, wsConnected]);
+  }, [roomId, wsConnected, applySnapshot]);
 
   // 观战心跳：保持在观众计数中
   useEffect(() => {
@@ -782,8 +741,10 @@ export default function SpectateScreen() {
           </View>
         )}
 
-        {/* 出错遮罩 */}
-        {phase === 'error' && (
+        {/* 出错遮罩：以 errorMsg 为准而非 phase === 'error'——网络断开/协议级失败时
+            我们刻意不切 error 阶段（那会停掉 2s 兜底轮询并误判为终态），若仍用阶段判断，
+            这些提示就会写进 state 却永远看不见 */}
+        {!!errorMsg && (
           <View style={styles.overlay}>
             <View style={styles.overlayCard}>
               <FontAwesome6 name="circle-exclamation" size={34} color={COLORS.danger} />

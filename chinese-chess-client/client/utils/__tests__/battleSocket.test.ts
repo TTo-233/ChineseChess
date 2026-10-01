@@ -155,7 +155,8 @@ describe('BattleSocket 心跳与可见性', () => {
     const { socket, ws } = await connectSocket({ onFatalError });
     opened = socket;
     ws.emit({ type: 'error', message: '房间不存在' });
-    expect(onFatalError).toHaveBeenCalledWith('房间不存在');
+    // 第二个参数是性质：'session' = 会话已终结（页面切终态）；'network' = 仅连接失败（页面不切终态）
+    expect(onFatalError).toHaveBeenCalledWith('房间不存在', 'session');
     ws.close();
     jest.advanceTimersByTime(30000);
     expect(FakeWebSocket.instances).toHaveLength(1);
@@ -166,7 +167,7 @@ describe('BattleSocket 心跳与可见性', () => {
     const { socket, ws } = await connectSocket({ onFatalError });
     opened = socket;
     ws.emit({ type: 'error', message: '玩家不在房间中' });
-    expect(onFatalError).toHaveBeenCalledWith('玩家不在房间中');
+    expect(onFatalError).toHaveBeenCalledWith('玩家不在房间中', 'session');
   });
 
   it('收到「对局已有玩家离开」致命错误 → 停止重连（观战不会陷入无限重连）', async () => {
@@ -174,10 +175,60 @@ describe('BattleSocket 心跳与可见性', () => {
     const { socket, ws } = await connectSocket({ onFatalError }, 'spectator');
     opened = socket;
     ws.emit({ type: 'error', message: '对局已有玩家离开，观战已结束' });
-    expect(onFatalError).toHaveBeenCalledWith('对局已有玩家离开，观战已结束');
+    expect(onFatalError).toHaveBeenCalledWith('对局已有玩家离开，观战已结束', 'session');
     ws.close();
     jest.advanceTimersByTime(30000);
     expect(FakeWebSocket.instances).toHaveLength(1);
+  });
+
+  // 握手阶段的两条拒绝此前漏在致命白名单外：服务端 sendJson 后立即 ws.close()，
+  // 客户端于是走 onclose → scheduleReconnect → 再次被拒，形成无限重连循环。
+  it.each(['缺少 playerId', '缺少 roomId'])('握手阶段拒绝「%s」→ 视为致命，不再重连', async message => {
+    const onFatalError = jest.fn();
+    const { socket, ws } = await connectSocket({ onFatalError });
+    opened = socket;
+    ws.emit({ type: 'error', message });
+    expect(onFatalError).toHaveBeenCalledWith(message, 'session');
+    ws.close();
+    jest.advanceTimersByTime(30000);
+    expect(FakeWebSocket.instances).toHaveLength(1);
+  });
+
+  it('自动重连用尽 → 以 kind=network 上抛，且停止自动重连（页面据此只提示不切终态）', async () => {
+    const onFatalError = jest.fn();
+    const { socket, ws: first } = await connectSocket({ onFatalError });
+    opened = socket;
+    let ws = first;
+    // 每次退避都失败：新建的连接从不 open，因此重连计数不会清零
+    for (let i = 0; i < 8; i += 1) {
+      ws.close();
+      jest.advanceTimersByTime(8000);
+      ws = FakeWebSocket.instances[FakeWebSocket.instances.length - 1];
+    }
+    expect(onFatalError).toHaveBeenCalled();
+    const last = onFatalError.mock.calls[onFatalError.mock.calls.length - 1] as [string, string];
+    expect(last[1]).toBe('network');
+    expect(last[0]).toContain('网络');
+    // 用尽后停止自动重连：再等下去也不会创建新连接
+    const settled = FakeWebSocket.instances.length;
+    jest.advanceTimersByTime(60000);
+    expect(FakeWebSocket.instances).toHaveLength(settled);
+  });
+
+  it('重连用尽后回到前台（setHidden(false)）可重新开始自动重连', async () => {
+    const onFatalError = jest.fn();
+    const { socket, ws: first } = await connectSocket({ onFatalError });
+    opened = socket;
+    let ws = first;
+    for (let i = 0; i < 8; i += 1) {
+      ws.close();
+      jest.advanceTimersByTime(8000);
+      ws = FakeWebSocket.instances[FakeWebSocket.instances.length - 1];
+    }
+    const exhausted = FakeWebSocket.instances.length;
+    socket.setHidden(true);
+    socket.setHidden(false); // 回到前台 → resume() 清零退避计数并立即重连
+    expect(FakeWebSocket.instances.length).toBe(exhausted + 1);
   });
 
   it('welcome/state 推送经 onState 分发（状态刷新通道正常）', async () => {

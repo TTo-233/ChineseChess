@@ -27509,6 +27509,20 @@ function actMove(roomId, body) {
   const { gameState, gameOver, winner } = body;
   const prevMoveCount = Array.isArray(room.gameState?.moveHistory) ? room.gameState.moveHistory.length : 0;
   const nextMoveCount = Array.isArray(gameState?.moveHistory) ? gameState.moveHistory.length : 0;
+  // 初始局面上传收紧：仅房内玩家、且仅在本局尚未产生任何着法时可上传（防匿名改写棋盘/伪造胜负）。
+  // 理由：该分支是「旧协议完整局面上传」，唯一合法用途是建立初始局面；
+  // 若不加这道校验，任何人仅凭房间号就能越过规则引擎直接改写对局棋盘并伪造胜负。
+  // 约束「本局尚无着法」而非「阶段为 waiting」：waiting 阶段 room.gameState 本就为 null，
+  // 而在线对局在选边公示结束前就可能已把 phase 置为 playing，此时客户端上传的正是第一个局面，
+  // 若改判 phase 会把唯一合法上传路径一起拒掉、导致对局永远没有棋盘。
+  // ⚠️ 本段由 scripts/patch-dist.mjs 注入，勿手改；dist 换版后需重跑该脚本。
+  var uploader = room.players && room.players.find(function (p) { return p.id === body.playerId; });
+  if (!uploader) {
+    return { status: 403, body: { success: false, error: "forbidden", message: "\u4EC5\u623F\u95F4\u5185\u73A9\u5BB6\u53EF\u4E0A\u4F20\u521D\u59CB\u5C40\u9762" } };
+  }
+  if (prevMoveCount !== 0 || nextMoveCount !== 0) {
+    return { status: 403, body: { success: false, error: "forbidden", message: "\u672C\u5C40\u5DF2\u4EA7\u751F\u7740\u6CD5\uFF0C\u4E0D\u63A5\u53D7\u5B8C\u6574\u5C40\u9762\u4E0A\u4F20" } };
+  }
   if (room.clocks && nextMoveCount > prevMoveCount && room.lastMoveTime) {
     const nextSideTag = gameState.sideTag;
     const mover = nextSideTag === true || nextSideTag === "red" ? "black" : "red";
@@ -27521,16 +27535,6 @@ function actMove(roomId, body) {
   room.lastActivity = Date.now();
   room.pendingUndo = null;
   room.pendingDraw = null;
-  if (gameOver && winner) {
-    room.phase = "ended";
-    if (winner === "draw") {
-      room.winner = null;
-      room.endReason = "draw";
-    } else {
-      room.winner = winner;
-      room.endReason = "checkmate";
-    }
-  }
   return { status: 200, body: { success: true } };
 }
 router.post("/rooms/:roomId/gameState", (req, res) => {
