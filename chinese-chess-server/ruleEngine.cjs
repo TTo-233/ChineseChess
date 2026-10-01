@@ -17,12 +17,13 @@ var __copyProps = (to, from, except, desc) => {
 };
 var __toCommonJS = (mod) => __copyProps(__defProp({}, "__esModule", { value: true }), mod);
 
-// chinese-chess-client/client/utils/chess/ruleEngine.bundle.ts
+// D:\Code\ChineseChess\chinese-chess-client\client\utils\chess\ruleEngine.bundle.ts
 var ruleEngine_bundle_exports = {};
 __export(ruleEngine_bundle_exports, {
   cloneGameState: () => cloneGameState,
   createInitialState: () => createInitialState,
-  getValidMoves: () => getValidMoves,
+  getSelectableMovesForParity: () => getSelectableMovesForParity,
+  getValidMoves: () => getValidMoves2,
   isMoveBanned: () => isMoveBanned,
   makeMove: () => makeMove
 });
@@ -891,6 +892,19 @@ function getSelectableMoves(state, pieceId) {
 function getValidMoves(state, pieceId) {
   return getSelectableMoves(state, pieceId);
 }
+function isMoveKingSafe(state, pieceId, toCol, toRow) {
+  const piece = state.pieces[pieceId];
+  if (!piece || !piece.alive) return false;
+  return !afterMoveStillJiangJun(
+    pieceId,
+    piece.col,
+    piece.row,
+    toCol,
+    toRow,
+    state.qiPan,
+    toPiecePositions(state.pieces)
+  );
+}
 function isJiangJun(state, jiangOrShuai) {
   const result = [-1, -1, -1];
   if (jiangOrShuai !== 0 && jiangOrShuai !== 16) return result;
@@ -1033,10 +1047,25 @@ function getWinnerSideTagFromReason(newSideTag, reason) {
       return !newSideTag;
   }
 }
+
+// chinese-chess-client/client/utils/chess/ruleEngine.bundle.ts
+function getValidMoves2(state, pieceId) {
+  const points = getSelectableMoves(state, pieceId);
+  for (let col = 0; col < 9; col++) {
+    for (let row = 0; row < 10; row++) {
+      if (points[col][row] && !isMoveKingSafe(state, pieceId, col, row)) {
+        points[col][row] = false;
+      }
+    }
+  }
+  return points;
+}
+var getSelectableMovesForParity = getValidMoves;
 // Annotate the CommonJS export names for ESM import in node:
 0 && (module.exports = {
   cloneGameState,
   createInitialState,
+  getSelectableMovesForParity,
   getValidMoves,
   isMoveBanned,
   makeMove

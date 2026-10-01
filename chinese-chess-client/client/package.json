@@ -15,7 +15,11 @@
     "preset": "jest-expo",
     "moduleNameMapper": {
       "^@/(.*)$": "<rootDir>/$1"
-    }
+    },
+    "testMatch": [
+      "<rootDir>/**/__tests__/**/*.test.[jt]s?(x)",
+      "<rootDir>/**/?(*.)+(spec|test).[jt]s?(x)"
+    ]
   },
   "dependencies": {
     "@expo/metro-runtime": "~6.1.2",

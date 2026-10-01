@@ -18,6 +18,7 @@ import { getBestMoveAsync, getHintMoveAsync, type AIMoveResult } from './AIEngin
 import {
   toFenString,
   getValidMoves,
+  isMoveKingSafe,
   makeMove,
   buildEngineHistory,
   isFenBoardWidthValid,
@@ -35,6 +36,7 @@ import {
   type OnlineMove,
 } from './onlineAI';
 import { isMoveBanned } from './RuleEngine';
+import { assertOnlineMoveSide, OnlineMoveGuardError } from './onlineMoveGuard';
 import { getPlayerId } from '@/utils/playerIdentity';
 import { getOnlineServerUrl } from '@/utils/serverConfig';
 
@@ -306,6 +308,27 @@ class OnlineAiInvalidMoveError extends OnlineAiError {
 }
 
 /**
+ * 入口守卫（归属方/回合/起点活子校验）。
+ *
+ * 实现放在无原生依赖的 onlineMoveGuard.ts（便于单测），这里只做一次错误类型折叠：
+ * 守卫抛 OnlineMoveGuardError，而 runHybrid 是按 OnlineAiInvalidMoveError 分类的
+ * （命中分支会记 lastInvalidMoveReason 并在 UI 暴露，且不计入熔断）。
+ */
+function resolveOnlineMoveSource(
+  state: GameState,
+  move: { uci: string; fromCol: number; fromRow: number }
+): PieceState {
+  try {
+    return assertOnlineMoveSide(state, move);
+  } catch (err) {
+    if (err instanceof OnlineMoveGuardError) {
+      throw new OnlineAiInvalidMoveError(err.reason);
+    }
+    throw err;
+  }
+}
+
+/**
  * 调用在线 AI 一次，并把云端走法定位/校验到当前局面。
  * 成功返回可用的在线走法；失败按原因抛出，供 runHybrid 决定退避重试还是熔断。
  */
@@ -340,17 +363,16 @@ async function requestOnlineMove(
     makeRequestId(),
     history ?? undefined
   );
-  const piece = state.pieces.find(
-    (p) => p.alive && p.col === online.fromCol && p.row === online.fromRow
-  );
-  if (!piece) {
-    throw new OnlineAiInvalidMoveError(
-      `起点 (${online.fromCol},${online.fromRow}) 无活子（服务端返回 ${online.uci}）`
-    );
-  }
+  // 归属方/回合 + 起点活子校验（见 onlineMoveGuard：服务端可能返回对方的着法）
+  const piece = resolveOnlineMoveSource(state, online);
   if (!isOnlineMoveLegal(state, piece, online.toCol, online.toRow)) {
     throw new OnlineAiInvalidMoveError(
       `走法 ${online.uci} 在当前局面不合法（源 ${piece.id}，落点 (${online.toCol},${online.toRow})）`
+    );
+  }
+  if (!isOnlineMoveKingSafe(state, piece.id, online.toCol, online.toRow)) {
+    throw new OnlineAiInvalidMoveError(
+      `走法 ${online.uci} 会让己方将/帅继续被攻击（送将），已丢弃并回退本地 AI`
     );
   }
   if (!isOnlineMoveRuleSafe(state, piece.id, online.toCol, online.toRow)) {
@@ -392,14 +414,24 @@ async function runHybrid(
     for (let attempt = 0; attempt <= BUSY_MAX_RETRY; attempt++) {
       try {
         const { piece, online } = await requestOnlineMove(state, difficulty, priority);
-        recordOnlineSuccess();
-        return {
+        const accepted: AIMoveResult = {
           pieceId: piece.id,
           fromCol: online.fromCol,
           fromRow: online.fromRow,
           toCol: online.toCol,
           toRow: online.toRow,
           score: 0,
+        };
+        // 出口断言（第二道）：requestOnlineMove 内部已挡送将，这里再确认一次，
+        // 保证"交到界面的走法"一定是安全的——即便将来有人改守卫顺序也不会漏。
+        if (!rejectMoverUnsafe(state, accepted)) {
+          throw new OnlineAiInvalidMoveError(
+            `走法 ${online.uci} 会让己方将/帅继续被攻击（送将）`
+          );
+        }
+        recordOnlineSuccess();
+        return {
+          ...accepted,
           source: 'online',
           depth: online.depth,
           timeMs: online.timeMs,
@@ -433,22 +465,61 @@ async function runHybrid(
       console.warn('[aiDispatcher] 在线 AI 失败但不熔断:', (error as Error).name, (error as Error).message);
     }
   }
-  // 回退：本地离线 AI
-  const offline = await offlineFallback();
+  // 回退：本地离线 AI。同样过出口断言——本地搜索本就不会产送将着法（逐层
+  // isSideInCheck 过滤），这里只在"未来改动破坏了那个前提"时兜住，宁可返回 null
+  // （界面提示无可用着法）也不把非法着法落进盘面。
+  const offline = rejectMoverUnsafe(state, await offlineFallback());
   if (!offline) return null;
   return { ...offline, source: 'offline' };
 }
 
 /**
  * 校验云端走法在当前局面下合法：
- * 1. 起点棋子必须属于当前走棋方（防止 FEN 不同步时误用对方棋子）；
- * 2. 落点必须在该棋子的合法走法内（含王安全过滤）。
+ * 1. 起点棋子必须**存在、存活、且属于当前走棋方**（防止 FEN 不同步或服务端在错误
+ *    局面上搜索时，把对方棋子/空格当成己方着法）；
+ * 2. 落点必须在该棋子的走法形状内（getValidMoves 只判形状，**不做王安全过滤**）；
+ * 3. 该着法不得送将（走后己方将/帅仍被攻击）。
+ *
+ * ⚠️ 第 2 条用 getValidMoves（只判棋子自身走法，见 GameEngine getSelectableMoves 的
+ * 注释），所以第 3 条必须单独判——第 2、3 条合起来才是完整的"合法着法"口径。
  * 任一不满足即视为在线失败，回退本地，杜绝非法落子破坏局面。
  */
 function isOnlineMoveLegal(state: GameState, piece: PieceState, toCol: number, toRow: number): boolean {
   const pieceIsMover = state.sideTag === RED_SIDE ? piece.id >= 16 : piece.id < 16;
   if (!pieceIsMover) return false;
   return !!getValidMoves(state, piece.id)[toCol]?.[toRow];
+}
+
+/**
+ * 走法是否不送将（走后己方将/帅不再被攻击，含将帅照面）。
+ *
+ * 为什么在线走法必须再过这一关（2026-09 实测）：
+ * 服务端 Pikafish 是标准象棋引擎，其合法着法生成**不含吃将**——当对方将/帅已处于
+ * 可被直接吃掉的位置时，它不会去吃，而是照常走别的着法（实测 5/5 局面如此）。
+ * 更靠近线一点：客户端把含送将着法的历史发给服务端后，皮卡鱼会**拒绝重放**该步，
+ * 于是服务端在「送将之前」的局面（轮到对方）上搜索，并把**对方的着法**当作己方
+ * 着法返回（实测：请求红方着法，返回的却是 (4,4)->(4,5) 这种黑方起点的着法）。
+ * 那种着法有时恰好也能通过 getValidMoves（起点上真有己方活子、落点也符合棋子走法），
+ * 于是被当作"在线走法"直接采纳，落出一个引擎根本没打算给的着法。
+ * 因此这里用 isMoveKingSafe 再筛一道，不满足就回退本地 AI。
+ */
+function isOnlineMoveKingSafe(state: GameState, pieceId: number, toCol: number, toRow: number): boolean {
+  return isMoveKingSafe(state, pieceId, toCol, toRow);
+}
+
+/**
+ * 统一出口过滤：任何来源（在线/本地）的着法在交给界面落子前，都必须确认它不会送将。
+ *
+ * 本地 AI 与本地提示的搜索本就逐层用 isSideInCheck 过滤（见 AIEngine），正常不会
+ * 产出送将着法；这里仍做一道出口断言，因为送将的后果不是"下得差一点"，而是
+ * **盘面进入非法状态且无法靠对方补救**（皮卡鱼不吃将，对局会永久僵在非法局面）。
+ * 判据与落子闸门（screens/game、screens/lanBattle）共用同一个 isMoveKingSafe，
+ * 三处口径一致。
+ */
+function rejectMoverUnsafe(state: GameState, move: AIMoveResult | null): AIMoveResult | null {
+  if (!move) return null;
+  if (isMoveKingSafe(state, move.pieceId, move.toCol, move.toRow)) return move;
+  return null;
 }
 
 /**

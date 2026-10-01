@@ -26572,11 +26572,39 @@ function registerSocketLivenessProbe(fn) {
   socketLivenessProbe = fn;
 }
 var WAITING_SWEEP_GRACE_MS = 30 * 1e3;
+// 被拒绝的动作回推权威状态（客户端只按 <400 收 state，被拒动作会导致画面永久停在乐观更新后的样子）
+// ⚠️ 本段由 scripts/patch-dist.mjs 注入，勿手改；dist 换版后需重跑该脚本（见该文件头注释）。
+//
+// 被拒绝的动作必须把**权威状态**也回推给双方。
+// 客户端应用服务端状态的唯一入口是 state 帧 / GET /rooms/:id/gameState，
+// 而服务端原本只在 result.status < 400 时才广播（且广播的是当前 room 状态）；
+// 于是"不是你的回合""非法走法（含送将）""对方的悔棋请求已被处理"这类拒绝
+// 会让客户端毫无感知：落子的乐观更新留在盘上、悔棋按钮停在"等待对方同意"，
+// 直到下一次成功动作才被顺带纠正。
+//
+// 这里在非 2xx 时补一次广播（room 未变，所以推过去的正是权威局面）。
+// 限流：同一房间 3 秒内最多 8 次，避免被连续非法请求刷屏；
+// 且只对 4xx 生效——5xx 属于服务端自身异常，不该顺手改写客户端对局画面。
+var syncRejectionCount = 0;
 function respondAction(res, roomId, result) {
+  var rejected = result.status >= 400;
   if (result.status < 400) {
-    const room = rooms.get(roomId);
-    if (room) roomBroadcaster(room);
+    syncRejectionCount = 0;
   }
+  var roomForSync = rooms.get(roomId);
+  if (rejected && result.status < 500 && roomForSync) {
+    var nowSync = Date.now();
+    var lastSyncAt = roomForSync.lastRejectionSyncAt || 0;
+    if (nowSync - lastSyncAt >= 3000) {
+      syncRejectionCount = 0;
+    }
+    if (syncRejectionCount < 8) {
+      syncRejectionCount += 1;
+      roomForSync.lastRejectionSyncAt = nowSync;
+      roomBroadcaster(roomForSync);
+    }
+  }
+
   res.status(result.status).json(result.body);
 }
 function generateRoomId() {

@@ -24,9 +24,9 @@ import { useFocusEffect } from 'expo-router';
 import { useNavigation, usePreventRemove, type NavigationProp } from '@react-navigation/native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { FontAwesome6 } from '@expo/vector-icons';
-import { createInitialState, applyHandicap, cloneGameState, getSelectableMoves, getValidMoves, makeMove, undoMove, getWinnerSideTag, type GameState } from '@/utils/chess/GameEngine';
+import { createInitialState, applyHandicap, cloneGameState, getSelectableMoves, getValidMoves, isMoveKingSafe, makeMove, undoMove, getWinnerSideTag, type GameState } from '@/utils/chess/GameEngine';
 import { HandicapBoard } from '@/components/HandicapBoard';
-import { RED_SIDE, BLACK_SIDE } from '@/utils/chess/types';
+import { RED_SIDE, BLACK_SIDE, type SideTag } from '@/utils/chess/types';
 import ChessBoard, { CapturedPiecesDrawer } from '@/components/ChessBoard';
 import JueShaOverlay from '@/components/JueShaOverlay';
 import { AppDialog, AppModal, GameNotice, ModalButton, modalButtonRowStyle, type GameNoticeItem } from '@/components/Modal';
@@ -1475,6 +1475,17 @@ export default function LanBattleScreen() {
       return;
     }
 
+    // 送将拦截（2026-09 线上事故修复）：与本地对局页同一口径，落点提示仍给出全部
+    // 走点（保持 4ccdae5 的观感），但真的要点下去时，若这步走后己方将/帅仍会被攻击
+    // （含将帅照面/白脸将），就地拦下并说明原因，不落子、也不上报服务端。
+    // 必须拦在本地这一层：服务端 Pikafish 不会吃将，送将后局面会永久僵在非法状态。
+    //
+    // 同本地对局页：**不清选中态**，让用户直接改点另一个落点（少一次"点棋子"）。
+    if (!isMoveKingSafe(gameState, selectedPieceId, toCol, toRow)) {
+      showNotice('着法送将，请另走');
+      return;
+    }
+
     // 长将长捉超限（方案 10 娱乐向改造）：**不拦截落子、不判负**。
     // banMoves 仅用于棋盘标红「走这里会继续长将/长捉」，落子照常进行；
     // 服务端（dist/index.js 的 ruleEngine 二次校验）同样不再拦截禁着。
@@ -1612,13 +1623,64 @@ export default function LanBattleScreen() {
     await sendBattleAction('move', { move });
   };
 
-  // 超时随机走一步棋
+  /**
+   * 终局结算（本地乐观结算，最终以服务端广播为准）。
+   * @param settled  终局后的局面（走完那一步的 newState；无可走着法时直接传当前局面）
+   * @param reason   终局原因（'juesha' | 'kunbi' | 长将长捉/和棋等，传给结算特效）
+   * @param loserSideOverride  指定判负方；不传时由局面 gameStatus 推导
+   */
+  const settleFromState = (
+    settled: GameState,
+    reason: string,
+    loserSideOverride?: SideTag
+  ) => {
+    // 和棋只看局面自身的 gameStatus；显式指定判负方时（无合法着法判负）不可能是和棋。
+    // 顺序不能反：判定困毙/绝杀时传入的局面还是"走子前"的状态，gameStatus 恒为 playing，
+    // 若先算 isDraw 再判 override，会把"因无着法可走而判负"错误地结算成和棋。
+    const isDraw = loserSideOverride === undefined && settled.gameStatus === 'draw';
+    setJueShaVisible(true);
+    setGameOverReason(reason);
+    setGameEndReason(isDraw ? 'draw' : 'checkmate');
+    if (isDraw) {
+      setGameResult({
+        winner: null,
+        isWin: false,
+        // eslint-disable-next-line react-hooks/purity -- 事件回调中计算对局时长
+        duration: gameStartTimeRef.current ? Date.now() - gameStartTimeRef.current : 0,
+        moveCount: settled.moveHistory.length,
+        surrenderBy: null,
+        isDraw: true,
+      });
+    } else {
+      // 引擎判定真实胜方（长将/长捉判负时走棋方可能为败方，不能默认走棋方获胜）；
+      // 显式指定判负方时（无合法着法判负）以指定方为准
+      const winnerSide: 'red' | 'black' = loserSideOverride !== undefined
+        ? (loserSideOverride === RED_SIDE ? 'black' : 'red')
+        : (getWinnerSideTag(settled) === RED_SIDE ? 'red' : 'black');
+      setGameResult({
+        winner: winnerSide,
+        isWin: winnerSide === mySide,
+        // eslint-disable-next-line react-hooks/purity -- 事件回调中计算对局时长
+        duration: gameStartTimeRef.current ? Date.now() - gameStartTimeRef.current : 0,
+        moveCount: settled.moveHistory.length,
+        surrenderBy: null,
+      });
+    }
+    setPhase('ended');
+  };
+
+  // 超时兜底走棋。
+  // ⚠️ 这里的"走一步"必须是**合法**着法（走后己方将/帅不被攻击）：
+  // getValidMoves 只判棋子走法形状、含送将着法，若随机到送将（尤其走将入攻击格），
+  // 局面会进入"被将却无人应招"的非法状态，而对方端引擎（本地 AI/皮卡鱼）都不会靠
+  // 吃将来补救，绝杀/困毙也不触发 → 对局永久僵住。
+  // 因此先按 isMoveKingSafe 过滤；**过滤后为空说明该方已无任何合法着法**，即已被
+  // 将死或困毙（中国象棋两者均判负），此时判负终局，绝不退回"随便送一步"。
   const doRandomMove = () => {
     if (!gameState) return;
 
     const mySideTag = sideStringToTag(mySide);
-    // 收集所有己方棋子的合法走法（超限时优先选「变招」着法避免僵局，方案 10 娱乐向改造：
-    // 这只是择着偏好，不是落子限制——若过滤后为空仍会退回全部合法着法）
+    // 收集所有己方棋子的可走落点（getValidMoves 只判棋子走法形状，不含王安全过滤）
     const allMoves: { pieceId: number; col: number; row: number }[] = [];
     for (const piece of gameState.pieces) {
       if (!piece.alive) continue;
@@ -1635,10 +1697,18 @@ export default function LanBattleScreen() {
       }
     }
 
-    if (allMoves.length === 0) return;
+    const safeMoves = allMoves.filter((m) => isMoveKingSafe(gameState, m.pieceId, m.col, m.row));
+
+    if (safeMoves.length === 0) {
+      // 己方无任何不送将的着法 → 已被将死（被将军）或困毙（未被将军）。
+      // 用引擎判据分类，只影响展示文案，终局结果同为判负。
+      const checked = !!gameState.isCheck;
+      settleFromState(gameState, checked ? 'juesha' : 'kunbi', mySideTag ? BLACK_SIDE : RED_SIDE);
+      return;
+    }
 
     // 随机选择一个走法
-    const randomMove = allMoves[Math.floor(Math.random() * allMoves.length)];
+    const randomMove = safeMoves[Math.floor(Math.random() * safeMoves.length)];
     const result = makeMove(gameState, randomMove.pieceId, randomMove.col, randomMove.row);
     if (!result) return;
 
@@ -1672,32 +1742,7 @@ export default function LanBattleScreen() {
 
     // 检查是否绝杀/困毙/长将长捉规则终局/将帅被吃（本地乐观结算，服务端广播为准）
     if (result.isGameOver) {
-      const isDraw = result.newState.gameStatus === 'draw';
-      setJueShaVisible(true);
-      setGameOverReason(result.gameOverReason);
-      setGameEndReason(isDraw ? 'draw' : 'checkmate');
-      if (isDraw) {
-        setGameResult({
-          winner: null,
-          isWin: false,
-          duration: gameStartTimeRef.current ? Date.now() - gameStartTimeRef.current : 0,
-          moveCount: result.newState.moveHistory.length,
-          surrenderBy: null,
-          isDraw: true,
-        });
-      } else {
-        // 引擎判定真实胜方（长将/长捉判负时走棋方为败方）
-        const winnerSide: 'red' | 'black' = getWinnerSideTag(result.newState) === RED_SIDE ? 'red' : 'black';
-        const isWin = winnerSide === mySide;
-        setGameResult({
-          winner: winnerSide,
-          isWin,
-          duration: gameStartTimeRef.current ? Date.now() - gameStartTimeRef.current : 0,
-          moveCount: result.newState.moveHistory.length,
-          surrenderBy: null,
-        });
-      }
-      setPhase('ended');
+      settleFromState(result.newState, result.gameOverReason);
     }
     lastMoveTimeRef.current = Date.now();
     setTurnTimeLeft(turnTimeLimit);

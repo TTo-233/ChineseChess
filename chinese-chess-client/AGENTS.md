@@ -97,6 +97,25 @@ node chinese-chess-server/scripts/patch-dist.mjs --restore-marker  # 仅补回�
 规则引擎本体（`ruleEngine.cjs`）由 `client/utils/chess/ruleEngine.bundle.ts` 打包而来，
 `dist/index.js` 通过 `require("../ruleEngine.cjs")` 加载它——改规则请改**客户端**源码。
 
+### 规则引擎「两端同源」校验（改规则源码后必跑）
+
+`ruleEngine.cjs` 是 `ruleEngine.bundle.ts` 的**打包产物**，两端"同源"是约定而非机制，
+很容易漂移（改了客户端源码忘记重新打包，服务端就还在跑旧规则，且没有任何报错）。
+
+```bash
+pnpm -w verify:rule-engine-parity                              # 校验；漂移则 exit 1
+node chinese-chess-server/scripts/verify-rule-engine-parity.mjs --write   # 重新生成 ruleEngine.cjs
+```
+
+校验方式是**在内存里重新打包并逐字节比对**已提交的 `ruleEngine.cjs`。打包参数是实测反推的，
+不能随便改：
+
+- `bundle: true, format: 'cjs', platform: 'node', target: 'es2020'`，**不加 banner**；
+- esbuild 版本必须与出包时一致——仓库 `package.json` 的 `pnpm.overrides` 已把 esbuild 钉在 **0.27.2**；
+- `target` 换 `es2019`/`es2018` 会多出 `var _a, _b;` 降级变量，`es2017` 及更低会换掉整套 `__defProp` 头部，都会造成假漂移。
+
+`--write` 覆盖 `ruleEngine.cjs` 之后，**必须重启服务端**（`dist/index.js` 是 `require` 加载它，不会热更）。
+
 ## 打包规范（仓库根目录 pack.ps1 / pack.sh）
 
 ```bash

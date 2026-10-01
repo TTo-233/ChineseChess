@@ -97,7 +97,12 @@ function toPiecePositions(pieces: PieceState[]) {
  * 规则口径：车马炮的阻挡、象的塞眼、兵的过河、将帅的九宫、士的斜线等，全部走 MoveCheck 的
  * 棋子级走法；**不做**"走后己方将/帅仍被攻击（含飞将/白脸将）"的王安全过滤。
  * 因此被将军时玩家仍能看到该棋子全部走点，既避免了只剩应将点的"变相提示"，
- * 也允许玩家主动送出将/帅（送将后由对方走完一步即算终局，风险自负）。
+ * 也让"落点为什么点不动"由落子阶段给出明确原因（见 isMoveKingSafe）。
+ *
+ * ⚠️ 本函数只回答「这个点符不符合棋子的走法」，**不代表这步棋可以走**：
+ * 走后己方将/帅仍被攻击（送将/照面）的着法在这里仍是 true，必须由落子阶段
+ * 用 isMoveKingSafe 拦截。四类送将（暴露阻挡、被牵制子、将帅照面、走将入攻击格）
+ * 的实际拦截点见 screens/game 与 screens/lanBattle 的 executeMove。
  *
  * 走子方限制仍然保留：非当前走棋方的棋子不返回落点（界面本就只允许选己方棋子）。
  */
@@ -126,6 +131,57 @@ export function getSelectableMoves(state: GameState, pieceId: number): boolean[]
  */
 export function getValidMoves(state: GameState, pieceId: number): boolean[][] {
   return getSelectableMoves(state, pieceId);
+}
+
+/**
+ * 判断一手棋是否「走后己方将/帅仍被攻击」——即送将（含将帅照面/白脸将）。
+ *
+ * ============================================================================
+ * 【为什么需要这个判据 · 2026-09 线上事故】
+ *
+ * 送将在任何象棋规则下都是**非法着法**（等同于把己方将帅送给对方吃），
+ * 但 4ccdae5「合法落点不做王安全过滤」之后，它变成了一步"能走"的棋：
+ *   · 本地引擎会照常走完并切换走棋方，盘面上留下一个「正被攻击却无人应招」的将/帅；
+ *   · 服务端 Pikafish **永远不会去吃将/帅**。实测（hint，depth 8）5/5 局面都是
+ *     对方将/帅就摆在一步可吃的位置，引擎仍去走别的着法（如红车 (4,5) 面对
+ *     黑将 (4,0) 却返回 (4,5)->(4,8)）。原因是象棋引擎的合法着法生成本就
+ *     不含"吃将"，它把被将视作己方要承担的代价、而不是可以收割的战利品。
+ *   · 于是「送将 → 对方杀将终结」这条依赖对方配合的收尾路径并不成立，
+ *     对局会停在一个非法局面里：双方把将/帅晾在盘上，绝杀/困毙判据
+ *     （isJueSha / isKunBi 都基于 hasAnyLegalMove，而对方走法充足）也不会触发。
+ *
+ * 因此送将必须在**落子阶段**拦掉，而不是指望"对方走一步就终局"。
+ * 该判据直接复用 afterMoveStillJiangJun —— 与 hasAnyLegalMove / isJueSha /
+ * isKunBi 以及 AIEngine 的 isSideInCheck 完全同一口径，保证：
+ *   盘上永远不会出现"该方被将且轮到该方"的局面，绝杀/困毙判定与引擎搜索一致，
+ *   在线引擎也不会再收到它拒绝重放的历史（见 buildEngineHistory）。
+ *
+ * 四类必须拦截的情况（均有单测覆盖，见 __tests__/songjiang.test.ts）：
+ *   1. 暴露阻挡：移开挡在己方将/帅与敌子之间的子（discovered check）；
+ *   2. 被牵制子：钉子（pinned piece）离开线路；
+ *   3. 将帅照面：移开两将/帅之间的唯一阻挡子（飞将/白脸将）；
+ *   4. 走将入攻击格：将/帅自己走进敌子控制范围。
+ *
+ * @returns true = 该着法安全（合法）；false = 送将，必须拦截
+ * ============================================================================
+ */
+export function isMoveKingSafe(
+  state: GameState,
+  pieceId: number,
+  toCol: number,
+  toRow: number
+): boolean {
+  const piece = state.pieces[pieceId];
+  if (!piece || !piece.alive) return false;
+  return !afterMoveStillJiangJun(
+    pieceId,
+    piece.col,
+    piece.row,
+    toCol,
+    toRow,
+    state.qiPan,
+    toPiecePositions(state.pieces)
+  );
 }
 
 /**
@@ -243,6 +299,22 @@ export function isKunBi(state: GameState, side: SideTag): boolean {
   // 被将军而无走法属于绝杀，不属于困毙
   if (isJiangJun(state, jiangId)[0] !== -1) return false;
   return !hasAnyLegalMove(state, side);
+}
+
+/**
+ * 指定一方是否还有**合法**着法（走后己方将/帅不被攻击）。
+ *
+ * 与 isMoveKingSafe 同一判据（都基于 afterMoveStillJiangJun），因此：
+ *   hasAnyLegalMoveForSide(state, side) === false
+ *   等价于「该方无论走哪一步都会送将」，即该方已被将死或困毙——
+ *   中国象棋两者均判负。
+ *
+ * 用途：超时兜底着法选择（screens/lanBattle 的 doRandomMove）需要先确认
+ * 「真的还有不送将的棋可走」再随机；否则应直接判负，绝不能退回"随便走一步"
+ * ——那一步必然是送将，会把局面重新拖回非法状态。
+ */
+export function hasAnyLegalMoveForSide(state: GameState, side: SideTag): boolean {
+  return hasAnyLegalMove(state, side);
 }
 
 /**

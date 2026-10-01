@@ -30,6 +30,7 @@ import {
   createFromFen,
   getSelectableMoves,
   getValidMoves,
+  isMoveKingSafe,
   makeMove,
   undoMove,
   getWinnerSideTag,
@@ -691,6 +692,24 @@ export default function GameScreen() {
       return;
     }
 
+    // 送将拦截（2026-09 线上事故修复）：落点判定仍按 4ccdae5 的口径给出全部走点
+    // （被将军时不只剩应将点，避免"变相提示"），但**真的要点下去**时，若这步走后
+    // 己方将/帅仍会被攻击（含将帅照面/白脸将），则拦下这一步并说明原因。
+    //
+    // 为什么不能指望"送将后对方一步终局"：服务端 Pikafish 是标准象棋引擎，
+    // 其合法着法生成**不含吃将**——对方将/帅摆在可吃位置它也不会去吃（实测 5/5），
+    // 于是对局会停在「正被将军却无人应招」的非法局面里，绝杀/困毙都不会触发。
+    // 判据复用 MoveCheck.afterMoveStillJiangJun，与 hasAnyLegalMove / isJueSha /
+    // isKunBi / AIEngine.isSideInCheck 完全同口径，保证盘上不会出现"该方被将且轮到该方"。
+    //
+    // 注意这里**故意不清 selectedPieceId/validMoves**：被拦下的只是这一个落点，
+    // 该子的其他落点和换子重选都还合法。清掉选中等于让用户重走一遍"点棋子→点落点"，
+    // 保留选中则直接改点另一个落点即可（提示条给了原因，落点表本来就是全量显示）。
+    if (!isMoveKingSafe(gameState, pieceId, toCol, toRow)) {
+      showRuleNotice('着法送将，请另走');
+      return;
+    }
+
     // 长将长捉超限（方案 10 娱乐向改造）：**不拦截落子、不判负**。
     // 达到长将 6/12/18 或长捉 6 着后，仅由 banMoves 在棋盘上标红提示
     // 「走这里会继续长将/长捉」，同时提示条提醒尽快变招；
@@ -1057,6 +1076,14 @@ export default function GameScreen() {
       // 计算期间局面已变化（走子/悔棋/换边等）或已有新请求 → 丢弃结果
       if (reqId !== hintReqRef.current) return;
       if (!best) return;
+
+      // 兜底：提示着法同样不得送将。
+      // 本地提示搜索走 isSideInCheck 过滤、本来不含送将；但"提示"在线优先请求服务端
+      // 皮卡鱼，而实测过一种病态局面——历史里含送将着法时皮卡鱼拒绝重放，会在"送将
+      // 之前"的局面上搜索并返回**对方的着法**，那种着法有时恰能通过落子形状校验。
+      // aiDispatcher 已在出口拦一道（rejectMoverUnsafe），这里再按落子入口同一判据兜底，
+      // 避免把一步必然被拦的着法标成"推荐走法"。
+      if (!isMoveKingSafe(gameState, best.pieceId, best.toCol, best.toRow)) return;
 
       // 残局闯关：成功给出提示才消耗一次次数（计算失败/局面已变不扣次）
       if (isEndgame) setEndgameHintLeft(prev => Math.max(0, prev - 1));

@@ -7,7 +7,7 @@
  * dist/index.js 只能手工修改，而手工修改会在下一次「重新打包/换版本」时被覆盖，
  * 导致改动丢失 —— 所以每一条改动都必须在本脚本里留一份可重放的补丁。
  *
- * 本脚本当前承载四条补丁（都幂等、都进 --check 闸门）：
+ * 本脚本当前承载五条补丁（都幂等、都进 --check 闸门）：
  *
  *   补丁一「长将长捉不拦截」：删掉服务端对禁着的二次拦截与「连续 3 次判负」。
  *     丢失症状：客户端能走的着法被服务端以 400「禁着，请变招」拒绝。
@@ -18,6 +18,10 @@
  *     （POST /rooms/:roomId/gameState 不带 move）。
  *     丢失症状：**任何人只要知道 6 位房间号，就能匿名改写对局棋盘、甚至伪造胜负**
  *     （详见下方补丁三头部的完整分析）。
+ *   补丁五「被拒绝的动作回推权威状态」：respondAction 在 4xx 时也广播一次房间状态。
+ *     丢失症状：被拒绝的动作（不是你的回合 / 非法走法 / 送将 / 请求已被处理）
+ *     客户端完全无感知，落子的乐观更新与"等待对方同意"会永久留在界面上。
+ *     与规则引擎侧的送将过滤是配套的 —— 服务端一旦开始拒着法，就必须让客户端知道。
  *
  * 本文件因此是这几条规则的**唯一权威载体**：
  *   1. 补丁是**幂等**的：已打过则 no-op，不会重复注入。
@@ -315,6 +319,124 @@ function insertFenGuard(src) {
   return out;
 }
 
+// ============================================================================
+// 补丁五：被拒绝的动作要把权威状态推回客户端
+// ============================================================================
+
+const SYNC_REJECT_PATCH_NOTE =
+  '被拒绝的动作回推权威状态（客户端只按 <400 收 state，被拒动作会导致画面永久停在乐观更新后的样子）';
+
+/** respondAction 的函数声明行，用它定位插入点（全文件唯一） */
+const RESPOND_FN_ANCHOR = 'function respondAction(res, roomId, result) {';
+/** 幂等标记：注入块自带 */
+const SYNC_REJECT_MARKER = 'var syncRejectionCount = 0;';
+/**
+ * respondAction 里的老写法。
+ * ⚠️ **必须包含前导换行**：替换时吃掉的区间是
+ * `function respondAction(...) {` + 紧随其后的 `\n  if (result.status < 400) {`，
+ * 若漏掉那个 `\n`，替换后老函数体（`const room = rooms.get(...)` 等）会与注入块之间
+ * 缺少换行、并在结尾多出一个孤立的 `}`，产出无法解析的 dist（首次实现就踩了这一步）。
+ */
+const SYNC_REJECT_OLD_BODY = '\n  if (result.status < 400) {';
+/** 上式只吃掉到 `{` 为止，它对应的 `}` 也要一并吃掉（缩进 2 空格） */
+const SYNC_REJECT_OLD_BODY_CLOSER = '\n  }';
+
+const SYNC_REJECT_BLOCK_HEAD = [
+  `// ${SYNC_REJECT_PATCH_NOTE}`,
+  '// ⚠️ 本段由 scripts/patch-dist.mjs 注入，勿手改；dist 换版后需重跑该脚本（见该文件头注释）。',
+  '//',
+  '// 被拒绝的动作必须把**权威状态**也回推给双方。',
+  '// 客户端应用服务端状态的唯一入口是 state 帧 / GET /rooms/:id/gameState，',
+  '// 而服务端原本只在 result.status < 400 时才广播（且广播的是当前 room 状态）；',
+  '// 于是"不是你的回合""非法走法（含送将）""对方的悔棋请求已被处理"这类拒绝',
+  '// 会让客户端毫无感知：落子的乐观更新留在盘上、悔棋按钮停在"等待对方同意"，',
+  '// 直到下一次成功动作才被顺带纠正。',
+  '//',
+  '// 这里在非 2xx 时补一次广播（room 未变，所以推过去的正是权威局面）。',
+  '// 限流：同一房间 3 秒内最多 8 次，避免被连续非法请求刷屏；',
+  '// 且只对 4xx 生效——5xx 属于服务端自身异常，不该顺手改写客户端对局画面。',
+  'var syncRejectionCount = 0;',
+  'function respondAction(res, roomId, result) {',
+  '  var rejected = result.status >= 400;',
+].join('\n');
+
+const SYNC_REJECT_BLOCK_TAIL = [
+  '  var roomForSync = rooms.get(roomId);',
+  '  if (rejected && result.status < 500 && roomForSync) {',
+  '    var nowSync = Date.now();',
+  '    var lastSyncAt = roomForSync.lastRejectionSyncAt || 0;',
+  '    if (nowSync - lastSyncAt >= 3000) {',
+  '      syncRejectionCount = 0;',
+  '    }',
+  '    if (syncRejectionCount < 8) {',
+  '      syncRejectionCount += 1;',
+  '      roomForSync.lastRejectionSyncAt = nowSync;',
+  '      roomBroadcaster(roomForSync);',
+  '    }',
+  '  }',
+].join('\n');
+
+/** 补丁五的状态分析 */
+function analyzeSyncReject(src) {
+  const hasSyncReject = src.includes(SYNC_REJECT_PATCH_NOTE);
+  const hasMarker = src.includes(SYNC_REJECT_MARKER);
+  const hasOldBody = src.includes(SYNC_REJECT_OLD_BODY);
+  const hasFn = src.includes(RESPOND_FN_ANCHOR);
+  return {
+    hasSyncReject,
+    hasMarker,
+    hasOldBody,
+    hasFn,
+    // 注入块自身也包含 `if (result.status < 400) {`，所以不能把"老写法还在"当作未打补丁的判据；
+    // 真正的判据是「NOTE 注释 + 计数变量 + respondAction 声明」三者齐备。
+    syncRejectPatched: hasSyncReject && hasMarker && hasFn,
+  };
+}
+
+/** 补丁五的稳定不变量：标记存在 ⟺ 反刷屏计数变量确实在代码里 */
+function syncRejectInvariantHolds(src, expectedPatched) {
+  const s = analyzeSyncReject(src);
+  return s.syncRejectPatched === expectedPatched;
+}
+
+/**
+ * 注入补丁五：替换 `function respondAction(...) {` + 紧随其后的老 2xx 判断。
+ * 幂等：syncRejectPatched 为真则原样返回。
+ * @returns {string} 注入后的源码
+ */
+function insertSyncReject(src) {
+  if (analyzeSyncReject(src).syncRejectPatched) return src;
+  const at = src.indexOf(RESPOND_FN_ANCHOR);
+  if (at < 0) throw new Error('找不到 respondAction 函数声明；dist 可能已换版');
+  // 老写法必须紧跟在函数声明之后（中间允许空行），否则说明结构变了，不动手。
+  const after = src.slice(at + RESPOND_FN_ANCHOR.length);
+  const bodyRel = after.indexOf(SYNC_REJECT_OLD_BODY);
+  if (bodyRel < 0 || bodyRel > 200) {
+    throw new Error('respondAction 函数体结构与预期不符（找不到 2xx 广播判断）；dist 可能已换版');
+  }
+  const bodyAbs = at + RESPOND_FN_ANCHOR.length + bodyRel;
+  // 吃掉的范围 = 函数声明行 + `\n  if (result.status < 400) {` + 该 if 的结束 `\n  }`。
+  // 那个结束花括号在原文里紧跟 `if (room) roomBroadcaster(room);` 之后；
+  // 它与 SYNC_REJECT_OLD_BODY 之间就是原来的两行函数体，必须一起删掉（否则残留未声明的 room 引用）。
+  const afterOld = bodyAbs + SYNC_REJECT_OLD_BODY.length;
+  const closerAt = src.indexOf(SYNC_REJECT_OLD_BODY_CLOSER, afterOld);
+  if (closerAt < 0 || closerAt - afterOld > 200) {
+    throw new Error('respondAction 老函数体结构与预期不符（找不到 2xx 块的结束花括号）；dist 可能已换版');
+  }
+  // ⚠️ 这里**刻意不复用 SYNC_REJECT_OLD_BODY** 来拼中间段：它是以 `\n` 开头的，
+  // 直接接在 HEAD（结尾是 `{`）后面会变成 `{  if (...)`，产出粘行。
+  // 各段自带换行、显式拼装。
+  return (
+    src.slice(0, at) +
+    SYNC_REJECT_BLOCK_HEAD +
+    '\n  if (result.status < 400) {\n' +
+    '    syncRejectionCount = 0;\n  }\n' +
+    SYNC_REJECT_BLOCK_TAIL +
+    '\n' +
+    src.slice(closerAt + SYNC_REJECT_OLD_BODY_CLOSER.length)
+  );
+}
+
 function main() {
   const checkOnly = process.argv.includes('--check');
   const restoreMarker = process.argv.includes('--restore-marker');
@@ -383,6 +505,33 @@ function main() {
     uploadChanged = true;
   }
 
+  // ------------------------------------------------------------------
+  // 补丁五（被拒动作回推权威状态）：同样是纯增量 + 幂等，独立于其它补丁。
+  // 这条与送将拦截配套——服务端现在会拒绝送将着法，若拒绝不推状态，
+  // 客户端会拿着"已经走成"的乐观画面一直等下去（见注入块注释）。
+  // ------------------------------------------------------------------
+  let syncRejectChanged = false;
+  if (!analyzeSyncReject(working).syncRejectPatched) {
+    if (checkOnly) {
+      fail(
+        '⚠️ dist/index.js 缺少「被拒绝的动作回推权威状态」补丁！\n' +
+        '  服务端只在 2xx 时才广播状态，因此被拒绝的动作（不是你的回合 / 非法走法 /\n' +
+        '  送将 / 请求已被处理）客户端完全无感知：落子的乐观更新会留在盘上、\n' +
+        '  悔棋按钮会停在"等待对方同意"，直到下一次成功动作才被顺带纠正。\n' +
+        '  修复：node scripts/patch-dist.mjs',
+      );
+    }
+    try {
+      working = insertSyncReject(working);
+    } catch (e) {
+      fail(`注入「被拒动作回推权威状态」补丁失败：${e.message}`);
+    }
+    if (!syncRejectInvariantHolds(working, true)) {
+      fail('注入后的产物状态不符合预期，已放弃写入（dist/index.js 未被修改）');
+    }
+    syncRejectChanged = true;
+  }
+
   // 写盘 + 读回校验的统一出口：补丁标记与真实性的不变量都必须成立。
   const commit = (next, message) => {
     fs.writeFileSync(DIST, next, 'utf8');
@@ -393,15 +542,19 @@ function main() {
     if (!uploadInvariantHolds(reread, true)) {
       fail('写入后读回校验失败（初始局面上传保护未生效），请检查 dist/index.js');
     }
+    if (!syncRejectInvariantHolds(reread, true)) {
+      fail('写入后读回校验失败（被拒动作状态回推未生效），请检查 dist/index.js');
+    }
     console.log(message);
     return true;
   };
 
-  // 本轮改动摘要：另两条补丁是纯增量的，任何一次执行都可能顺带把它们补上，
+  // 本轮改动摘要：另几条补丁是纯增量的，任何一次执行都可能顺带把它们补上，
   // 输出必须如实反映，否则「no-op」字样会掩盖刚刚发生的安全修复。
   const extras = [];
   if (fenChanged) extras.push('FEN 行宽校验补丁');
   if (uploadChanged) extras.push('初始局面上传收紧补丁');
+  if (syncRejectChanged) extras.push('被拒动作回推权威状态补丁');
   const withExtras = msg => (extras.length ? `${msg}；已注入 ${extras.join(' + ')}` : msg);
 
   const before = analyze(working);
@@ -528,4 +681,10 @@ export {
   UPLOAD_PATCH_NOTE,
   UPLOAD_ANCHOR,
   GAME_OVER_ANCHOR,
+  SYNC_REJECT_PATCH_NOTE,
+  SYNC_REJECT_MARKER,
+  RESPOND_FN_ANCHOR,
+  analyzeSyncReject,
+  insertSyncReject,
+  syncRejectInvariantHolds,
 };
