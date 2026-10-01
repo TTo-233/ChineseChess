@@ -707,7 +707,10 @@ export default function LanGameScreen() {
           title="创建房间"
         >
           <ScrollView
-            style={{ flexGrow: 0 }}
+            // flexGrow:0 = 内容不多时卡片按内容高度收缩（不强行撑满）；
+            // flexShrink:1 + minHeight:0 = 内容超高时这一层先收缩、由 ScrollView 内部
+            // 滚动，而不是把「取消/创建」按钮顶出卡片下沿（短屏机型实机问题）。
+            style={{ flexGrow: 0, flexShrink: 1, minHeight: 0 }}
             showsVerticalScrollIndicator={false}
             keyboardShouldPersistTaps="handled"
           >

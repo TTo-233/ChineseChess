@@ -924,7 +924,12 @@ const styles = StyleSheet.create({
     marginTop: 18,
   },
   modalBody: {
+    // flexGrow:0 = 内容不多时按内容高度收缩；
+    // flexShrink:1 + minHeight:0 = 内容超高时这一层先收缩、由 ScrollView 内部滚动，
+    // 而不是把底部按钮顶出卡片下沿（与 AppModal.body 的 minHeight:0 配套）。
     flexGrow: 0,
+    flexShrink: 1,
+    minHeight: 0,
   },
   fieldLabel: {
     fontSize: FONT.body,

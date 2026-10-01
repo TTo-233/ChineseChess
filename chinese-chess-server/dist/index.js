@@ -26614,9 +26614,18 @@ function generateRoomId() {
   } while (rooms.has(id));
   return id;
 }
+// 房间名最小空缺优先：自动房间名从 1 起找第一个未占用的编号，销毁房间后其编号可被复用
+// ⚠️ 本段由 scripts/patch-dist.mjs 注入，勿手改；dist 换版后需重跑该脚本（见该文件头注释）。
+//
+// 原实现的起点写死为 `rooms.size + 1`，只会单调递增：
+// 同时存在「房间1」「房间3」时，下一个编号是「房间3」→ 被占用 → +1 →「房间4」，
+// 于是即便「房间2」空着也永远排不到它；
+// 销毁「房间1」后 size 从 3 变 2，起点仍是 3 → 又是「房间3」「房间4」……
+// 空号只增不减，房间名也越涨越大（删掉「房间7」后新建得到的是「房间9」）。
+// ⚠️ 不要用 `rooms.size` 做起点：它与"已占用编号"无关，这正是原实现的错误来源。
 function defaultRoomName() {
   const usedNames = new Set([...rooms.values()].map((r) => r.name));
-  let n = rooms.size + 1;
+  let n = 1;
   while (usedNames.has(`\u623F\u95F4${n}`)) n += 1;
   return `\u623F\u95F4${n}`;
 }

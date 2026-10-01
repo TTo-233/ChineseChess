@@ -232,6 +232,12 @@ const styles = StyleSheet.create({
     borderRadius: RADIUS.modalCard,
     borderWidth: 1,
     borderColor: COLORS.modalBorder,
+    // ⚠️ 这里刻意【不设】overflow:'hidden'。
+    // 房间设置类弹窗的下拉选项面板与点击遮罩都是 absolute 定位，并刻意向外扩出
+    // body 内边距（见 RoomSettingsControls.formStyles.selectBackdrop 的负 margin，
+    // 以及 selectPanel 的 top:'100%' 悬浮）。一旦在卡片上裁剪，展开的下拉面板会被
+    // 圆角处切掉、点不到。高度问题已由 body 的 minHeight:0 + ScrollView 的
+    // flexShrink:1 解决，不需要靠裁剪兜底。
     zIndex: Z_INDEX.overlay,
     elevation: ELEVATION.overlay,
   },
@@ -275,5 +281,11 @@ const styles = StyleSheet.create({
   body: {
     padding: SIZES.modalPadding,
     paddingTop: SIZES.modalPadding - 4,
+    // ⚠️ minHeight:0 是「内容超高时内部滚动」的关键，不能删。
+    // 卡片有 maxHeight:88%，但 flex 子项的自动最小尺寸等于其内容尺寸：内容一旦超过
+    // 卡片上限，body（以及它内部 flexGrow:0 的 ScrollView）都不肯收缩，直接把内容
+    // 顶出卡片下沿——实机表现为短屏机型上「取消/创建」按钮溢出弹窗、点不到。
+    // minHeight:0 解除这个自动最小尺寸，卡片才会封顶、ScrollView 才会真正滚动。
+    minHeight: 0,
   },
 });

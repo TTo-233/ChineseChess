@@ -16,10 +16,10 @@
   ai\                   皮卡鱼引擎 + 开局库 + Worker（必须与 dist 同级，勿删改/移动）
   start.bat             手动启动脚本（前台运行，便于调试）
   run-server.bat        后台守护脚本（崩溃自动重启 + 写日志，供开机自启调用）
-  安装开机自启.bat       一键注册“开机自动启动”（需管理员，强烈推荐）
-  卸载开机自启.bat       移除开机自启任务
+  install-autostart.bat   一键注册“开机自动启动”（需管理员，强烈推荐）
+  uninstall-autostart.bat 移除开机自启任务
   scripts\verify-lan-disconnect.cjs  断线恢复回归自检脚本（可选，见下方第九节最后一条）
-  部署说明.txt           本说明
+  DEPLOY.md              本说明（原 部署说明.txt）
 
 三、启动服务（本机手动 / 调试）
   方式1：双击 start.bat。
@@ -31,17 +31,27 @@
   ============================ 红字警告 ============================
   【dist\index.js 是手工改动过的构建产物】
   本目录是自包含部署包：没有 src\、没有 tsconfig.json、没有 sourcemap。
-  「长将长捉超限不拦截落子、不按违规次数判负」这条规则的实现就写在该文件里，
-  由 scripts\patch-dist.mjs 注入（幂等补丁）。
+  下面这些规则的实现都直接写在该文件里，由 scripts\patch-dist.mjs 注入（幂等补丁）：
+    1) 长将长捉超限不拦截落子、不按违规次数判负
+       丢失表现：客户端能走的着法被服务端以 400「禁着，请变招」拒绝。
+    2) 畸形 FEN 行宽校验
+       丢失表现：WASM 越界写内存，4 个引擎 worker 全崩、/ai/move 返回 500。
+    3) 初始局面上传收紧（仅房内玩家、且仅在本局尚无着法时可上传）
+       丢失表现：任何人只要知道 6 位房间号，就能匿名改写进行中的棋盘。
+    4) 请求体驱动的终局副作用（与第 3 条同源，成对生效）
+    5) 被拒绝的动作也回推权威状态
+       丢失表现：被拒的动作客户端无感知，乐观更新会永久留在界面上。
+    6) 房间名最小空缺优先（自动房间名复用被释放的编号）
+       丢失表现：销毁「房间7」后新建会得到「房间9」，空号只增不减。
 
   每次重新构建 / 换版本 / 从其它机器拷贝 dist\index.js 覆盖之后，
   必须立刻执行：   node scripts\patch-dist.mjs
-  否则已删除的「禁着拦截 + 连续 3 次判负」逻辑会复活，表现为
-  「客户端能走的着法被服务端以 400『禁着，请变招』拒绝」。
+  该脚本会一次性补齐缺失的补丁（已存在的为 no-op 跳过）。
 
-  补丁已存在（no-op），只有标记丢失时用：  node scripts\patch-dist.mjs --restore-marker
+  只补第 1 条的标记（标记被单独剥离时用）：
+                   node scripts\patch-dist.mjs --restore-marker
 
-  这道闸门已挂在以下环节，任一环节丢补丁都会立刻以非零退出失败：
+  这道闸门已挂在以下环节，任一条补丁丢失都会立刻以非零退出失败：
     启动服务   pnpm start                    启动前自动 --check，补丁丢失则拒绝启动
     打包服务端 pack.ps1 server / pack.sh server  出包前校验，失败则阻塞出包（不生成 zip）
     安装依赖   本目录下 pnpm install         postinstall 自动 --check，失败即安装失败
@@ -52,13 +62,13 @@
 四、开机自启与崩溃自愈（强烈推荐配置）
   背景：Windows 重启/断电/系统更新后，手动双击的 start.bat 不会自动恢复，服务端会离线。
   本方案使用系统自带“任务计划程序”，无需额外安装任何软件：
-  1. 右键 安装开机自启.bat → 以管理员身份运行。它会创建计划任务 ChessServerAutoStart：
+  1. 右键 install-autostart.bat → 以管理员身份运行。它会创建计划任务 ChessServerAutoStart：
      开机时（无需登录桌面）自动运行 run-server.bat。
   2. run-server.bat 为守护脚本：node 进程若异常退出，会在 5 秒后自动重新拉起，
      并把运行日志写入同目录 server-watchdog.log，便于排查。
   3. 验证：重启电脑后访问  http://localhost:9091/api/v1/health  应返回 {"status":"ok"}；
      或执行  schtasks /Query /TN "ChessServerAutoStart"  查看任务状态。
-  4. 取消：右键 卸载开机自启.bat → 以管理员身份运行。
+  4. 取消：右键 uninstall-autostart.bat → 以管理员身份运行。
   进阶（可选，长期稳定部署）：改用 Windows 服务方式（登录前即启动、失败自动重启更完善），
      用 NSSM（https://nssm.cc/ 下载）：
        nssm install ChessServer "C:\path\to\node.exe" "C:\path\to\dist\index.js"
@@ -76,7 +86,7 @@
   3. 在隧道的 Public Hostname 添加固定域名（如 chess.example.com），
      Service 类型选 HTTP，URL 填 localhost:9091。
   4. 保持 cloudflared 服务运行（服务停止则客户端无法连接）。
-  【重要】cloudflared 以 Windows 服务方式安装后本身即开机自启；配合第四节的“安装开机自启.bat”，
+  【重要】cloudflared 以 Windows 服务方式安装后本身即开机自启；配合第四节的“install-autostart.bat”，
      重启后「服务端 + 隧道」都会自动恢复，无需人工干预。
 
 六、客户端对接（运行时可配置，无需重新打包客户端）
@@ -105,7 +115,7 @@
   - 客户端连不上：确认 cloudflared 服务在运行、客户端“服务器设置”填的是固定域名。
   - 域名访问异常：检查 Cloudflare Tunnel 的 Public Hostname（DNS 路由）是否正确指向该域名。
   - 服务端电脑与 cloudflared 连接器需保持开机在线，客户端才能连接。
-  - 重启后服务端没起来：确认已运行“安装开机自启.bat”；查看同目录 server-watchdog.log；
+  - 重启后服务端没起来：确认已运行“install-autostart.bat”；查看同目录 server-watchdog.log；
     确认 node 已安装并加入“系统级”PATH（任务以 SYSTEM 运行）。
   - 重启后服务端正常但客户端仍连不上：多半是 cloudflared 连接器没随开机启动，
     确认已执行  cloudflared service install，见第五节。

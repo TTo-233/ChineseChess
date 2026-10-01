@@ -7,7 +7,7 @@
  * dist/index.js 只能手工修改，而手工修改会在下一次「重新打包/换版本」时被覆盖，
  * 导致改动丢失 —— 所以每一条改动都必须在本脚本里留一份可重放的补丁。
  *
- * 本脚本当前承载五条补丁（都幂等、都进 --check 闸门）：
+ * 本脚本当前承载六条补丁（都幂等、都进 --check 闸门）：
  *
  *   补丁一「长将长捉不拦截」：删掉服务端对禁着的二次拦截与「连续 3 次判负」。
  *     丢失症状：客户端能走的着法被服务端以 400「禁着，请变招」拒绝。
@@ -22,6 +22,9 @@
  *     丢失症状：被拒绝的动作（不是你的回合 / 非法走法 / 送将 / 请求已被处理）
  *     客户端完全无感知，落子的乐观更新与"等待对方同意"会永久留在界面上。
  *     与规则引擎侧的送将过滤是配套的 —— 服务端一旦开始拒着法，就必须让客户端知道。
+ *   补丁六「房间名最小空缺优先」：defaultRoomName 从 1 起找第一个未占用的编号。
+ *     丢失症状：自动房间名的起点被写死为 `rooms.size + 1`，只会单调递增，
+ *     销毁的房间名（例如「房间7」）不会被复用，空号越攒越多。
  *
  * 本文件因此是这几条规则的**唯一权威载体**：
  *   1. 补丁是**幂等**的：已打过则 no-op，不会重复注入。
@@ -437,6 +440,97 @@ function insertSyncReject(src) {
   );
 }
 
+// ============================================================================
+// 补丁六：房间名「最小空缺优先」，让被销毁房间释放的编号可以复用
+// ============================================================================
+
+const ROOM_NAME_PATCH_NOTE =
+  '房间名最小空缺优先：自动房间名从 1 起找第一个未占用的编号，销毁房间后其编号可被复用';
+
+/** old 实现整函数替换：用「数字字形+空格」逐字符匹配，避开 dist 里的字面 \\uXXXX 转义 */
+const ROOM_NAME_OLD = [
+  'function defaultRoomName() {',
+  '  const usedNames = new Set([...rooms.values()].map((r) => r.name));',
+  '  let n = rooms.size + 1;',
+  '  while (usedNames.has(`\\u623F\\u95F4${n}`)) n += 1;',
+  '  return `\\u623F\\u95F4${n}`;',
+  '}',
+].join('\n');
+
+const ROOM_NAME_NEW = [
+  '// ' + ROOM_NAME_PATCH_NOTE,
+  '// ⚠️ 本段由 scripts/patch-dist.mjs 注入，勿手改；dist 换版后需重跑该脚本（见该文件头注释）。',
+  '//',
+  '// 原实现的起点写死为 `rooms.size + 1`，只会单调递增：',
+  '// 同时存在「房间1」「房间3」时，下一个编号是「房间3」→ 被占用 → +1 →「房间4」，',
+  '// 于是即便「房间2」空着也永远排不到它；',
+  '// 销毁「房间1」后 size 从 3 变 2，起点仍是 3 → 又是「房间3」「房间4」……',
+  '// 空号只增不减，房间名也越涨越大（删掉「房间7」后新建得到的是「房间9」）。',
+  '// ⚠️ 不要用 `rooms.size` 做起点：它与"已占用编号"无关，这正是原实现的错误来源。',
+  'function defaultRoomName() {',
+  '  const usedNames = new Set([...rooms.values()].map((r) => r.name));',
+  '  let n = 1;',
+  '  while (usedNames.has(`\\u623F\\u95F4${n}`)) n += 1;',
+  '  return `\\u623F\\u95F4${n}`;',
+  '}',
+].join('\n');
+
+/** 补丁六的状态分析 */
+function analyzeRoomName(src) {
+  return {
+    hasRoomNamePatched: src.includes(ROOM_NAME_PATCH_NOTE),
+    // 老实现是「起点恒为 rooms.size + 1」；新实现是「从 1 起」。
+    // 用它做逻辑判据，而不是只看标记注释——标记与逻辑必须同真同假。
+    hasLegacyStart: src.includes('let n = rooms.size + 1;'),
+    hasMinGapStart: /function defaultRoomName\(\) \{\n  const usedNames[\s\S]{0,120}?\n  let n = 1;/.test(
+      src,
+    ),
+    hasFn: src.includes('function defaultRoomName() {'),
+  };
+}
+
+/**
+ * 补丁六的稳定不变量：**标记存在必须与「起点改为 1」的真实逻辑完全同真同假**。
+ * 与补丁三/五同样的道理：只看标记会漏掉「标记在、逻辑被换回旧写法」这种最危险的状态。
+ * @returns {{ ok: boolean, reason: string }}
+ */
+function verifyRoomName(src, expectedPatched) {
+  const s = analyzeRoomName(src);
+  if (!s.hasFn) return { ok: false, reason: '找不到 defaultRoomName 函数；dist 可能已换版' };
+  const actuallyPatched = s.hasRoomNamePatched && s.hasMinGapStart && !s.hasLegacyStart;
+  if (actuallyPatched !== expectedPatched) {
+    return {
+      ok: false,
+      reason: `defaultRoomName 的补丁标记(${s.hasRoomNamePatched})与真实逻辑(起点为1: ${s.hasMinGapStart} / 旧起点: ${s.hasLegacyStart})不一致`,
+    };
+  }
+  return { ok: true, reason: '' };
+}
+
+function roomNameInvariantHolds(src, expectedPatched) {
+  return verifyRoomName(src, expectedPatched).ok;
+}
+
+/**
+ * 注入补丁六：整函数替换 defaultRoomName。
+ * 幂等：已打成（标记 + 起点 1）则原样返回。
+ * @returns {string} 注入后的源码
+ */
+function insertRoomName(src) {
+  if (roomNameInvariantHolds(src, true)) return src;
+  const at = src.indexOf(ROOM_NAME_OLD);
+  if (at < 0) {
+    // 已打了补丁（新写法在文件里）却没过不变量 → 状态混乱，宁可失败也不猜。
+    throw new Error(
+      '找不到 defaultRoomName 的旧实现；dist 可能已换版（若确认已改过，请核对 ROOM_NAME_OLD 的字面量写法）',
+    );
+  }
+  const out = src.slice(0, at) + ROOM_NAME_NEW + src.slice(at + ROOM_NAME_OLD.length);
+  const check = verifyRoomName(out, true);
+  if (!check.ok) throw new Error(`注入后校验失败：${check.reason}`);
+  return out;
+}
+
 function main() {
   const checkOnly = process.argv.includes('--check');
   const restoreMarker = process.argv.includes('--restore-marker');
@@ -532,6 +626,32 @@ function main() {
     syncRejectChanged = true;
   }
 
+  // ------------------------------------------------------------------
+  // 补丁六（房间名最小空缺优先）：纯替换 + 幂等，独立于其它补丁。
+  // 这条是功能修复，不是安全修复，但同样进 --check 闸门——
+  // 一旦丢失，自动房间名又会退回「只会递增、不复用空号」的旧行为。
+  // ------------------------------------------------------------------
+  let roomNameChanged = false;
+  if (!roomNameInvariantHolds(working, true)) {
+    if (checkOnly) {
+      fail(
+        '⚠️ dist/index.js 缺少「房间名最小空缺优先」补丁！\n' +
+        '  defaultRoomName 的起点会退回写死的 `rooms.size + 1`，自动房间名只增不减：\n' +
+        '  销毁「房间7」后新建会得到「房间9」，被释放的编号永远排不到。\n' +
+        '  修复：node scripts/patch-dist.mjs',
+      );
+    }
+    try {
+      working = insertRoomName(working);
+    } catch (e) {
+      fail(`注入「房间名最小空缺优先」补丁失败：${e.message}`);
+    }
+    if (!roomNameInvariantHolds(working, true)) {
+      fail('注入后的产物状态不符合预期，已放弃写入（dist/index.js 未被修改）');
+    }
+    roomNameChanged = true;
+  }
+
   // 写盘 + 读回校验的统一出口：补丁标记与真实性的不变量都必须成立。
   const commit = (next, message) => {
     fs.writeFileSync(DIST, next, 'utf8');
@@ -545,6 +665,9 @@ function main() {
     if (!syncRejectInvariantHolds(reread, true)) {
       fail('写入后读回校验失败（被拒动作状态回推未生效），请检查 dist/index.js');
     }
+    if (!roomNameInvariantHolds(reread, true)) {
+      fail('写入后读回校验失败（房间名最小空缺优先未生效），请检查 dist/index.js');
+    }
     console.log(message);
     return true;
   };
@@ -555,6 +678,7 @@ function main() {
   if (fenChanged) extras.push('FEN 行宽校验补丁');
   if (uploadChanged) extras.push('初始局面上传收紧补丁');
   if (syncRejectChanged) extras.push('被拒动作回推权威状态补丁');
+  if (roomNameChanged) extras.push('房间名最小空缺优先补丁');
   const withExtras = msg => (extras.length ? `${msg}；已注入 ${extras.join(' + ')}` : msg);
 
   const before = analyze(working);
@@ -687,4 +811,11 @@ export {
   analyzeSyncReject,
   insertSyncReject,
   syncRejectInvariantHolds,
+  ROOM_NAME_PATCH_NOTE,
+  ROOM_NAME_OLD,
+  ROOM_NAME_NEW,
+  analyzeRoomName,
+  verifyRoomName,
+  roomNameInvariantHolds,
+  insertRoomName,
 };

@@ -7,7 +7,7 @@
  * 会直接报 `'NODE_ENV' is not recognized as an internal or external command`。
  * 同一个脚本还有第二个问题：`${PORT:-5000}` 会把未设置时的端口定成 5000，
  * 而 dist/index.js:28892 的真实默认是 `var port = process.env.PORT || 9091;`，
- * 部署说明.txt 与 start.bat 也都写的是 9091 —— 于是 `pnpm start` 和文档说的端口不一致。
+ * DEPLOY.md 与 start.bat 也都写的是 9091 —— 于是 `pnpm start` 和文档说的端口不一致。
  *
  * 这里用 Node 设置环境变量再加载 dist，两个问题一起解决：
  * - NODE_ENV 默认 production（只影响 express 出错时是否打印堆栈）；

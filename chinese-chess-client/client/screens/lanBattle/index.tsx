@@ -2777,7 +2777,9 @@ export default function LanBattleScreen() {
           onClose={() => setSettingsVisible(false)}
           title="房间设置"
         >
-          <ScrollView style={{ flexGrow: 0 }} showsVerticalScrollIndicator={false} keyboardShouldPersistTaps="handled">
+          {/* flexGrow:0 = 内容不多时按内容高度收缩；flexShrink:1 + minHeight:0 = 内容超高时
+              这一层先收缩、由 ScrollView 内部滚动，避免「取消/保存」被顶出卡片下沿。 */}
+          <ScrollView style={{ flexGrow: 0, flexShrink: 1, minHeight: 0 }} showsVerticalScrollIndicator={false} keyboardShouldPersistTaps="handled">
               {(() => {
                 const canEdit = phase === 'waiting' && hostId === playerId;
                 // 展示值：编辑模式取编辑态，查看模式取房间实际值
