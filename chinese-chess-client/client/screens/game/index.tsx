@@ -36,7 +36,7 @@ import {
   getWinnerSideTag,
   type GameState,
 } from '@/utils/chess/GameEngine';
-import { getBestMoveAsync, precomputeHint, cancelHintPonder, recordHistoryHash, clearHistoryHash, computeZobristHash } from '@/utils/chess/AIEngine';
+import { getBestMoveAsync, precomputeHint, cancelHintPonder, abortSearch, recordHistoryHash, clearHistoryHash, computeZobristHash } from '@/utils/chess/AIEngine';
 import { getHybridBestMove, getHybridHintMove, getOnlineAiStatus, isOnlineAiBusyRetrying, getOnlineAiInvalidReason, getOnlineAiLongGameNotice, subscribeOnlineAiStatus, type AISource, type HybridMoveResult, type OnlineAiStatus } from '@/utils/chess/aiDispatcher';
 import { isMoveBanned, enumerateLegalMoves } from '@/utils/chess/RuleEngine';
 import { playSound, playJiangJunSound, unloadAllSounds, preloadSounds, preloadGameEndSounds } from '@/utils/SoundManager';
@@ -197,13 +197,19 @@ export default function GameScreen() {
   // 待执行的 AI 延时定时器（executeMove/重开/翻转等排定的 AI 走子）
   const aiTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  /** 使所有排队中/计算中的 AI 走子失效（局面重置类操作的统一前置动作） */
+  /**
+   * 使所有排队中/计算中的 AI 走子失效（局面重置类操作的统一前置动作）。
+   * 除了清掉延时定时器，还必须**中止已经在跑的那次搜索**：
+   * 只靠代数校验的话，旧搜索会继续占着主线程跑到自然结束（最多一个完整预算），
+   * 与重置后新排定的 AI 思考抢算力——悔棋/翻转/重开后越打越卡就是这么来的。
+   */
   const invalidatePendingAI = useCallback(() => {
     gameGenRef.current += 1;
     if (aiTimerRef.current) {
       clearTimeout(aiTimerRef.current);
       aiTimerRef.current = null;
     }
+    abortSearch();
   }, []);
 
   // 卸载时清理 AI 延时定时器
@@ -627,6 +633,10 @@ export default function GameScreen() {
   // 点击棋子
   const handlePiecePress = useCallback((pieceId: number) => {
     clearHint(); // 点击任意棋子，提示立即消失
+    // 玩家一旦伸手就立刻放弃后台提示预计算：AI 走子后 250ms 启动的那次 ponder 正好
+    // 落在玩家准备落子的窗口里，如果让它继续跑，点击会被主线程搜索顶住（"动画结束后
+    // 仍有一段时间点不动"的主因）。中止是协作式的，最迟一个分片（约 12ms）内真正停下。
+    cancelHintPonder();
     if (aiThinking || gameState.gameStatus !== 'playing') return;
 
     const piece = gameState.pieces[pieceId];

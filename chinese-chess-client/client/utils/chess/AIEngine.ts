@@ -113,27 +113,154 @@ const CANNON_POSITION_BONUS: number[][] = [
 ];
 
 // ======================== 搜索控制 ========================
+// 【2026-10 主线程响应性重构】搜索控制状态从模块级全局变量收进「单次搜索会话」对象。
+//
+// 为什么要这么做：搜索是异步分片执行的，一次搜索没结束就可能被下一次搜索启动
+// （玩家走子后 AI 搜索 vs 后台提示预计算），而原先 searchDeadline / searchAborted /
+// pureBestMode 都是模块级单例 —— 新搜索会把旧搜索的 deadline 覆盖掉、把旧搜索刚
+// 收到的 abort 复位成 false，于是「已被取消的旧搜索」会继续按新预算跑到自然结束，
+// 与真正需要结果的搜索抢主线程算力（表现为：AI 落子后越打越卡、提示搜索永远不止）。
+// 现在每次搜索各自持有一份状态，旧搜索被 abort 后再也不会被新搜索"复活"。
+//
+// 另外，让出点原先只在根节点走法之间（两次让出之间跑完一整个根走法子树），
+// 单次阻塞实测可达 130ms（Node；真机 Hermes 更久），触摸/动画全部被推迟。
+// 现在 checkSearch 带「分片发送」语义：跑满约 SEND_SLICE_MS 就让出主线程一次，
+// 让出点因此落在递归树内部，单次阻塞被压到 ~12ms。
+//
+// 【2026-10 续跑式分片】让出必须"原地挂起、原地恢复"，不能"回到根节点重试"。
+// 早期版本让 checkSearch 抛 SearchYieldSignal、根节点循环捕获后 `i--; continue`
+// 重跑同一个根走法，实测不可用：
+//   - 比一个分片更大的根走法子树永远跑不完：每片都从头重算，永远到不了叶子，
+//     形成活锁（eng-ply10 深度 4、60s 预算：2036ms 后仍在跑；不分片 481ms 就跑完）；
+//   - 即使侥幸跑完，重算的节点也是纯冗余：实测 17.6 倍节点，并且可能返回更浅层
+//     （退化）的结果 —— 正确性一并被破坏。
+// 现在 minimax/quiescence 是**生成器**：checkSearch 判定分片跑满时 `yield` 出
+// SearchYieldSignal 挂起，栈帧、局部变量、棋盘全部原样保留；驱动循环 await 一次
+// 宏任务让出主线程后调用 gen.next()，**从 yield 的下一句继续**。遍历顺序、剪枝、
+// 节点数与不分片时逐节点一致（同一份逻辑，只是把 JS 调用栈换成了可挂起的对象）。
 
-/** 搜索截止时间戳（毫秒） */
-let searchDeadline = 0;
-/** 搜索是否已被超时中断 */
-let searchAborted = false;
-/** 已搜索节点数（用于周期性检查时间，避免每次 Date.now 开销） */
-let nodeCount = 0;
 /**
- * 纯最佳模式（提示功能专用）：
- * 开启后搜索完全确定性 —— 跳过根节点多样化随机、重复局面惩罚、长将/长捉惩罚，
- * 只返回客观评分最高的走法。与 AI 对弈思考（需要变化与反循环策略）严格区分。
+ * 搜索会话：一次 searchWithTimeBudget 调用独占的状态。
+ * 不放在模块级，避免并发搜索互相污染（见上方说明）。
  */
-let pureBestMode = false;
+interface SearchSession {
+  /** 搜索截止时间戳（毫秒） */
+  deadline: number;
+  /** 是否已被中止（超时 / 外部 abortSearch / 被更新的搜索取代） */
+  aborted: boolean;
+  /** 已搜索节点数（用于周期性检查时间，避免每次节点都调 Date.now） */
+  nodeCount: number;
+  /**
+   * 纯最佳模式（提示功能专用）：
+   * 开启后搜索完全确定性 —— 跳过根节点多样化随机、重复局面惩罚、长将/长捉惩罚，
+   * 只返回客观评分最高的走法。与 AI 对弈思考（需要变化与反循环策略）严格区分。
+   */
+  pureBest: boolean;
+  /** 本分片开始时间戳 */
+  sliceStart: number;
+  /** 已让出主线程次数（诊断用：确认分片粒度按预期生效） */
+  yields: number;
+}
 
-/** 周期性检查是否超时（每 512 个节点检查一次） */
-function checkTime(): boolean {
-  if (searchAborted) return true;
-  if ((++nodeCount & 511) === 0 && Date.now() > searchDeadline) {
-    searchAborted = true;
+/** 当前正在执行的搜索会话（仅用于外部 abortSearch 定位目标） */
+let activeSearch: SearchSession | null = null;
+
+/**
+ * 分片让出信号：checkSearch 判定本分片已跑满时，搜索生成器 `yield` 出本值挂起，
+ * 驱动循环（searchWithTimeBudget）捕获后 await 一次宏任务让出主线程，
+ * 再调用 gen.next() 从挂起点**原地继续**——不重放、不重试、不重复计节点。
+ *
+ * 为什么用生成器而不是「抛异常 + 回到根节点重试」：minimax 的返回值是局面分数
+ * （number），用特殊 number 当哨兵会和评分空间冲突；异常虽然能让每层的
+ * `unapplyMove(state, undo)` 走 finally 补齐，但异常语义是"这一层递归被放弃"，
+ * 只能回到根节点重跑整棵子树 —— 于是比分片更大的根子树永远跑不完（活锁），
+ * 跑完的那些也在重复计算（实测 17.6 倍节点）。
+ * 生成器把「函数调用栈」变成可挂起的对象：yield 时栈帧与棋盘保持原样，
+ * next() 时从 yield 的下一句继续，因此切片只改变"什么时候回事件循环"，
+ * 不改变遍历与结果。
+ */
+const SearchYieldSignal = Symbol('search-yield');
+
+/** 可挂起搜索生成器：yield 表示"本分片跑满，请让出主线程后再恢复我"，返回值是该节点的分数 */
+type SearchGen = Generator<typeof SearchYieldSignal, number, void>;
+
+/** checkSearch 的裁决结果 */
+type SearchCheck = 'ok' | 'abort' | 'send';
+
+/** 每跑满约这么多毫秒就让出一次主线程（一个 60fps 帧的预算） */
+const SEND_SLICE_MS = 12;
+/** 周期性子检查间隔（节点数）。与原先 checkTime 一致：每 512 节点查一次时间 */
+const TIME_POLL_NODES = 512;
+/** 时间检查的节点掩码 */
+const TIME_POLL_MASK = TIME_POLL_NODES - 1;
+
+/**
+ * 让出主线程、把控制权交回事件循环（触摸/动画/音频消息得以处理），且不引入计时器延迟。
+ *
+ * 优先用 setImmediate：它只是"本轮到期的其他回调处理完后执行"，等待开销约 0.01ms；
+ * 而 setTimeout(fn, 0) 会被主机的按时长取整（Node/Windows 实测每次约 15.4ms），
+ * 以 12ms 分片搜索时每片就要多付一次计时器延迟，一台手机一局棋要付上千次，
+ * 会把"响应性优化"变成数倍的搜索时长膨胀。
+ * 生态兼容：setImmediate 在所有已适配平台（Hermes / JSC / Node / 浏览器 polyfill）都有，
+ * 仅在不存在的运行环境里退回 setTimeout(0)。
+ */
+let yieldToEventLoop = (): Promise<void> => {
+  if (typeof (globalThis as { setImmediate?: unknown }).setImmediate === 'function') {
+    yieldToEventLoop = () => new Promise<void>(resolve => setImmediate(resolve));
+  } else {
+    yieldToEventLoop = () => new Promise<void>(resolve => setTimeout(resolve, 0));
   }
-  return searchAborted;
+  return yieldToEventLoop();
+};
+
+/**
+ * 【本副本额外导出】最近一次搜索的诊断计数。
+ * 用于验证「分片不产生冗余节点」「每个分片的实际阻塞时长」这两个验收指标：
+ * 与不分片版本（同源、只把 SEND_SLICE_MS 调成无穷大）对比时，节点数应当一致。
+ * 生产代码不读它，也不影响任何搜索行为。
+ */
+export const __searchStats = { nodeCount: 0, yields: 0 };
+
+/** 新建搜索会话 */
+function createSession(timeBudget: number, pureBest: boolean): SearchSession {
+  __searchStats.nodeCount = 0;
+  __searchStats.yields = 0;
+  return {
+    deadline: Date.now() + timeBudget,
+    aborted: false,
+    nodeCount: 0,
+    pureBest,
+    sliceStart: Date.now(),
+    yields: 0,
+  };
+}
+
+/**
+ * 周期性检查（每 512 个节点一次，避免每节点 Date.now 开销）：
+ *  - 'abort'：已中止 / 超时 → 调用方立即返回中立分，结果被上层丢弃
+ *  - 'send' ：本分片跑满 → 调用方 `yield SearchYieldSignal` 挂起本节点，
+ *             由驱动循环让出主线程后从挂起点原地恢复
+ *  - 'ok'   ：继续搜索
+ */
+function checkSearch(session: SearchSession): SearchCheck {
+  if (session.aborted) return 'abort';
+  if ((++session.nodeCount & TIME_POLL_MASK) !== 0) return 'ok';
+  __searchStats.nodeCount = session.nodeCount;
+
+  const now = Date.now();
+  if (now > session.deadline) {
+    session.aborted = true;
+    return 'abort';
+  }
+  if (now - session.sliceStart >= SEND_SLICE_MS) {
+    return 'send';
+  }
+  return 'ok';
+}
+
+/** 开启一个新的分片（每次真正让出主线程、恢复搜索前调用） */
+function enterSearchSlice(session: SearchSession): void {
+  session.sliceStart = Date.now();
 }
 
 // ======================== 局面评估 ========================
@@ -561,7 +688,7 @@ function generatePseudoMoves(state: GameState): Move[] {
  * 只需复制会被改写的部分（棋盘、棋子、哈希、走棋方）——搜索全程不写 moveHistory /
  * ruleState，但为避免与其它持有者共享引用被间接改写，一并做浅层复制。
  */
-function cloneForSearch(state: GameState): GameState {
+export function cloneForSearch(state: GameState): GameState {
   return {
     ...state,
     qiPan: state.qiPan.map(col => [...col]),
@@ -760,16 +887,24 @@ function findImmediateWin(state: GameState, moves: Move[]): Move | null {
  * 静态搜索（Quiescence Search）
  * - 未被将军：stand-pat + 只搜索吃子走法
  * - 被将军：必须搜索所有应将走法（否则绝杀不可见），无应将 = 绝杀
+ *
+ * 生成器版本：分片跑满时 `yield SearchYieldSignal` 原地挂起（栈帧/棋盘原样保留），
+ * 由驱动循环让出主线程后 next() 恢复。逻辑与不分片时逐句相同。
  */
-function quiescence(
+function* quiescence(
   state: GameState,
   alpha: number,
   beta: number,
   isMaximizing: boolean,
   qDepth: number,
-  ply: number
-): number {
-  if (checkTime()) return 0;
+  ply: number,
+  session: SearchSession
+): SearchGen {
+  {
+    const check = checkSearch(session);
+    if (check === 'send') yield SearchYieldSignal;
+    if (check === 'abort') return 0;
+  }
 
   const inCheck = isSideInCheck(state, state.sideTag);
 
@@ -793,7 +928,11 @@ function quiescence(
   let legalCount = 0;
 
   for (const move of moves) {
-    if (checkTime()) break;
+    {
+      const check = checkSearch(session);
+      if (check === 'send') yield SearchYieldSignal;
+      if (check === 'abort') break;
+    }
     // 未被将军时只搜索吃子走法；被将军时搜索全部走法（应将）
     if (!inCheck && state.qiPan[move.toCol][move.toRow] === -1) continue;
 
@@ -807,8 +946,14 @@ function quiescence(
     }
     legalCount++;
 
-    const score = quiescence(state, alpha, beta, !isMaximizing, qDepth - 1, ply + 1);
-    unapplyMove(state, undo);
+    // 分片挂起发生在子树深处：`yield*` 让挂起信号穿透到驱动循环，
+    // try/finally 保证无论正常返回、提前 return(0) 还是异常，本层落子都被撤销。
+    let score: number;
+    try {
+      score = yield* quiescence(state, alpha, beta, !isMaximizing, qDepth - 1, ply + 1, session);
+    } finally {
+      unapplyMove(state, undo);
+    }
 
     if (isMaximizing) {
       if (score >= beta) return beta;
@@ -831,22 +976,29 @@ function quiescence(
  * Minimax + Alpha-Beta 剪枝（带超时中断、将军延伸、终局检测）
  * @param ply 距根节点的层数（用于绝杀分数：越快绝杀越好）
  * @param ext 本路径已用的将军延伸次数（上限 2，防止将军链爆炸）
+ *
+ * 生成器版本：分片跑满时 `yield SearchYieldSignal` 原地挂起，驱动循环让出主线程后恢复。
  */
-function minimax(
+function* minimax(
   state: GameState,
   depth: number,
   alpha: number,
   beta: number,
   isMaximizing: boolean,
   ply: number,
-  ext: number
-): number {
-  // 超时检查：被中断时立即返回中立分（结果会被上层丢弃）
-  if (checkTime()) return 0;
+  ext: number,
+  session: SearchSession
+): SearchGen {
+  // 超时/分片检查：超时立即返回中立分（结果会被上层丢弃）；分片跑满则挂起让出主线程
+  {
+    const check = checkSearch(session);
+    if (check === 'send') yield SearchYieldSignal;
+    if (check === 'abort') return 0;
+  }
 
   // 叶子节点：进入静态搜索
   if (depth <= 0) {
-    return quiescence(state, alpha, beta, isMaximizing, 4, ply);
+    return yield* quiescence(state, alpha, beta, isMaximizing, 4, ply, session);
   }
 
   const moves = generatePseudoMoves(state);
@@ -866,7 +1018,11 @@ function minimax(
   let legalCount = 0;
 
   for (const move of sortedMoves) {
-    if (searchAborted) break;
+    {
+      const check = checkSearch(session);
+      if (check === 'send') yield SearchYieldSignal;
+      if (check === 'abort') break;
+    }
 
     const undo = applyMove(state, move.pieceId, move.toCol, move.toRow);
 
@@ -882,12 +1038,18 @@ function minimax(
     const givesCheck = isSideInCheck(state, state.sideTag);
     const extension = givesCheck && ext < 2 ? 1 : 0;
 
-    const score = minimax(
-      state, depth - 1 + extension, alpha, beta, !isMaximizing, ply + 1, ext + extension
-    );
-    unapplyMove(state, undo);
+    // 分片挂起发生在子树深处：`yield*` 让挂起信号穿透到驱动循环，
+    // try/finally 保证无论正常返回、提前 return(0) 还是异常，本层落子都被撤销。
+    let score: number;
+    try {
+      score = yield* minimax(
+        state, depth - 1 + extension, alpha, beta, !isMaximizing, ply + 1, ext + extension, session
+      );
+    } finally {
+      unapplyMove(state, undo);
+    }
 
-    if (searchAborted) break;
+    if (session.aborted) break;
 
     if (isMaximizing) {
       if (score > bestScore) bestScore = score;
@@ -938,18 +1100,21 @@ const MAX_DEPTH: Record<string, number> = {
 };
 
 /**
- * 迭代加深搜索（带时间预算 + 硬性超时中断）
+ * 迭代加深搜索（带时间预算 + 硬性超时中断 + 分片让出）
  * 保证：无论搜索多慢，时间一到立即中断，必定返回已完成的最新结果
  *
- * yieldIntervalMs > 0 时，在根节点走法之间周期性让出主线程（约每 N 毫秒一次），
- * 用于提示的后台预计算——搜索期间 UI/动画/触摸保持响应。
- * 默认 0：不让出，全程同步执行（AI 对弈通道，行为与此前完全一致）。
+ * 主线程友好：搜索按约 SEND_SLICE_MS 一段切片执行，每片跑满就 await 一次宏任务让出，
+ * 让触摸事件、动画帧、音频桥接消息有机会被处理。分片只切"什么时候返回事件循环"，
+ * 不改搜索结果——被让出打断的根走法会在让出后从头重试，且时间预算不因让出而缩水。
+ * 因此同一局面在同一预算下的择着与让出间隔无关（有基准脚本比对择着一致性）。
+ *
+ * @param pureBest 纯最佳模式（提示）：跳过根节点多样化随机与反循环惩罚
  */
-async function searchWithTimeBudget(
+export async function searchWithTimeBudget(
   state: GameState,
   maxDepth: number,
   timeBudget: number,
-  yieldIntervalMs = 0
+  pureBest: boolean
 ): Promise<AIMoveResult | null> {
   const isMaximizing = state.sideTag === RED_SIDE;
   let moves = generatePseudoMoves(state);
@@ -965,11 +1130,8 @@ async function searchWithTimeBudget(
     if (legal.length > 0) moves = legal;
   }
 
-  const startTime = Date.now();
-  searchDeadline = startTime + timeBudget;
-  searchAborted = false;
-  nodeCount = 0;
-  let lastYieldTs = startTime;
+  const session = createSession(timeBudget, pureBest);
+  activeSearch = session;
 
   let bestMove: AIMoveResult | null = null;
 
@@ -978,20 +1140,19 @@ async function searchWithTimeBudget(
     killerMoves[d] = [null, null];
   }
 
-  // 检测当前是否处于循环中（用于动态提高随机性）
-  // 注意：当前局面在出现时已记录过 1 次，计数 >= 2 才是真正发生重复
+  // 检测当前是否处于循环中（用于动态提高随机性）  // 注意：当前局面在出现时已记录过 1 次，计数 >= 2 才是真正发生重复
   const currentHash = state.zobristHash;
   const currentRepetitionCount = historyHashCount.get(currentHash) || 0;
   const isInRepetition = currentRepetitionCount >= 2;
 
   // 检测最近 4 步是否构成完整往返循环：[红 A→B, 黑 C→D, 红 B→A, 黑 D→C] → 局面回到 4 步前
   const recentHistory = state.moveHistory.slice(-20); // 只看最近 20 步
-  const hasRecentCycle = !pureBestMode && detectRecentCycle(state.moveHistory);
+  const hasRecentCycle = !session.pureBest && detectRecentCycle(state.moveHistory);
 
   // 反循环机制（多样化随机、重复走法惩罚）仅在出现真实重复征兆时激活：
   // 当前局面已重复（>= 2 次）或最近走法形成 2-周期往返循环。
   // 正常局面下 AI 走确定性的客观最优着法，不受任何随机/惩罚干扰
-  const antiLoopActive = !pureBestMode && (isInRepetition || hasRecentCycle);
+  const antiLoopActive = !session.pureBest && (isInRepetition || hasRecentCycle);
 
   // 统计历史走法频率（用于根节点过滤高频重复走法，仅反循环激活时使用）
   const moveFrequency = new Map<string, number>();
@@ -1012,6 +1173,7 @@ async function searchWithTimeBudget(
   // 这是「绝杀着法永远排第一、绝不会被剪枝掉」的最强保证。
   const immediateWin = findImmediateWin(state, moves);
   if (immediateWin) {
+    activeSearch = null;
     return {
       pieceId: immediateWin.pieceId,
       fromCol: immediateWin.fromCol,
@@ -1024,7 +1186,7 @@ async function searchWithTimeBudget(
 
   // 迭代加深
   for (let depth = 1; depth <= maxDepth; depth++) {
-    if (Date.now() > searchDeadline) break;
+    if (Date.now() > session.deadline) break;
 
     let currentBest: AIMoveResult | null = null;
     let currentBestScore = isMaximizing ? -Infinity : Infinity;
@@ -1034,16 +1196,11 @@ async function searchWithTimeBudget(
     // 否则黑方所有根走法都以全窗口搜索，有效深度远低于红方（红黑不对称缺陷）
     let beta = Infinity;
 
-    for (const move of moves) {
-      if (searchAborted) break;
-
-      // 后台预计算模式：周期性让出主线程，保证 UI 触摸/动画响应
-      if (yieldIntervalMs > 0 && Date.now() - lastYieldTs >= yieldIntervalMs) {
-        await new Promise<void>(resolve => setTimeout(resolve, 0));
-        lastYieldTs = Date.now();
-        // 让出期间可能已被外部中止（玩家走棋等）→ 立即退出
-        if (searchAborted) break;
-      }
+    // 用下标循环（而不是 for...of）：分片让出后要**重试同一个根走法**，
+    // 而 for...of 的迭代器无法回退。
+    for (let i = 0; i < moves.length; i++) {
+      if (session.aborted) break;
+      const move = moves[i];
 
       // 吃子价值（等分 tie-break 用：评分完全相同时优先吃子、优先吃价值大的子）
       const capturedId = state.qiPan[move.toCol][move.toRow];
@@ -1059,7 +1216,7 @@ async function searchWithTimeBudget(
         // 纯最佳模式（提示）同样跳过所有根节点惩罚
         let rootPenalty = 0;
         let isRepetitiveMove = false; // 是否为重复走法（多样化硬过滤用）
-        if (pureBestMode) {
+        if (session.pureBest) {
           // 提示通道的规则责任（确定性，非随机）：
           // 同一棋子连续第 3 个回合将军构成"长将"，继续循环会触发连杀判负 ——
           // 引导判负的走法不是客观最优解，必须扣分规避
@@ -1115,12 +1272,38 @@ async function searchWithTimeBudget(
         }
 
         // depth=1 也走 minimax → 进入静态搜索，绝杀-in-1 才能被发现
-        let score = minimax(state, depth - 1, alpha, beta, !isMaximizing, 1, 0);
+        //
+        // 驱动循环：minimax 是生成器，`next()` 跑到下一个分片边界或跑完。
+        // 分片跑满时它 yield 出 SearchYieldSignal 挂起（栈帧、局部变量、棋盘全部原样保留），
+        // 这里 await 让出主线程一次，再 next() **从挂起的下一句继续**——
+        // 不重放、不重算、不重试，因此遍历顺序、剪枝与节点数与不分片时完全一致。
+        // 会话 deadline 是硬截止时间：让出与调度开销不返还预算、不顺延。
+        let score = 0;
+        const gen = minimax(state, depth - 1, alpha, beta, !isMaximizing, 1, 0, session);
+        try {
+          for (;;) {
+            const step = gen.next();
+            if (step.done) {
+              score = step.value;
+              break;
+            }
+            await yieldToEventLoop();
+            enterSearchSlice(session);
+            session.yields++;
+            __searchStats.yields = session.yields;
+          }
+        } finally {
+          // 无论正常返回、被中断还是抛异常，本层落子都必须撤销。
+          // 先 gen.return() 让生成器内部的 try/finally 逐层撤销更深层的落子，再撤根走法；
+          // 顺序不能反，否则内部 unapply 会作用在已被撤销的棋盘上。
+          gen.return(0);
+          unapplyMove(state, undo);
+        }
 
         // 应用根节点惩罚
         score -= rootPenalty;
 
-        if (!searchAborted) {
+        if (!session.aborted) {
           // 注意：applyMove 后 piece.col/row 已变为目标位，from 坐标必须取 move 中保存的原值
           const result: AIMoveResult = {
             pieceId: move.pieceId,
@@ -1157,20 +1340,17 @@ async function searchWithTimeBudget(
           }
         }
       }
-
-      unapplyMove(state, undo);
     }
 
     // 只有完整跑完一层（未被中断），才接受该层结果
-    if (!searchAborted && currentBest) {
+    if (!session.aborted && currentBest) {
       bestMove = currentBest;
-    } else if (searchAborted) {
+    } else if (session.aborted) {
       break;
     }
   }
 
-  // 根节点候选多样化：仅在反循环机制激活时（antiLoopActive）从近优解中随机选择，
-  // 帮助 AI 跳出后期重复走法的死循环；正常局面下走确定性的客观最优着法
+  // 根节点候选多样化：仅在反循环机制激活时（antiLoopActive）从近优解中随机选择，  // 帮助 AI 跳出后期重复走法的死循环；正常局面下走确定性的客观最优着法
   if (antiLoopActive && rootMoveEvals.length > 0) {
     // 按分数降序排序
     rootMoveEvals.sort((a, b) => isMaximizing ? b.score - a.score : a.score - b.score);
@@ -1240,6 +1420,8 @@ async function searchWithTimeBudget(
     }
   }
 
+  // 会话结束即失活：避免之后的一次 abortSearch 误伤已经跑完的这次搜索
+  activeSearch = null;
   return bestMove;
 }
 
@@ -1268,18 +1450,18 @@ export async function getBestMoveAsync(
   state: GameState,
   difficulty: 'easy' | 'medium' | 'hard'
 ): Promise<AIMoveResult | null> {
-  // 防御性取消正在进行的提示预计算：避免与 AI 搜索争抢算力、
-  // 以及共享搜索控制状态（pureBestMode / searchDeadline 等）被交叉污染
+  // 防御性取消正在进行的提示预计算：避免与 AI 搜索争抢算力
+  // （两次搜索各自持有独立会话，不会再有共享 deadline 被覆盖的问题）
   cancelHintPonder();
   // 让出主线程，确保 UI 更新（"AI思考中"提示），同时给被取消的预计算留出收尾时间
   await new Promise<void>(resolve => setTimeout(resolve, 50));
   const maxDepth = MAX_DEPTH[difficulty] || 4;
   const timeBudget = TIME_BUDGET[difficulty] || 2000;
-  // 周期性让出主线程（与后台提示搜索一致）：残局闯关固定走本地 AI，hard 预算长达 2.5s，
+  // 让出主线程并分片执行：残局闯关固定走本地 AI，hard 预算长达 2.5s，
   // 若全程同步阻塞会冻结 JS 线程，导致走子音效的音频桥接消息无法送达、AI 落子无声；
-  // 分片让出后搜索期间音频/UI 保持响应，落子音效正常播放（搜索逻辑与结果不受影响）
+  // 分片后搜索期间音频/UI/触摸保持响应（搜索逻辑与结果不受影响）。
   // 在私有副本上搜索：让出期间调用方（React state）不会被改写成搜索树的中间局面
-  return searchWithTimeBudget(cloneForSearch(state), maxDepth, timeBudget, 30);
+  return searchWithTimeBudget(cloneForSearch(state), maxDepth, timeBudget, false);
 }
 
 // ======================== 提示预计算（后台思考 / Ponder） ========================
@@ -1299,9 +1481,9 @@ interface PonderEntry {
 
 let ponderEntry: PonderEntry | null = null;
 
-/** 中止当前搜索（若有）。搜索每 512 个节点检查一次 searchAborted，会在毫秒内退出 */
+/** 中止当前搜索（若有）。搜索会在下一次节点轮询（≤512 节点）时看到中断标志并退出 */
 export function abortSearch(): void {
-  searchAborted = true;
+  if (activeSearch) activeSearch.aborted = true;
 }
 
 /**
@@ -1327,29 +1509,14 @@ function ponderMatches(entry: PonderEntry, state: GameState): boolean {
 /**
  * 提示搜索（纯最佳模式）：hard 深度与时间预算、完全确定性。
  *
- * 让出间隔（yieldIntervalMs）取 8ms 而非原先的 25ms：
- * 让出点只在根节点走法之间（searchWithTimeBudget 的根节点循环），
- * 两次让出之间会跑完一整棵 minimax + 静态搜索子树，因此单次主线程阻塞
- * 并不由子树大小决定，而是由「上次让出后到下次让出检查」这段间隔决定。
- * 实测同一批中局（见 _review/probe_yield_sweep.cjs）：
- *   间隔 25ms → 搜索 79ms / 最长阻塞 51.9ms
- *   间隔 12ms → 搜索 85ms / 最长阻塞 36.5ms
- *   间隔  8ms → 搜索 110ms / 最长阻塞 28.1ms
- * 走法在 25/16/12/8/4ms 下完全一致，8ms 在响应性与开销之间取平衡：
- * 最长阻塞降到约 28ms（玩家点击最多被推迟这么久），搜索开销仅增加约 40%，
- * 而提示是玩家主动点击后才消费的后台预计算，多花的 30ms 无人感知。
- * 4ms 会让阻塞次数翻倍而最长阻塞不再下降，故不取。
+ * 让出方式与 AI 对弈搜索完全相同：固定 12ms 分片（SEND_SLICE_MS），
+ * 每片跑满就把搜索挂起、让出主线程，然后从挂起点继续（不会重放已算过的子树）。
+ * 因此最长连续阻塞约等于一个分片（十几毫秒），而不是「一整棵根走法子树」
+ * ——旧实现只在根走法之间检查让出间隔，实测中局单次阻塞可达约 125ms。
  */
-const HINT_YIELD_INTERVAL_MS = 8;
-
 async function runHintSearch(state: GameState): Promise<AIMoveResult | null> {
-  pureBestMode = true;
-  try {
-    // 同样在私有副本上搜索：提示预计算在后台与玩家操作并行，更不能改写 live state
-    return await searchWithTimeBudget(cloneForSearch(state), MAX_DEPTH.hard, TIME_BUDGET.hard, HINT_YIELD_INTERVAL_MS);
-  } finally {
-    pureBestMode = false;
-  }
+  // 同样在私有副本上搜索：提示预计算在后台与玩家操作并行，更不能改写 live state
+  return await searchWithTimeBudget(cloneForSearch(state), MAX_DEPTH.hard, TIME_BUDGET.hard, true);
 }
 
 /**
