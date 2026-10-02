@@ -18,6 +18,7 @@ import ChessBoard, { CapturedPiecesDrawer } from '@/components/ChessBoard';
 import { useMoveEffect } from '@/hooks/useMoveEffect';
 import { playJiangJunSound, playSound, preloadSounds, unloadAllSounds } from '@/utils/SoundManager';
 import { getOnlineServerUrl } from '@/utils/serverConfig';
+import { serverNow } from '@/utils/serverClock';
 import { BattleSocket } from '@/utils/battleSocket';
 import { useBattleStateSync } from '@/hooks/useBattleStateSync';
 import { type BattlePlayer } from '@/utils/battleProtocol';
@@ -115,6 +116,9 @@ export default function SpectateScreen() {
   const [clockText, setClockText] = useState<{ red: string | null; black: string | null; redUrgent: boolean; blackUrgent: boolean }>({ red: null, black: null, redUrgent: false, blackUrgent: false });
   const [turnTimeLimit, setTurnTimeLimit] = useState(0); // 秒，0=不限时
   const [turnTimeLeft, setTurnTimeLeft] = useState(0);
+  // 【C-53】步时限额的镜像 ref：useBattleStateSync 同时会写这个 ref 与 setTurnTimeLimit
+  // （见 hook 内 :263 附近），本页原先只传 setter、不传 ref，那个 ref 分支永远不生效。
+  const turnTimeLimitRef = useRef(0);
   const lastMoveTimeRef = useRef<number>(0);
   const serverTimeOffsetRef = useRef(0);
   // 房间读秒时长（byoyomi）：基本用时耗尽后展示「读 M:SS」
@@ -198,6 +202,7 @@ export default function SpectateScreen() {
     isActive: () => mountedRef.current,
     serverTimeOffsetRef,
     lastMoveTimeRef,
+    turnTimeLimitRef,
     byoyomiRef,
     clockSnapRef,
     setGameState,
@@ -260,7 +265,8 @@ export default function SpectateScreen() {
         setClockText(prev => (prev.red === null && prev.black === null ? prev : { red: null, black: null, redUrgent: false, blackUrgent: false }));
         return;
       }
-      const correctedNow = Date.now() + serverTimeOffsetRef.current;
+      // 第 3 批：走 serverNow（§8 表 #7）
+      const correctedNow = serverNow(serverTimeOffsetRef);
       const anchorNow = snap.clockPausedAt ?? correctedNow;
       const elapsed = Math.max(0, anchorNow - snap.lastMoveTime);
       const toMove: 'red' | 'black' = snap.sideTag === RED_SIDE ? 'red' : 'black';
@@ -295,8 +301,11 @@ export default function SpectateScreen() {
   useEffect(() => {
     if (phase !== 'playing' || turnTimeLimit <= 0) return undefined;
     const tick = () => {
-      const correctedNow = Date.now() + serverTimeOffsetRef.current;
-      const elapsed = Math.floor(Math.max(0, correctedNow - lastMoveTimeRef.current) / 1000);
+      // 第 3 批：走 serverNow（§8 表 #7）
+      const correctedNow = serverNow(serverTimeOffsetRef);
+      // 【C-41 同源】协商期间（悔棋/求和）服务端冻结棋钟，步时展示也要跟着冻结
+      const anchorNow = clockSnapRef.current?.clockPausedAt ?? correctedNow;
+      const elapsed = Math.floor(Math.max(0, anchorNow - lastMoveTimeRef.current) / 1000);
       setTurnTimeLeft(Math.max(0, turnTimeLimit - elapsed));
     };
     tick();

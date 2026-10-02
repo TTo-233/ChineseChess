@@ -64,12 +64,24 @@ export default function AppDialog({
   return (
     <AppModal
       visible={visible}
-      onClose={hasCancel ? onCancel! : onConfirm}
+      // 【C-79】单键弹窗不再把返回键接到确认动作。
+      // AppModal 用 onRequestClose 承接 Android 物理返回键（AppModal.tsx:102/174），
+      // 此前 `onClose={hasCancel ? onCancel! : onConfirm}` 让"只有确认键"的弹窗一按
+      // 返回就执行确认。当前唯一单键调用方（game/index.tsx:1450 残局说明）无害，
+      // 但 AppDialog 是通用组件：将来「删除对局 / 认输 / 退出房间」这类单键确认弹窗
+      // 一接上，返回键立刻变成误确认入口。
+      // 修复方式（两处协同，单键时语义才完整）：
+      //   ① 单键时 onClose 传空操作 —— 即使别的路径走到 onClose（AppModal 的关闭图标键）
+      //      也不会顺手执行确认；
+      //   ② 下方 blockBackButton 补 `|| !hasCancel` —— 返回键被直接吞掉。
+      // 两处都不引入新 prop：单键弹窗本来就该由它唯一的按钮来关闭。若某天确实需要
+      // "返回键 = 关闭"，给该调用方补一个 onCancel（或改用双键形式）即可显式表达。
+      onClose={hasCancel ? onCancel! : () => undefined}
       title={title}
       variant={variant}
       placement={placement}
       anchorCenter={anchorCenter}
-      blockBackButton={blockBackButton}
+      blockBackButton={blockBackButton || !hasCancel}
       // 确认类弹窗不支持点遮罩关闭，避免误触丢失输入
       dismissOnMaskPress={false}
     >

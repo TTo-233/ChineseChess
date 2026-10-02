@@ -37,6 +37,7 @@ import {
   type BattleUndoResult,
   type GameStatePayload,
 } from '@/utils/battleProtocol';
+import { applyServerNow, serverElapsedMs, serverNow } from '@/utils/serverClock';
 
 /** 本端走子的乐观保护窗口：超过该时长仍未在服务端局面里看到本端着法，即判定上传失败 */
 const OPTIMISTIC_SYNC_TIMEOUT_MS = 8000;
@@ -252,16 +253,21 @@ export function useBattleStateSync(options: BattleStateSyncOptions): BattleState
     }
 
     // ---- 服务端时钟校正（所有与服务端时间戳的比较都必须走校正时间） ----
-    if (typeof data.serverNow === 'number' && opt.serverTimeOffsetRef) {
-      opt.serverTimeOffsetRef.current = data.serverNow - Date.now();
-    }
+    // 第 3 批：偏移量的写入/读取集中到 @/utils/serverClock，
+    // 避免各处手写 `Date.now() + offset` 时漏掉某一条路径（§8 表 #7）
+    applyServerNow(opt.serverTimeOffsetRef, data.serverNow);
 
     // ---- 房间设置同步 ----
     const settings = asObject<BattleSettings>(data.settings);
     if (settings) {
       // 单回合限时由 room 轮询与对局负载双向同步（两者都写同一镜像 ref）
-      if (typeof settings.turnTimeLimit === 'number' && opt.turnTimeLimitRef) {
-        opt.turnTimeLimitRef.current = settings.turnTimeLimit;
+      if (typeof settings.turnTimeLimit === 'number') {
+        // 【C-53】此前只写镜像 ref、从不调 setTurnTimeLimit，声明的 setter 是死参数：
+        // 对局页之所以还能显示，是因为它的 room 轮询那条路径（lanBattle:676/:1308）
+        // 调了 setter；观战页只调 setter 不传 ref → turnTimeLimit 永远停在初始 0，
+        // 「限时步时」的房间里观众从头到尾看不到倒计时。两个写入通道都补齐。
+        if (opt.turnTimeLimitRef) opt.turnTimeLimitRef.current = settings.turnTimeLimit;
+        opt.setTurnTimeLimit?.(settings.turnTimeLimit);
       }
       if (typeof settings.byoyomiSeconds === 'number' && opt.byoyomiRef) {
         opt.byoyomiRef.current = settings.byoyomiSeconds;
@@ -291,7 +297,7 @@ export function useBattleStateSync(options: BattleStateSyncOptions): BattleState
         opt.clockSnapRef.current = {
           red: clocks.red,
           black: clocks.black,
-          lastMoveTime: typeof data.lastMoveTime === 'number' ? data.lastMoveTime : Date.now(),
+          lastMoveTime: typeof data.lastMoveTime === 'number' ? data.lastMoveTime : serverNow(opt.serverTimeOffsetRef),
           sideTag: data.gameState.sideTag,
           clockPausedAt: typeof data.clockPausedAt === 'number' ? data.clockPausedAt : null,
         };
@@ -321,7 +327,8 @@ export function useBattleStateSync(options: BattleStateSyncOptions): BattleState
           !data.winner ? 'draw' : data.surrenderBy ? 'resign' : 'checkmate',
         ),
         moveCount: data.gameState?.moveHistory?.length,
-        duration: data.gameStartTime ? Date.now() - data.gameStartTime : 0,
+        // 第 3 批 / §8 #7：gameStartTime 是服务端时间戳，必须用校正后的服务端时间求差
+        duration: serverElapsedMs(opt.serverTimeOffsetRef, data.gameStartTime),
       });
     }
 
@@ -406,7 +413,13 @@ export function useBattleStateSync(options: BattleStateSyncOptions): BattleState
     if (data.disconnectedPlayerId && data.disconnectedPlayerId !== opt.selfId) {
       let countdown = DISCONNECT_WAIT_SECONDS;
       if (data.disconnectTime) {
-        const elapsed = Math.floor((Date.now() - data.disconnectTime) / 1000);
+        // §4.4：disconnectTime 是服务端时间戳（与 lastMoveTime、sideReveal.time 同源），
+        // 必须用校正后的服务端时间求差。直接用本机 Date.now() 时，
+        // 设备时钟偏快会算出巨大的 elapsed → 倒计时直接 0，用户看到「对方已断线」+
+        // 归零闪一下；同时时钟偏慢又会算出负数 → Math.max(0, ...) 把它拉回满值，
+        // 倒计时长时间不归零。这两种表现都是「服务端其实还在等满 60s」。
+        // 第 3 批起这条路径走 serverElapsedMs（§8 表 #7）
+        const elapsed = Math.floor(serverElapsedMs(opt.serverTimeOffsetRef, data.disconnectTime) / 1000);
         countdown = Math.max(0, DISCONNECT_WAIT_SECONDS - elapsed);
       }
       opt.setOpponentDisconnected?.(true);

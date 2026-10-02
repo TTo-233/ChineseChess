@@ -15,7 +15,8 @@
     "lint:all": "pnpm -r --if-present run lint",
     "verify:server-parity": "node ../chinese-chess-server/build.js --check",
     "verify:rule-engine-parity": "node ../chinese-chess-server/scripts/verify-rule-engine-parity.mjs",
-    "validate": "pnpm run lint && pnpm run verify:server-parity && pnpm run verify:rule-engine-parity"
+    "test:client": "pnpm --filter expo-app run test:ci",
+    "validate": "pnpm run lint && pnpm run verify:server-parity && pnpm run verify:rule-engine-parity && pnpm run test:client"
   },
   "dependencies": {},
   "devDependencies": {},

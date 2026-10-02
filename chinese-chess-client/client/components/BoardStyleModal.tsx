@@ -122,15 +122,6 @@ const styles = StyleSheet.create({
     paddingHorizontal: 20,
     paddingBottom: 20,
   },
-  headerIcon: {
-    width: 36,
-    height: 36,
-    borderRadius: 10,
-    backgroundColor: 'rgba(139, 105, 20, 0.12)',
-    alignItems: 'center',
-    justifyContent: 'center',
-    marginRight: 10,
-  },
   subtitle: {
     fontSize: FONT.caption,
     color: COLORS.textMuted,

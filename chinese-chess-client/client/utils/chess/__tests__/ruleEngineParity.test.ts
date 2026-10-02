@@ -6,7 +6,8 @@
  *
  * 服务端的规则引擎 chinese-chess-server/ruleEngine.cjs 不是独立源码，而是把
  * chinese-chess-client/client/utils/chess/ruleEngine.bundle.ts 用 esbuild 打包的产物
- * （服务端 dist/index.js 通过 require("../ruleEngine.cjs") 加载它）。
+ * （服务端 `src/routes/lanGame.ts:6` 通过 require("../ruleEngine.cjs") 加载它；
+ * 【I-1】原注释写的是 dist/index.js，已改指源码）。
  *
  * 于是"两端同源"只是**约定**，没有任何机制保证：
  *   · 改了客户端规则源码而忘记重新打包 → 服务端还在跑旧规则，且不报任何错；
@@ -106,7 +107,7 @@ describe('两端规则引擎同源 —— 逐字节', () => {
       throw new Error(
         '两端规则引擎已漂移！请执行：\n' +
           '  node chinese-chess-server/scripts/verify-rule-engine-parity.mjs --write\n' +
-          '然后**重启服务端**（dist/index.js 通过 require 加载 ruleEngine.cjs）。\n' +
+          '然后**重启服务端**（src/routes/lanGame.ts:6 通过 require 加载 ruleEngine.cjs）。\n' +
           `首个差异在第 ${i} 字节：\n` +
           `  重新打包 ${built.length} 字节：${JSON.stringify(built.slice(Math.max(0, i - 60), i + 60))}\n` +
           `  已提交   ${shipped.length} 字节：${JSON.stringify(shipped.slice(Math.max(0, i - 60), i + 60))}`

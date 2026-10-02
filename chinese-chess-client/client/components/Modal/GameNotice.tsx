@@ -70,7 +70,11 @@ export default function GameNotice({
       duration: 200,
       easing: Easing.out(Easing.quad),
       useNativeDriver: true,
-    }).start(() => {
+    }).start(({ finished }) => {
+      // 【C-76】start 的回调不区分「跑完」与「被 stop 打断」。连续提示时（例如「将军」
+      //   紧跟「吃子」）新动画会打断旧的淡出，而旧动画的完成回调照样触发 → setVisible(false)
+      //   把刚弹出的新提示抹掉。只有自然结束才允许收尾。
+      if (!finished) return;
       setVisible(false);
       onHide?.();
     });
@@ -124,11 +128,19 @@ export default function GameNotice({
   return (
     <Animated.View
       // 绝对定位在棋盘之上居中：非阻塞，不吃掉棋盘的点击
+      // （box-none 只作用于本节点，子节点要靠自己的 pointerEvents="none"，见下方 inner）
       pointerEvents="box-none"
       style={[containerStyle, { opacity }]}
       collapsable={false}
     >
-      <View style={styles.inner} collapsable={false}>
+      <View
+        // 【C-74】内层必须显式 none：pointerEvents 不向下传递，容器的 box-none 只让
+        //   「自己」不命中，子 View 仍参与命中测试 —— 提示条可见的这 3 秒里，棋盘中部
+        //   整块被它吞掉，点自己的棋子没反应。提示条本身不需要任何交互。
+        pointerEvents="none"
+        style={styles.inner}
+        collapsable={false}
+      >
         <Text style={styles.text} numberOfLines={4}>
           {notice.text}
         </Text>

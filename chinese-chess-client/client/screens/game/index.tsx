@@ -9,9 +9,8 @@ import {
   Text,
   TouchableOpacity,
   StyleSheet,
-  Dimensions,
+  useWindowDimensions,
   Animated,
-  Image,
   ActivityIndicator,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -23,11 +22,17 @@ import { FontAwesome6 } from '@expo/vector-icons';
 import ChessBoard, { CapturedPiecesDrawer } from '@/components/ChessBoard';
 import JueShaOverlay from '@/components/JueShaOverlay';
 import { useMoveEffect } from '@/hooks/useMoveEffect';
-import { useBoardFrame } from '@/hooks/useBoardFrame';
+import { useGameBoardLayout } from '@/hooks/useGameBoardLayout';
+import { usePendingAIMove } from '@/hooks/usePendingAIMove';
+import {
+  useNewGame,
+  buildGameStateFromFen,
+  buildInitialGameState,
+  ENDGAME_HINT_LIMIT,
+  ENDGAME_UNDO_LIMIT,
+} from '@/hooks/useNewGame';
 import { MOVE_EFFECT_DURATION_MS } from '@/components/MoveEffectOverlay';
 import {
-  createInitialState,
-  createFromFen,
   getSelectableMoves,
   getValidMoves,
   isMoveKingSafe,
@@ -36,7 +41,7 @@ import {
   getWinnerSideTag,
   type GameState,
 } from '@/utils/chess/GameEngine';
-import { getBestMoveAsync, precomputeHint, cancelHintPonder, abortSearch, recordHistoryHash, clearHistoryHash, computeZobristHash } from '@/utils/chess/AIEngine';
+import { getBestMoveAsync, precomputeHint, cancelHintPonder, recordHistoryHash, clearHistoryHash, computeZobristHash } from '@/utils/chess/AIEngine';
 import { getHybridBestMove, getHybridHintMove, getOnlineAiStatus, isOnlineAiBusyRetrying, getOnlineAiInvalidReason, getOnlineAiLongGameNotice, subscribeOnlineAiStatus, type AISource, type HybridMoveResult, type OnlineAiStatus } from '@/utils/chess/aiDispatcher';
 import { isMoveBanned, enumerateLegalMoves } from '@/utils/chess/RuleEngine';
 import { playSound, playJiangJunSound, unloadAllSounds, preloadSounds, preloadGameEndSounds } from '@/utils/SoundManager';
@@ -44,9 +49,6 @@ import { RED_SIDE, BLACK_SIDE } from '@/utils/chess/types';
 import { saveGame, loadGame, deleteSave, type GameSave } from '@/utils/GameSave';
 import { saveReplay } from '@/utils/replayStorage';
 import { BUILTIN_ENDGAMES } from '@/utils/chess/endgames';
-import { useBoardLayoutBudget, capHostHeightToViewport } from '@/utils/chess/capturedDrawerMetrics';
-import { boardAlignedRowStyle } from '@/utils/chess/boardContentWidth';
-import { useBoardStyle } from '@/utils/chess/boardStyleStore';
 import {
   markLevelCompleted,
   markCustomCompleted,
@@ -56,11 +58,6 @@ import {
   type EndgameLaunchParams,
 } from '@/utils/EndgameProgress';
 import { FONT } from '@/utils/typography';
-
-const { width: SCREEN_WIDTH, height: SCREEN_HEIGHT } = Dimensions.get('window');
-
-// 棋盘尺寸根据屏幕宽度自适应
-
 
 // 主题色 - 浅色复古系
 const COLORS = {
@@ -78,10 +75,8 @@ const COLORS = {
 
 type Difficulty = 'easy' | 'medium' | 'hard';
 
-// 残局闯关每局限用次数：提示 3 次、悔棋 10 次。
-// 悔棋不参与金/银/铜冠评定——评级只统计提示次数（悔棋属于过程性辅助，不作为评级依据）
-const ENDGAME_HINT_LIMIT = 3;
-const ENDGAME_UNDO_LIMIT = 10;
+// 残局闯关每局限用次数由 @/hooks/useNewGame 统一导出（ENDGAME_HINT_LIMIT / ENDGAME_UNDO_LIMIT），
+// 页面与重置逻辑共用同一份常量，避免「按钮禁用阈值」与「重置回的值」各写一遍。
 
 export default function GameScreen() {
   const router = useSafeRouter();
@@ -127,29 +122,11 @@ export default function GameScreen() {
   const initialSideTag = currentFirstMover === 'player' ? playerSideTag : aiSideTag;
   const aiFirst = currentFirstMover === 'ai';
 
-  // 从残局 FEN 构建初始局面（含 Zobrist 初始化与历史记录）
-  const buildEndgameState = useCallback((fen: string): GameState => {
-    const state = createFromFen(fen.trim());
-    state.zobristHash = computeZobristHash(state);
-    clearHistoryHash();
-    recordHistoryHash(state);
-    return state;
-  }, []);
-
-  // 游戏状态
-  const [gameState, setGameState] = useState<GameState>(() => {
-    if (initialEndgame) {
-      return buildEndgameState(initialEndgame.fen);
-    }
-    const state = createInitialState(initialSideTag);
-    // 初始化 Zobrist 哈希
-    state.zobristHash = computeZobristHash(state);
-    // 清空历史记录（新对局开始）
-    clearHistoryHash();
-    // 记录初始局面
-    recordHistoryHash(state);
-    return state;
-  });
+  // 游戏状态（开局局面的构建与 useNewGame 共用同一实现 buildGameStateFromFen /
+  // buildInitialGameState：Zobrist 哈希与重复局面历史的初始化不能有两份写法）
+  const [gameState, setGameState] = useState<GameState>(() =>
+    initialEndgame ? buildGameStateFromFen(initialEndgame.fen) : buildInitialGameState(initialSideTag)
+  );
   const [selectedPieceId, setSelectedPieceId] = useState<number | null>(null);
   const [validMoves, setValidMoves] = useState<boolean[][] | null>(null);
   const [lastMove, setLastMove] = useState<{
@@ -188,43 +165,27 @@ export default function GameScreen() {
     };
   }, []);
 
-  // ===== AI 走子竞态防护 =====
+  // ===== AI 走子竞态防护（第 3 批抽到 @/hooks/usePendingAIMove）=====
   // 代数（generation）：任何会重置/改变局面的操作（重开、下一关、悔棋、翻转、
   // 返回、读档）都使代数自增；延时中或计算中的 AI 走子在落地前校验代数，
   // 代数已变则丢弃结果，避免旧局面的 AI 着法覆盖新状态（如"重开后 AI 又落一子
   // 把局面拉回旧棋"、"悔棋被延时中的 AI 着法顶掉"）。
-  const gameGenRef = useRef(0);
-  // 待执行的 AI 延时定时器（executeMove/重开/翻转等排定的 AI 走子）
-  const aiTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // 与旧实现不同：玩家分支（executeMove）现在**同样**过代数闸——它此前 await 音效
+  // 却没有校验，"落子后立刻重开"会把旧局面写回去（CODE_AUDIT.md §8 表 #8）。
+  const runAIMoveRef = useRef<(state: GameState) => void>(() => undefined);
+  const {
+    invalidatePendingAI,
+    scheduleAIMove,
+    beginMoveTicket,
+    isTicketLive,
+  } = usePendingAIMove({
+    runAIMove: (state) => runAIMoveRef.current(state),
+    onDiscard: () => setAiThinking(false),
+  });
 
-  /**
-   * 使所有排队中/计算中的 AI 走子失效（局面重置类操作的统一前置动作）。
-   * 除了清掉延时定时器，还必须**中止已经在跑的那次搜索**：
-   * 只靠代数校验的话，旧搜索会继续占着主线程跑到自然结束（最多一个完整预算），
-   * 与重置后新排定的 AI 思考抢算力——悔棋/翻转/重开后越打越卡就是这么来的。
-   */
-  const invalidatePendingAI = useCallback(() => {
-    gameGenRef.current += 1;
-    if (aiTimerRef.current) {
-      clearTimeout(aiTimerRef.current);
-      aiTimerRef.current = null;
-    }
-    abortSearch();
-  }, []);
-
-  // 卸载时清理 AI 延时定时器
-  useEffect(() => {
-    return () => {
-      if (aiTimerRef.current) clearTimeout(aiTimerRef.current);
-    };
-  }, []);
-
-  // 动态间距：随屏幕宽度/棋盘缩放比例自适应
-  const screenWidth = Dimensions.get('window').width;
-  // 窗口高度：用于把棋盘宿主实测高度封顶到视口内，打断宽屏纵向溢出的正反馈
-  const windowHeight = Dimensions.get('window').height;
-  const dynamicGap = Math.max(Math.round(screenWidth * 0.03), 8);
   // 安全区：Screen 已在内容之外施加，预算封顶时需据此扣减可用高度
+  // （screenWidth / windowHeight / dynamicGap 改由 useGameBoardLayout 内的
+  //  useWindowDimensions 提供，第 3 批顺带修掉转屏后不再重算的旧问题）
   const insets = useSafeAreaInsets();
 
   // 游戏结束状态（声明提前，handleFlip 需要引用）
@@ -334,8 +295,33 @@ export default function GameScreen() {
   // 残局"说明"弹窗（不使用全局 alert —— 其在 Release 构建中不可用，调用会导致卡死）
   const [endgameInfoVisible, setEndgameInfoVisible] = useState(false);
   // 残局闯关：每局限 3 次提示 + 10 次悔棋，用完按钮禁用（重开/下一关/恢复存档时重置）
+  // 上限常量由 @/hooks/useNewGame 统一导出，重置回的值与按钮禁用阈值共用同一份。
   const [endgameHintLeft, setEndgameHintLeft] = useState(ENDGAME_HINT_LIMIT);
   const [endgameUndoLeft, setEndgameUndoLeft] = useState(ENDGAME_UNDO_LIMIT);
+
+  // ===== 开新局的统一重置（第 3 批抽到 @/hooks/useNewGame）=====
+  // 「确认重开 / 再来一局 / 残局下一关」三条路径此前各抄了一份 15 行重置序列；
+  // 这里给出全部 setter，重置序列由 Hook 单一实现承担（差异改用显式选项表达）。
+  const { startNewGame } = useNewGame({
+    endgameResultRef,
+    replaySavedRef,
+    invalidatePendingAI,
+    scheduleAIMove,
+    clearHint,
+    setGameState,
+    setSelectedPieceId,
+    setValidMoves,
+    setLastMove,
+    setMoveCount,
+    setCapturedRed,
+    setCapturedBlack,
+    setIsFlipped,
+    setJueShaVisible,
+    setGameOverReason,
+    setEndgameHintLeft,
+    setEndgameUndoLeft,
+    setBoardKey,
+  });
   // 被吃棋子明细抽屉展开的一侧（null=收起），抽屉渲染在顶部标题行正下方
   const [capturedDrawerSide, setCapturedDrawerSide] = useState<'opponent' | 'mine' | null>(null);
   // 棋盘可用纵向空间实测（宽屏/纵向空间不足时限制棋盘尺寸，避免挤占标题行与底部操作栏）
@@ -356,82 +342,31 @@ export default function GameScreen() {
   }, []);
   const hideRuleNotice = useCallback(() => setRuleNotice(null), []);
 
-  // 棋盘高度预算 + 垂直定位留白（二分求解，口径与抽屉真实尺寸一致）：
-  // 条件 1 —— 棋盘顶边上方常驻预留「AI 角标行(30) + 摘要条悬浮区(38+30) + 抽屉展开高度」，
-  //           无论抽屉是否点开都预留，保证展开时底边不压棋盘、不与摘要条/角标重叠；
-  // 条件 2 —— 内容（角标行 + 棋盘 + 底部栏）在宿主内垂直居中；居中时上方预留不足则整体下移
-  //           贴住预留区（把下方空白让给棋盘），棋盘取到预留允许的最大尺寸。
-  // 宽屏下棋盘由纵向预算决定而缩小，抽屉随棋盘同步缩小，预留与真实抽屉高度精确一致，
-  // 不再像旧实现那样按宽度缩放高估抽屉、把棋盘压缩得过小。
-  // 上方流内占位 = AI 角标行(26+4=30)；下方流内占位 = dynamicGap + 底部操作栏。
-  // hostHeight 经视口封顶：Screen 的 flexGrow 容器会让 flex:1 宿主按内容撑开，
-  // 不封顶则「宿主变大 → 棋盘变大 → 内容更高」正反馈会让宽屏页面纵向溢出
-  // （详见 capHostHeightToViewport 注释）。
-  const { maxBoardHeight, paddingTop: boardPadTop } = useBoardLayoutBudget({
-    hostHeight: capHostHeightToViewport(
-      boardAreaH,
-      windowHeight,
-      drawerHostY,
-      insets.top,
-      insets.bottom,
-      0 // 底部栏在 capturedDrawerHost 之内，已由 bottomFlowHeight 计入
-    ),
+  // ===== 棋盘几何与纵向预算（第 3 批抽到 @/hooks/useGameBoardLayout）=====
+  // 宿主实测 → 视口封顶 → 纵向预算二分 → 棋盘尺寸 → 对齐行宽 → 绝杀特效框 → 提示条中心，
+  // 这条依赖链整体搬进了 Hook；页面只按名字消费结果，不再自己串每一环。
+  const {
+    maxBoardHeight,
+    boardPadTop,
+    alignedRowStyle,
+    jueshaBoardFrame,
+    ruleNoticeCenterY,
+    boardSize,
+    setBoardSize,
     screenWidth,
-    stripOffset: 30,
-    topFlowHeight: 30,
-    bottomFlowHeight: dynamicGap + bottomBarH,
+    windowHeight,
+    dynamicGap,
+    measureBoardFrame,
+    containerRef,
+    boardRef,
+  } = useGameBoardLayout({
+    boardAreaH,
+    bottomBarH,
+    drawerHostY,
+    insetsTop: insets.top,
+    insetsBottom: insets.bottom,
+    jueshaVisible: jueShaVisible,
   });
-
-
-  // 棋盘真实几何（相对主容器）：供绝杀特效锁定棋盘中心、把结算文字/按钮排到棋盘正下方
-  const { containerRef, boardRef, boardFrame, measure: measureBoardFrame } = useBoardFrame();
-  // 当前棋盘样式：AI 角标行宽度需按样式几何换算棋盘本体宽度（用户可在首页设置中切换样式）
-  const boardStyle = useBoardStyle();
-
-  // AI 角标行宽度：取棋盘本体宽度并水平居中，使角标行左右边缘与棋盘边缘对齐
-  // （宽屏下棋盘因纵向预算被压缩居中，角标行若铺满整屏会贴到屏幕最左/最右）
-  const nameRowStyle = useMemo(
-    () => boardAlignedRowStyle(screenWidth, boardStyle, maxBoardHeight ?? 0),
-    [boardStyle, maxBoardHeight]
-  );
-
-  // 底部操作栏宽度：同样跟随棋盘本体宽度居中，宽屏下不再横贯整个屏幕
-  const bottomBarWidthStyle = useMemo(
-    () => boardAlignedRowStyle(screenWidth, boardStyle, maxBoardHeight ?? 0),
-    [boardStyle, maxBoardHeight]
-  );
-
-  // 绝杀特效弹出前兜底重测：boardPadTop/maxBoardHeight 变化只挪动棋盘（相对父级布局不变，
-  // 包裹层 onLayout 可能不触发），此处按绝对坐标重新测量，保证特效对齐的是最新棋盘位置
-  useEffect(() => {
-    if (!jueShaVisible) return;
-    measureBoardFrame();
-  }, [jueShaVisible, boardPadTop, maxBoardHeight, measureBoardFrame]);
-
-  // 棋盘本体真实尺寸（外层容器宽=屏宽，onBoardLayout 回报的才是棋盘宽），由 ChessBoard 回报
-  const [boardSize, setBoardSize] = useState<{ width: number; height: number } | null>(null);
-
-  // 绝杀特效对齐用的棋盘框：测量框宽=屏宽（外层容器），按棋盘本体宽度在其中水平居中换算，
-  // 得到棋盘本体的真实 x/宽，保证特效中心与按钮宽度口径都落在棋盘本体上
-  const jueshaBoardFrame = useMemo(() => {
-    if (!boardFrame) return null;
-    const w = boardSize?.width ?? boardFrame.width;
-    const h = boardSize?.height ?? boardFrame.height;
-    return {
-      x: boardFrame.x + (boardFrame.width - w) / 2,
-      y: boardFrame.y,
-      width: w,
-      height: h,
-    };
-  }, [boardFrame, boardSize]);
-
-  // 长将长捉提示条（GameNotice）的棋盘中心纵坐标：挂载点 capturedDrawerHost 与
-  // boardFrame 的测量基准（根容器）相差 drawerHostY，需换算到同一坐标系；
-  // 缺测量时返回 undefined，由 GameNotice 退回容器 50% 居中（口径同联机对战页）
-  const ruleNoticeCenterY = useMemo(() => {
-    if (!jueshaBoardFrame) return undefined;
-    return jueshaBoardFrame.y + jueshaBoardFrame.height / 2 - drawerHostY;
-  }, [jueshaBoardFrame, drawerHostY]);
 
   // 在线 AI 状态订阅：熔断/恢复/服务端繁忙/走法被拒都会主动广播，
   // 这里把它转成 state 触发重渲染——否则角标只能等下一次走子才刷新，
@@ -487,8 +422,8 @@ export default function GameScreen() {
   const triggerAIMove = useCallback(async (currentState: GameState) => {
     if (currentState.gameStatus !== 'playing') return;
 
-    // 记录当前代数：计算期间若发生重开/悔棋/翻转等重置，结果作废
-    const gen = gameGenRef.current;
+    // 开一张代数票据：计算期间若发生重开/悔棋/翻转等重置，本次结果作废
+    const ticket = beginMoveTicket();
     setAiThinking(true);
 
     try {
@@ -503,7 +438,7 @@ export default function GameScreen() {
       }
 
       // 计算返回时局面已被重置（重开/悔棋/翻转/退出）→ 丢弃结果
-      if (gameGenRef.current !== gen) return;
+      if (!isTicketLive(ticket)) return;
 
       if (aiMove) {
         setAiSource(aiMove.source);
@@ -560,7 +495,7 @@ export default function GameScreen() {
         }
 
         // 音效播放期间局面也可能被重置（如玩家中途重开）→ 落地前再校验一次
-        if (gameGenRef.current !== gen) return;
+        if (!isTicketLive(ticket)) return;
 
         setGameState(newState);
         setLastMove({
@@ -615,20 +550,13 @@ export default function GameScreen() {
     } finally {
       // 仅当本次计算未被重置操作作废时才复位思考标记，
       // 避免旧流程的 finally 覆盖新流程（如重开后排定的新 AI 走子）的 aiThinking
-      if (gameGenRef.current === gen) setAiThinking(false);
+      if (isTicketLive(ticket)) setAiThinking(false);
     }
-  }, [difficulty, triggerMoveEffect, savePveReplay, isEndgame, aiSideTag, currentEndgame, endgameHintLeft, showRuleNotice]);
+  }, [difficulty, triggerMoveEffect, savePveReplay, isEndgame, aiSideTag, currentEndgame, endgameHintLeft, showRuleNotice, beginMoveTicket, isTicketLive]);
 
-  /** 延时排定一次 AI 走子（可被 invalidatePendingAI 取消） */
-  const scheduleAIMove = useCallback((state: GameState, delayMs: number) => {
-    if (aiTimerRef.current) clearTimeout(aiTimerRef.current);
-    const gen = gameGenRef.current;
-    aiTimerRef.current = setTimeout(() => {
-      aiTimerRef.current = null;
-      if (gameGenRef.current !== gen) return; // 局面已被重置，放弃
-      triggerAIMove(state);
-    }, delayMs);
-  }, [triggerAIMove]);
+  // triggerAIMove 的最新引用转交排定器：排定器是稳定引用，读 ref 才能避免
+  // 「每次 triggerAIMove 重建都让所有排定失效」的死循环式重排定。
+  runAIMoveRef.current = triggerAIMove;
 
   // 点击棋子
   const handlePiecePress = useCallback((pieceId: number) => {
@@ -693,6 +621,8 @@ export default function GameScreen() {
 
   // 执行走棋
   const executeMove = useCallback(async (pieceId: number, toCol: number, toRow: number) => {
+    // 开一张代数票据：与 AI 分支同一道闸，落地前（音效 await 之后）统一校验
+    const ticket = beginMoveTicket();
     // 兜底校验：落点必须在该棋子的走法规则内（仅棋子自身走法，不含王安全过滤）。
     // 即使界面落点状态过期，也杜绝任何不合规则的落子
     const legalMoves = getValidMoves(gameState, pieceId);
@@ -747,6 +677,11 @@ export default function GameScreen() {
     } else {
       await playSound('go');
     }
+
+    // 【第 3 批 / §8 表 #8】与 AI 分支同口径的代数闸：音效 await 期间玩家可能已
+    // 重开/悔棋/翻转/退出（音效播放不是瞬时的），此时不能再把这步落回界面——
+    // 否则「落子后立刻点重开」会被旧 newState 覆盖回去，重开形同虚设。
+    if (!isTicketLive(ticket)) return;
 
     // 吃子/将军特效（终局时不播，由绝杀特效接管）；返回实际播放的特效类型
     const shownEffect = triggerMoveEffect(captured, isCheck, isGameOver);
@@ -804,8 +739,10 @@ export default function GameScreen() {
         savePveReplay(newState, playerWon); // 玩家走棋终局：按真实胜负保存复盘
       }
       // 按真实胜负播放结算音效（和棋不播胜负音效）
+      // 结算音效同样 await，落地后再过一次代数闸：期间用户可能已点「再来一局」
       if (!isDraw) {
         await playSound(playerWon ? 'gamewin' : 'gamelose');
+        if (!isTicketLive(ticket)) return;
       }
       return;
     }
@@ -814,7 +751,7 @@ export default function GameScreen() {
     // 避免 AI 秒回导致特效被下一步棋的特效/棋盘变化打断；无特效时保持 300ms 的轻思考停顿
     const aiDelay = shownEffect ? MOVE_EFFECT_DURATION_MS[shownEffect] + 120 : 300;
     scheduleAIMove(newState, aiDelay);
-  }, [gameState, triggerAIMove, clearHint, isEndgame, currentEndgame, endgameHintLeft, triggerMoveEffect, savePveReplay, playerSideTag, scheduleAIMove, showRuleNotice, currentPlayerSide]);
+  }, [gameState, clearHint, isEndgame, currentEndgame, endgameHintLeft, triggerMoveEffect, savePveReplay, playerSideTag, scheduleAIMove, showRuleNotice, beginMoveTicket, isTicketLive]);
 
   // 悔棋（人机对战不限次数；残局闯关每局限 ENDGAME_UNDO_LIMIT 次，且不计入金/银/铜冠评定）
   const handleUndo = useCallback(() => {
@@ -882,42 +819,17 @@ export default function GameScreen() {
   }, []);
 
   // 确认重新开始（残局模式：重置为当前关卡的 FEN 局面）
+  // 第 3 批：重置序列不再在此手写，改由 @/hooks/useNewGame 的单一实现承担
+  // （此前「确认重开 / 再来一局 / 残局下一关」各有一份 15 行副本，见 §8 表）。
   const confirmRestart = useCallback(() => {
     setShowRestartConfirm(false);
-    invalidatePendingAI(); // 取消延时中/计算中的旧局 AI 走子，防止覆盖重开后的局面
-    clearHint();
-    cancelHintPonder(); // 中止旧局面的后台预计算
-    const newState = isEndgame && currentEndgame
-      ? buildEndgameState(currentEndgame.fen)
-      : (() => {
-          const s = createInitialState(initialSideTag);
-          s.zobristHash = computeZobristHash(s);
-          clearHistoryHash();
-          recordHistoryHash(s);
-          return s;
-        })();
-    setGameState(newState);
-    setSelectedPieceId(null);
-    setValidMoves(null);
-    setLastMove(null);
-    setMoveCount(0);
-    setCapturedRed(0);
-    setCapturedBlack(0);
-    setIsFlipped(currentPlayerSide === 'black');
-    setJueShaVisible(false);
-    setGameOverReason(null);
-    endgameResultRef.current = null;
-    replaySavedRef.current = false; // 新一局允许再次自动保存复盘
-    setEndgameHintLeft(ENDGAME_HINT_LIMIT); // 残局提示次数重置
-    setEndgameUndoLeft(ENDGAME_UNDO_LIMIT); // 残局悔棋次数同步重置
-
-    if (aiFirst) {
-      scheduleAIMove(newState, 500);
-    } else {
-      // 玩家先手：后台预计算提示
-      precomputeHint(newState);
-    }
-  }, [currentPlayerSide, initialSideTag, aiFirst, clearHint, isEndgame, currentEndgame, buildEndgameState, invalidatePendingAI, scheduleAIMove]);
+    startNewGame({
+      endgameFen: isEndgame && currentEndgame ? currentEndgame.fen : undefined,
+      initialSideTag,
+      initialFlipped: currentPlayerSide === 'black',
+      aiFirst,
+    });
+  }, [startNewGame, isEndgame, currentEndgame, initialSideTag, currentPlayerSide, aiFirst]);
 
   // 返回（对局中且有有效着法时弹保存确认，与系统返回行为一致）
   const handleBack = useCallback(() => {
@@ -979,42 +891,19 @@ export default function GameScreen() {
   }, [isEndgame, invalidatePendingAI]);
 
   // 处理再来一局（残局模式：重新挑战当前关）
+  // 第 3 批：与「确认重开」共用 useNewGame 的单一重置实现，参数完全一致
   const handlePlayAgain = useCallback(() => {
-    invalidatePendingAI(); // 取消延时中/计算中的旧局 AI 走子
-    clearHint();
-    cancelHintPonder(); // 中止旧局面的后台预计算
-    const newState = isEndgame && currentEndgame
-      ? buildEndgameState(currentEndgame.fen)
-      : (() => {
-          const s = createInitialState(initialSideTag);
-          s.zobristHash = computeZobristHash(s);
-          clearHistoryHash();
-          recordHistoryHash(s);
-          return s;
-        })();
-    setGameState(newState);
-    setSelectedPieceId(null);
-    setValidMoves(null);
-    setLastMove(null);
-    setMoveCount(0);
-    setCapturedRed(0);
-    setCapturedBlack(0);
-    setIsFlipped(currentPlayerSide === 'black');
-    setGameOverReason(null);
-    setJueShaVisible(false);
-    endgameResultRef.current = null;
-    replaySavedRef.current = false; // 新一局允许再次自动保存复盘
-    setEndgameHintLeft(ENDGAME_HINT_LIMIT); // 残局提示次数重置
-    setEndgameUndoLeft(ENDGAME_UNDO_LIMIT); // 残局悔棋次数同步重置
-    if (aiFirst) {
-      scheduleAIMove(newState, 500);
-    } else {
-      // 玩家先手：后台预计算提示
-      precomputeHint(newState);
-    }
-  }, [currentPlayerSide, initialSideTag, aiFirst, clearHint, isEndgame, currentEndgame, buildEndgameState, invalidatePendingAI, scheduleAIMove]);
+    startNewGame({
+      endgameFen: isEndgame && currentEndgame ? currentEndgame.fen : undefined,
+      initialSideTag,
+      initialFlipped: currentPlayerSide === 'black',
+      aiFirst,
+    });
+  }, [startNewGame, isEndgame, currentEndgame, initialSideTag, currentPlayerSide, aiFirst]);
 
   // 残局闯关：进入下一关（原地重置棋盘为新关 FEN，避免同路由导航的状态复用问题）
+  // 第 3 批：重置序列同样走 useNewGame，差异只剩三项（棋盘重挂载、固定正向显示、
+  // 按新关 FEN 决定谁先走），原先这些差异是"复制整段后手工改几行"。
   const handleNextLevel = useCallback(() => {
     if (!currentEndgame || currentEndgame.levelIndex < 0) return;
     const nextIndex = currentEndgame.levelIndex + 1;
@@ -1027,31 +916,17 @@ export default function GameScreen() {
       comment: nextLevel.comment,
       fen: nextLevel.fen,
     };
-    clearHint();
-    cancelHintPonder();
-    invalidatePendingAI(); // 取消旧关卡延时中/计算中的 AI 走子
     setCurrentEndgame(next);
-    const newState = buildEndgameState(next.fen);
-    setGameState(newState);
-    setSelectedPieceId(null);
-    setValidMoves(null);
-    setLastMove(null);
-    setMoveCount(0);
-    setCapturedRed(0);
-    setCapturedBlack(0);
-    setIsFlipped(false);
-    setGameOverReason(null);
-    setJueShaVisible(false);
-    endgameResultRef.current = null;
-    replaySavedRef.current = false; // 新一局允许再次自动保存复盘
-    setEndgameHintLeft(ENDGAME_HINT_LIMIT); // 残局提示次数重置
-    setEndgameUndoLeft(ENDGAME_UNDO_LIMIT); // 残局悔棋次数同步重置
-    setBoardKey(k => k + 1);
-    // 下一关 FEN 若为黑先（AI 先走），自动触发 AI
-    if (next.fen.trim().split(/\s+/)[1] === 'b') {
-      scheduleAIMove(newState, 500);
-    }
-  }, [currentEndgame, clearHint, buildEndgameState, invalidatePendingAI, scheduleAIMove]);
+    startNewGame({
+      endgameFen: next.fen,
+      initialSideTag: RED_SIDE, // 残局下一关的红先由 aiFirstByFen 覆盖，此处仅占位
+      initialFlipped: false,
+      aiFirst: false,
+      forceFlipped: false, // 新关固定正向显示（玩家固定执红）
+      remountBoard: true, // 换关必须让 ChessBoard 重新挂载，旧关的内部测量不可复用
+      aiFirstByFen: true, // FEN 带 b 段（黑先）时由 AI 走第一步
+    });
+  }, [currentEndgame, startNewGame]);
 
   // 判断当前是否是玩家回合
   const isPlayerTurn = (currentPlayerSide === 'red' && gameState.sideTag === RED_SIDE) ||
@@ -1229,7 +1104,7 @@ export default function GameScreen() {
           <View style={[styles.boardContainer, { paddingTop: boardPadTop }]}>
             {/* AI 标识角标行：棋盘上方独立行，左对齐（参照联机对战对手名称角标样式），
                 实时指示当前 AI 引擎来源——绿色指示灯=云端皮卡鱼（含深度），灰色指示灯=本地AI（含难度） */}
-            <View style={[styles.aiNameRow, nameRowStyle]} pointerEvents="none">
+            <View style={[styles.aiNameRow, alignedRowStyle]} pointerEvents="none">
               <View style={styles.aiNameChip}>
                 <View style={[styles.aiNameChipDot, aiIsOnline && styles.aiNameChipDotOnline]} />
                 <Text style={styles.aiNameChipText} numberOfLines={1}>
@@ -1275,7 +1150,7 @@ export default function GameScreen() {
               残局闯关规则：不允许翻转；每局限 3 次提示（走皮卡鱼）+ 10 次悔棋，
               剩余次数以按钮右上角数字角标展示；「说明」已移至标题行右侧标识 */}
           <View
-            style={[styles.bottomBar, bottomBarWidthStyle, { marginTop: dynamicGap }, jueShaVisible && { opacity: 0 }]}
+            style={[styles.bottomBar, alignedRowStyle, { marginTop: dynamicGap }, jueShaVisible && { opacity: 0 }]}
             pointerEvents={jueShaVisible ? 'none' : 'auto'}
             onLayout={(e) => setBottomBarH(e.nativeEvent.layout.height)}
           >

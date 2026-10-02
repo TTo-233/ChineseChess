@@ -43,10 +43,22 @@ export const BYOYOMI_OPTIONS = [0, 10, 20, 30, 60].map(v => ({ value: v, label: 
 
 export interface SelectOption { value: number; label: string }
 
-/** 设置项下拉选择器（主题统一风格：标签 + 圆角值框 + 主色三角按钮；展开时悬浮显示选项） */
-export function SettingSelect({ label, valueText, options, open, onToggle, onSelect, disabled }: {
+/** 设置项下拉选择器（主题统一风格：标签 + 圆角值框 + 主色三角按钮；展开时悬浮显示选项）
+ *
+ *  【C-82】选中态按 value 判定，不再按显示文案（opt.label === valueText）判定：
+ *  调用方的 valueText 常常是"当前值的标签"，但有两种情况它与 options 里的 label 对不上：
+ *   1. 值不在选项表内（服务端返回了表外的秒数）→ valueText 退化成 `${value}秒` 兜底文案，
+ *      此时没有任何选项被高亮，用户看不出当前选的是哪一项；
+ *   2. 调用方为了表达"不适用"覆盖了文案（如局时不限时把加秒/读秒的 valueText 写成"不限时"），
+ *      更不能拿它去比对选项表里的 label。
+ *  两处 lanGame:792/801 与 lanBattle:2906/2915 都属于第 2 种：文案被改写后比中的是
+ *  另一个选项（"不限时"里没有同名 label，实际表现是选中项乱跳）。改为传 value。
+ *  没有对应选项时传 -1：明确"无选中项"。 */
+export function SettingSelect({ label, valueText, value, options, open, onToggle, onSelect, disabled }: {
   label: string;
   valueText: string;
+  /** 当前选中的值；传 -1 表示当前没有对应选项（不高亮任何一项） */
+  value: number;
   options: SelectOption[];
   open: boolean;
   onToggle: () => void;
@@ -76,10 +88,10 @@ export function SettingSelect({ label, valueText, options, open, onToggle, onSel
           {options.map(opt => (
             <TouchableOpacity
               key={opt.value}
-              style={[styles.selectOption, opt.label === valueText && styles.selectOptionActive]}
+              style={[styles.selectOption, opt.value === value && styles.selectOptionActive]}
               onPress={() => onSelect(opt.value)}
             >
-              <Text style={[styles.selectOptionText, opt.label === valueText && styles.selectOptionTextActive]}>
+              <Text style={[styles.selectOptionText, opt.value === value && styles.selectOptionTextActive]}>
                 {opt.label}
               </Text>
             </TouchableOpacity>

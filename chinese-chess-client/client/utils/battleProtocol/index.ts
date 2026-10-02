@@ -75,21 +75,10 @@ export interface BattleActionPayloadMap {
   emoji: { emoji: string; id: string };
 }
 
-/**
- * 发送一个动作并等待服务端裁决。
- *
- * 失败一律以 Error 抛出（见上方三个错误类），**成功路径只表示服务端接受了该动作**；
- * 局面变更仍由服务端随后的 state 广播送达（`status < 400` 时服务端会广播，见
- * types.ts 中 BattleAckFrame 的说明）。
- */
-export async function emitBattleAction<K extends keyof BattleActionPayloadMap>(
-  transport: BattleActionTransport | null | undefined,
-  type: K,
-  payload: BattleActionPayloadMap[K],
-): Promise<Record<string, unknown>> {
-  if (!transport) throw new BattleActionNotSentError(type);
-  return transport.request(type, payload as unknown as Record<string, unknown>);
-}
+// 【C-52】emitBattleAction 已删除：它只是 `transport.request()` 的薄转发，全仓无调用者。
+// 页面侧统一直接调 battleSocket.request()，少一层中转就少一处"两套入口"的错觉。
+// 失败语义（三类 Error）仍由 battleSocket.request() 按上面的约定抛出：
+// 成功路径只表示服务端接受了该动作，局面变更由随后的 state 广播送达。
 
 /** 是否属于「帧未发出」类失败（调用方据此决定是否走 HTTP 兜底） */
 export function isActionNotSent(error: unknown): error is BattleActionNotSentError {

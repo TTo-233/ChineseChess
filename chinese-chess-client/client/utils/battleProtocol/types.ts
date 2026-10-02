@@ -10,9 +10,11 @@
  * 本模块把「服务端 → 客户端的负载形状」与「客户端 → 服务端的动作负载形状」
  * 收敛为单一真源，供 battleSocket、useBattleStateSync、lanBattle、spectate 共用。
  *
- * 与 chinese-chess-server/dist/index.js 的对应关系（dist 无源码，行号即真源）：
- * - 负载构造：buildGameStatePayload（dist/index.js:26727-26766）
- * - 帧分发：handleMessage（dist/index.js:28696-28780）
+ * 与服务端源码的对应关系（【I-1】原先这里写的是 `dist/index.js` 的行号并自称
+ * "dist 无源码，行号即真源"，但服务端源码早已在 `src/`，且 dist 每次构建内容都会变，
+ * 行号既拿不到可编辑的源、也会过期）：
+ * - 负载构造：buildGameStatePayload（`chinese-chess-server/src/routes/lanGame.ts:395`）
+ * - 帧分发：handleMessage（`chinese-chess-server/src/routes/battleWs.ts:194`）
  */
 
 import type { GameState } from '@/utils/chess/GameEngine';
@@ -159,8 +161,8 @@ export interface GameStatePayload {
 /**
  * 客户端 → 服务端的动作类型。
  *
- * 只列出**客户端实际会经 WebSocket 发送**的动作。服务端还支持
- * `ready` / `side` / `start` / `rematch`（dist/index.js:28732-28756），
+ * 只列出**客户端实际会经 WebSocket 发送**的动作。服务端 WS 分发器还支持
+ * `ready` / `side` / `start` / `rematch`（`chinese-chess-server/src/routes/battleWs.ts:239-262`），
  * 但客户端这些流程一律走 HTTP 接口，故不在此收口。
  */
 export type BattleActionType =
@@ -201,9 +203,13 @@ export type BattleAction = {
 /**
  * 动作回执帧（服务端 `{ type: 'ack', reqId, status, body }`）。
  *
- * ⚠️ 服务端**仅在 `status < 400` 时才额外广播 state**（dist/index.js:28776-28778），
- * 所以被拒绝的动作（4xx）**没有任何 state 推送**——唯一的失败信号就是本回执。
- * 不消费它，界面就会静默卡住（例：悔棋被 400 拒绝后按钮仍停在「等待对方同意」）。
+ * 服务端在 `status < 400` 时广播 state；4xx 被拒动作**也会**补推一次权威状态，
+ * 但受按房间计数的限流约束（同一房间 3 秒内最多 8 次，由
+ * `chinese-chess-server/src/routes/actionOutcome.ts` 的 `shouldSyncRejection` /
+ * `settleActionOutcome` 统一裁决，HTTP 与 WS 两个通道共用同一份实现），
+ * 超限的拒绝不再推送。
+ * 因此**本回执仍是唯一的可靠失败信号**，不能只依赖 state 推送：不消费它，界面就会
+ * 静默卡住（例：悔棋被 400 拒绝后按钮仍停在「等待对方同意」）。
  */
 export interface BattleAckFrame {
   reqId?: string;
@@ -214,12 +220,15 @@ export interface BattleAckFrame {
 /**
  * 从回执 body 中提取可展示给用户的失败原因。
  *
- * 服务端各动作的失败 body 形状不完全一致：多数为 `{ success: false, message }`，
- * 而 `actMove` / `actHeartbeat` 的房间不存在分支为 `{ error }`。两者都读，
- * 并回退到按状态码生成的通用文案，避免把英文/空串直接暴露到界面。
+ * 失败 body 现在全端只一种形状（第 3 批统一，服务端由 `failBody` 单点构造）：
+ * `{ success: false, error: <机器码>, message: <中文文案> }`。
+ * 其中 `error` 是给程序分支用的机器码（`'bad_request'`、`'forbidden'`、`'not_found'`…），
+ * **不是**给人看的文案，展示一律读 `message`。
+ * 回退到按状态码生成的通用文案，是为了兜住 message 缺失/空串的异常情况，
+ * 避免把空字符串或机器码直接暴露到界面。
  */
 export function battleAckMessage(status: number, body: Record<string, unknown>): string {
-  const raw = body.message ?? body.error;
+  const raw = body.message;
   if (typeof raw === 'string' && raw.trim()) return raw.trim();
   if (status === 404) return '房间已不存在';
   if (status === 403) return '你没有权限执行该操作';

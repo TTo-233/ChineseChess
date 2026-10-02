@@ -38,7 +38,16 @@ $ExcludeCommon = @(
   '--exclude', '.vscode',
   '--exclude', '.idea',
   '--exclude', '*.iml',
-  '--exclude', '.git'
+  '--exclude', '.git',
+  # 【I-12】环境配置绝不入包：本仓库大量读 process.env.EXPO_PUBLIC_* / SERVER_PORT，
+  # 客户端 .gitignore 里也把 .env 列为忽略项，说明工作机上很可能存在这类文件。
+  '--exclude', '.env',
+  '--exclude', '.env.*',
+  '--exclude', '*.env',
+  # 【I-24】差分闸门 verify-server-diff.cjs 会在 chinese-chess-server/.verify-old/ 下留一份
+  # 1.4MB 的旧 dist 产物（--keep / 被强杀 / 中途 throw 都会留下），它不是可运行主体，
+  # 混进部署包极易被误用。
+  '--exclude', '.verify-old'
 )
 
 # 删除指定端的历史打包文件（保留当天那个，由后续打包重新生成）
@@ -59,10 +68,30 @@ function Assert-NoJunk {
   param([Parameter(Mandatory)][string]$Zip)
   $junkPattern = '(^|/)(node_modules|\.expo|\.expo-shared|coverage|\.cache|\.turbo|\.parcel-cache|\.vscode|\.idea|\.git)(/|$)'
   $junk = & tar -tf $Zip | Where-Object {
-    $_ -match $junkPattern -or $_ -match '\.(log|tsbuildinfo|eslintcache|DS_Store)$'
+    # 【I-12】.env / .env.local / *.env —— 排除项漏了时由这里兜底，宁可误报也不放过
+    # 【I-24】.verify-old —— 差分闸门留下的旧 dist 产物
+    $_ -match $junkPattern `
+      -or $_ -match '\.(log|tsbuildinfo|eslintcache|DS_Store)$' `
+      -or $_ -match '(^|/)\.env($|\.)' `
+      -or $_ -match '\.env$' `
+      -or $_ -match '(^|/)\.verify-old(/|$)'
   }
   if ($junk) {
-    throw "「$Zip」里混入了缓存/构建产物：`n  $($junk -join "`n  ")`n请补 --exclude 规则后重打。"
+    throw "「$Zip」里混入了缓存/构建产物/环境配置：`n  $($junk -join "`n  ")`n请补 --exclude 规则后重打。"
+  }
+}
+
+# 【I-11】校验 dist 与 src/ 必须在删旧包之前。
+# 以前 New-ServerZip 先 `Remove-Item $out` + `Remove-OldZip` 再跑 `node build.js --check`，
+# 于是校验失败时「上一版可用包已被删掉、新包又没生成」——该端直接零包，且无法回滚。
+# 这里把校验提成独立步骤，由调用方在任何删除动作之前执行。
+function Assert-ServerDistFresh {
+  Push-Location chinese-chess-server
+  & node build.js --check
+  $checkExit = $LASTEXITCODE
+  Pop-Location
+  if ($checkExit -ne 0) {
+    throw "服务端 dist 与 src/ 不一致，已阻塞打包。请在 chinese-chess-server 下执行：node build.js"
   }
 }
 
@@ -87,22 +116,16 @@ function New-ClientZip {
 }
 
 function New-ServerZip {
-  $out = "chinese-chess-server_$Date.zip"
-  if (Test-Path $out) { Remove-Item $out }
-  Remove-OldZip 'chinese-chess-server'
   # 服务端 dist/index.js 现在由 chinese-chess-server/src/ 经 `node build.js` 生成（esbuild）。
   #    打包前强制校验「已提交的 dist/index.js 与重新构建的结果一致」，这样：
   #      - dist 被手工改过 / 被旧产物覆盖过 → 直接阻塞出包；
   #      - 6 条加固（长将长捉不拦截、畸形 FEN 行宽、初始局面上传收紧、被拒动作回推权威状态、
   #        房间名最小空缺优先）都在 src/ 里，不可能像以前那样「补丁丢了却照样出包」。
-  Push-Location chinese-chess-server
-  & node build.js --check
-  $checkExit = $LASTEXITCODE
-  Pop-Location
-  if ($checkExit -ne 0) {
-    throw "服务端 dist 与 src/ 不一致，已阻塞打包。请在 chinese-chess-server 下执行：node build.js"
-  }
+  #    校验放在删旧包之前（switch 里调用 Assert-ServerDistFresh），失败时上一版可用包仍在。
   # 注意：服务端 dist/index.js 是唯一可运行主体，ai\ 为引擎与开局库，必须保留
+  $out = "chinese-chess-server_$Date.zip"
+  if (Test-Path $out) { Remove-Item $out }
+  Remove-OldZip 'chinese-chess-server'
   $tarArgs = @('-a', '-c', '-f', $out) + $ExcludeCommon + @(
     '--exclude', 'chinese-chess-server/node_modules',
     'chinese-chess-server'
@@ -113,6 +136,13 @@ function New-ServerZip {
   $size = '{0:N1} MB' -f ((Get-Item $out).Length / 1MB)
   Write-Output "[OK] $out ($size)"
 }
+
+# 【I-11】'all' 模式下服务端校验必须早于 New-ServerZip 的任何删除动作。
+# 以前校验写在 New-ServerZip 内部、且排在 Remove-OldZip 之后：`pack.ps1 all` 先打完 client 包，
+# 随后服务端校验失败时 root 里上一版 server 包已被删掉 → 该端零包且无法回滚。
+# 现在把校验提前到 switch 的最前面：任一端校验不过就整轮中止，此时磁盘上仍是上一版可用包。
+$needServerCheck = ($Target -eq 'server' -or $Target -eq 'all')
+if ($needServerCheck) { Assert-ServerDistFresh }
 
 switch ($Target) {
   'client' { New-ClientZip }

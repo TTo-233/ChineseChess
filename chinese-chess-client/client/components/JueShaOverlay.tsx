@@ -20,10 +20,6 @@ import { Animated, Image, StyleSheet, Text, TouchableOpacity, useWindowDimension
 import { COLORS as MODAL_COLORS, RADIUS } from '@/constants/modal';
 import { FONT } from '@/utils/typography';
 
-// 原项目素材尺寸（基于629x695棋盘网格区域）
-const GRID_WIDTH = 631;
-const GRID_HEIGHT = 697;
-
 // 大"绝"图片: 270x270 位于 (0,0)
 const JUE1_SIZE = 270;
 // 小"绝"图片: 100x90 位于 (85,90)（在270x270中居中）
@@ -54,9 +50,12 @@ const TUOBA_TOP = 74;
 const CONTENT_WIDTH = 339;  // max(270, 69+270, 29+310) = 339
 const CONTENT_HEIGHT = 304; // max(270, 34+270, 74+220) = 304
 
-// 内容在网格区域中的居中偏移
-const CENTER_OFFSET_X = (GRID_WIDTH - CONTENT_WIDTH) / 2;
-const CENTER_OFFSET_Y = (GRID_HEIGHT - CONTENT_HEIGHT) / 2;
+// 【C-87】原文件顶部还有 GRID_WIDTH=631 / GRID_HEIGHT=697 与派生的
+// CENTER_OFFSET_X / CENTER_OFFSET_Y（按"在旧口径棋盘网格内居中"算的偏移）。
+// 四者都已删除：中心对齐早已改由 contentLeft/contentTop 基于传入的 boardFrame
+// （boardCenterX/Y）计算，无传入时才退回屏幕居中；而 631/697 是陈旧的原始图片口径
+// （现样式参数在 @/utils/chess/boardStyles 里逐样式给出），留着只会让人以为居中
+// 仍由这些常量决定。
 
 interface JueShaOverlayProps {
   visible: boolean;
@@ -103,6 +102,11 @@ export default function JueShaOverlay({
   const [sha5Opacity] = useState(() => new Animated.Value(0));
   const [tuobaOpacity] = useState(() => new Animated.Value(0));
   const [buttonsOpacity] = useState(() => new Animated.Value(0));
+  // 【C-73】按钮是否已可交互（淡入完成才置 true）。opacity 不参与 RN 的命中测试，
+  // 而容器是 pointerEvents="box-none"（不传递给子节点）→ buttonsArea 这块全宽覆盖层
+  // 在淡入前同样能吃到点击，于是绝杀动画播放的 2.5 秒里「看不见的按钮」可以误触
+  // （点棋盘下半部实际命中「下一关 / 再来一局 / 返回首页」）。故显式按进度切 pointerEvents。
+  const [buttonsReady, setButtonsReady] = useState(false);
 
   useEffect(() => {
     if (!visible) return;
@@ -114,43 +118,57 @@ export default function JueShaOverlay({
     sha5Opacity.setValue(0);
     tuobaOpacity.setValue(0);
     buttonsOpacity.setValue(0);
+    // 【C-73】这是"每轮动画开始前把按钮区退回不可交互"的复位，不是从 props/state
+    // 派生的值：动画进度本身在 Animated.Value 上，buttonsReady 必须在 visible 每次
+    // 翻 true 时归零，否则会沿用上一轮残留的 true，导致新一轮淡入前那一帧仍能命中
+    // 不可见的按钮。改成渲染期复位或推迟到下一宏任务都会重新引入这个命中窗口。
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setButtonsReady(false);
+
+    let interactiveTimer: ReturnType<typeof setTimeout> | null = null;
 
     // 非绝杀终局（认输/和棋/断线判负）：不播「绝/杀」字符特效，直接淡入结果文字与按钮
     if (!showEffect) {
       Animated.timing(buttonsOpacity, { toValue: 1, duration: 300, useNativeDriver: true }).start();
-      return;
+      interactiveTimer = setTimeout(() => setButtonsReady(true), 300);
+    } else {
+      Animated.parallel([
+        // 大"绝": 0~2.0s opacity 1→0
+        Animated.sequence([
+          Animated.timing(jue1Opacity, { toValue: 1, duration: 0, useNativeDriver: true }),
+          Animated.timing(jue1Opacity, { toValue: 0, duration: 2000, useNativeDriver: true }),
+        ]),
+        // 小"绝": 0~1.5s opacity 0→1
+        Animated.timing(jue5Opacity, { toValue: 1, duration: 1500, useNativeDriver: true }),
+        // 大"杀": 0.3~2.6s opacity 1→0
+        Animated.sequence([
+          Animated.delay(300),
+          Animated.timing(sha1Opacity, { toValue: 1, duration: 0, useNativeDriver: true }),
+          Animated.timing(sha1Opacity, { toValue: 0, duration: 2300, useNativeDriver: true }),
+        ]),
+        // 小"杀": 0.3~1.8s opacity 0→1
+        Animated.sequence([
+          Animated.delay(300),
+          Animated.timing(sha5Opacity, { toValue: 1, duration: 1500, useNativeDriver: true }),
+        ]),
+        // 底部背景: 1.5~2.0s opacity 0→1
+        Animated.sequence([
+          Animated.delay(1500),
+          Animated.timing(tuobaOpacity, { toValue: 1, duration: 500, useNativeDriver: true }),
+        ]),
+        // 按钮: 2.5s 淡入
+        Animated.sequence([
+          Animated.delay(2500),
+          Animated.timing(buttonsOpacity, { toValue: 1, duration: 400, useNativeDriver: true }),
+        ]),
+      ]).start();
+      // 与上面的 Animated.delay(2500) + 400ms 淡入保持同一节奏：完全可见后才可点
+      interactiveTimer = setTimeout(() => setButtonsReady(true), 2500 + 400);
     }
 
-    Animated.parallel([
-      // 大"绝": 0~2.0s opacity 1→0
-      Animated.sequence([
-        Animated.timing(jue1Opacity, { toValue: 1, duration: 0, useNativeDriver: true }),
-        Animated.timing(jue1Opacity, { toValue: 0, duration: 2000, useNativeDriver: true }),
-      ]),
-      // 小"绝": 0~1.5s opacity 0→1
-      Animated.timing(jue5Opacity, { toValue: 1, duration: 1500, useNativeDriver: true }),
-      // 大"杀": 0.3~2.6s opacity 1→0
-      Animated.sequence([
-        Animated.delay(300),
-        Animated.timing(sha1Opacity, { toValue: 1, duration: 0, useNativeDriver: true }),
-        Animated.timing(sha1Opacity, { toValue: 0, duration: 2300, useNativeDriver: true }),
-      ]),
-      // 小"杀": 0.3~1.8s opacity 0→1
-      Animated.sequence([
-        Animated.delay(300),
-        Animated.timing(sha5Opacity, { toValue: 1, duration: 1500, useNativeDriver: true }),
-      ]),
-      // 底部背景: 1.5~2.0s opacity 0→1
-      Animated.sequence([
-        Animated.delay(1500),
-        Animated.timing(tuobaOpacity, { toValue: 1, duration: 500, useNativeDriver: true }),
-      ]),
-      // 按钮: 2.5s 淡入
-      Animated.sequence([
-        Animated.delay(2500),
-        Animated.timing(buttonsOpacity, { toValue: 1, duration: 400, useNativeDriver: true }),
-      ]),
-    ]).start();
+    return () => {
+      if (interactiveTimer) clearTimeout(interactiveTimer);
+    };
   }, [visible, showEffect]);
 
   if (!visible) return null;
@@ -283,7 +301,11 @@ export default function JueShaOverlay({
 
       {/* 结果提示条 + 按钮区域：结果文字以 GameNotice 样式（棋盘中央深色半透明条，
           非全屏遮罩，棋盘仍然可辨认）呈现；操作按钮排在棋盘正下方 */}
-      <Animated.View style={[styles.noticeArea, { opacity: buttonsOpacity, top: boardCenterY }]}>
+      {/* 结果文字无交互，pointerEvents="none" 让它不参与命中测试（box-none 不传递到子节点） */}
+      <Animated.View
+        pointerEvents="none"
+        style={[styles.noticeArea, { opacity: buttonsOpacity, top: boardCenterY }]}
+      >
         {resultText ? (
           <View style={styles.resultBar}>
             <Text style={styles.resultText}>{resultText}</Text>
@@ -291,7 +313,13 @@ export default function JueShaOverlay({
         ) : null}
       </Animated.View>
 
-      <Animated.View style={[styles.buttonsArea, { opacity: buttonsOpacity, top: buttonsTop }]}>
+      {/* 【C-73】淡入完成前整块不参与命中测试，避免「看不见的按钮」被误触；
+          容器 pointerEvents="box-none" 不会传递给子节点，所以要挂在这一层（buttonsArea 自身
+          是全宽绝对定位的覆盖层，命中面积远大于按钮本身）。 */}
+      <Animated.View
+        pointerEvents={buttonsReady ? 'box-none' : 'none'}
+        style={[styles.buttonsArea, { opacity: buttonsOpacity, top: buttonsTop }]}
+      >
         <View style={styles.buttonsRow}>
           {onNextLevel && (
             <TouchableOpacity style={styles.buttonPrimary} onPress={onNextLevel}>

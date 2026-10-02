@@ -239,3 +239,295 @@ describe('BattleSocket 心跳与可见性', () => {
     expect(onState).toHaveBeenCalledWith({ phase: 'playing' });
   });
 });
+
+/**
+ * 动作请求与回执的契约（第 3 批补测）。
+ *
+ * 抽出这一组的原因是第 3 批把失败 body 统一成
+ * `{ success:false, error:<机器码>, message:<文案> }`：`error` 从"可能是人读的文案"
+ * 变成机器码之后，客户端展示路径**只能读 message**。如果哪条路径又去读 error，
+ * 用户看到的就是 `not_found` 这种裸机器码，而不是中文提示——这类回归肉眼很难发现，
+ * 因为服务端确实返回了"一个错误字段"。
+ */
+describe('BattleSocket 请求与回执', () => {
+  /** 发一个动作，返回它发出的帧 */
+  function sendAction(ws: FakeWebSocket, type: string, payload: Record<string, unknown> = {}) {
+    const before = ws.frames().length;
+    ws.send(JSON.stringify({ type, reqId: `${type}-1`, ...payload }));
+    return ws.frames()[before];
+  }
+
+  it('request 发出带 reqId 的帧（reqId 前缀即动作类型）', async () => {
+    const { socket, ws } = await connectSocket();
+    opened = socket;
+    void socket.request('undo', { proposedState: {} }).catch(() => undefined);
+    expect(ws.frames().some(f => f.type === 'undo' && f.reqId === 'undo-1')).toBe(true);
+  });
+
+  it('ack 2xx 走 onAck，且不触发 onActionRejected', async () => {
+    const onAck = jest.fn();
+    const onActionRejected = jest.fn();
+    const { socket, ws } = await connectSocket({ onAck, onActionRejected });
+    opened = socket;
+    ws.emit({ type: 'ack', reqId: 'unknown-9', status: 200, body: { success: true } });
+    expect(onAck).toHaveBeenCalledWith({ reqId: 'unknown-9', status: 200, body: { success: true } });
+    expect(onActionRejected).not.toHaveBeenCalled();
+  });
+
+  it('ack 4xx 且 reqId 匹配在途请求 → 走 Promise 拒绝，不再重复触发 onActionRejected', async () => {
+    const onActionRejected = jest.fn();
+    const { socket, ws } = await connectSocket({ onActionRejected });
+    opened = socket;
+    const promise = socket.request('undo', { proposedState: {} }).catch((e: Error) => e);
+    sendAction(ws, 'undo'); // 让 reqId 计数对齐到 undo-1
+    ws.emit({
+      type: 'ack',
+      reqId: 'undo-1',
+      status: 400,
+      body: { success: false, error: 'bad_request', message: '当前局面不允许悔棋' },
+    });
+    const err = await promise;
+    expect((err as Error).message).toBe('当前局面不允许悔棋');
+    expect(onActionRejected).not.toHaveBeenCalled();
+  });
+
+  it('ack 4xx 且 reqId 匹配在途请求 → 动作类型与状态码被填进错误（页面据此精确回退）', async () => {
+    const { socket, ws } = await connectSocket();
+    opened = socket;
+    const promise = socket.request('move', { move: { pieceId: 1, toCol: 2, toRow: 3 } }).catch(
+      (e: Error) => e
+    );
+    ws.emit({
+      type: 'ack',
+      reqId: 'move-1',
+      status: 400,
+      body: { success: false, error: 'bad_request', message: '着法非法' },
+    });
+    const err = await promise;
+    expect(err).toMatchObject({ name: 'BattleActionRejectedError', action: 'move', status: 400 });
+  });
+
+  it('ack 4xx 且无匹配在途请求（即发即忘动作）→ 走 onActionRejected 兜底', async () => {
+    const onActionRejected = jest.fn();
+    const { socket, ws } = await connectSocket({ onActionRejected });
+    opened = socket;
+    ws.emit({
+      type: 'ack',
+      reqId: 'emoji-7',
+      status: 429,
+      body: { success: false, error: 'rate_limited', message: '操作过于频繁，请稍后重试' },
+    });
+    expect(onActionRejected).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: 'emoji',
+        status: 429,
+        message: '操作过于频繁，请稍后重试',
+      })
+    );
+  });
+
+  it('ack 4xx 无 reqId → 动作为 null，页面按通用失败处理', async () => {
+    const onActionRejected = jest.fn();
+    const { socket, ws } = await connectSocket({ onActionRejected });
+    opened = socket;
+    ws.emit({ type: 'ack', status: 400, body: { success: false, message: '请求被拒绝' } });
+    expect(onActionRejected).toHaveBeenCalledWith(
+      expect.objectContaining({ action: null, status: 400, message: '请求被拒绝' })
+    );
+  });
+
+  describe('失败文案提取只读 message（第 3 批统一形状后的回归防线）', () => {
+    it.each([
+      [400, '着法非法'],
+      [403, '你没有权限执行该操作'],
+      [404, '房间已不存在'],
+      [429, '操作过于频繁，请稍后重试'],
+      [500, '服务端故障，请稍后重试'],
+    ])('优先展示服务端 message 而非机器码（status=%s）', async (status, message) => {
+      const onActionRejected = jest.fn();
+      const { socket, ws } = await connectSocket({ onActionRejected });
+      opened = socket;
+      ws.emit({
+        type: 'ack',
+        reqId: 'emoji-1',
+        status,
+        body: { success: false, error: 'some_machine_code', message },
+      });
+      expect(onActionRejected.mock.calls[0][0].message).toBe(message);
+    });
+
+    it('message 缺失时按状态码回退到通用文案', async () => {
+      const onActionRejected = jest.fn();
+      const { socket, ws } = await connectSocket({ onActionRejected });
+      opened = socket;
+      ws.emit({ type: 'ack', reqId: 'emoji-1', status: 404, body: { success: false, error: 'not_found' } });
+      expect(onActionRejected.mock.calls[0][0].message).toBe('房间已不存在');
+    });
+
+    it('message 为空串或纯空白时同样回退（不把空白展示给用户）', async () => {
+      const onActionRejected = jest.fn();
+      const { socket, ws } = await connectSocket({ onActionRejected });
+      opened = socket;
+      ws.emit({ type: 'ack', reqId: 'emoji-1', status: 400, body: { message: '   ' } });
+      expect(onActionRejected.mock.calls[0][0].message).toBe('操作被服务端拒绝');
+    });
+
+    it('error 字段是机器码时绝不当作文案展示（裸 not_found 不能漏到界面）', async () => {
+      const onActionRejected = jest.fn();
+      const { socket, ws } = await connectSocket({ onActionRejected });
+      opened = socket;
+      ws.emit({
+        type: 'ack',
+        reqId: 'emoji-1',
+        status: 404,
+        body: { success: false, error: 'not_found' },
+      });
+      const shown = onActionRejected.mock.calls[0][0].message as string;
+      expect(shown).toBe('房间已不存在');
+      expect(shown).not.toBe('not_found');
+    });
+  });
+
+  describe('非致命 error 帧', () => {
+    it('「观战者无法执行该操作」不上抛致命，只走 onError（否则观战会被踢下线）', async () => {
+      const onFatalError = jest.fn();
+      const onError = jest.fn();
+      const { socket, ws } = await connectSocket({ onFatalError, onError }, 'spectator');
+      opened = socket;
+      ws.emit({
+        type: 'error',
+        reqId: 'move-1',
+        success: false,
+        error: 'forbidden',
+        message: '观战者无法执行该操作',
+      });
+      expect(onFatalError).not.toHaveBeenCalled();
+      expect(onError).toHaveBeenCalledWith('观战者无法执行该操作');
+    });
+
+    it('「未知消息类型」同样只走 onError', async () => {
+      const onFatalError = jest.fn();
+      const onError = jest.fn();
+      const { socket, ws } = await connectSocket({ onFatalError, onError });
+      opened = socket;
+      ws.emit({
+        type: 'error',
+        reqId: 'x-1',
+        success: false,
+        error: 'bad_request',
+        message: '未知消息类型',
+      });
+      expect(onFatalError).not.toHaveBeenCalled();
+      expect(onError).toHaveBeenCalledWith('未知消息类型');
+    });
+
+    it('error 帧缺 message 时用兜底文案，不返回 undefined', async () => {
+      const onError = jest.fn();
+      const { socket, ws } = await connectSocket({ onError });
+      opened = socket;
+      ws.emit({ type: 'error' });
+      expect(onError).toHaveBeenCalledWith('连接错误');
+    });
+  });
+
+  describe('帧的健壮性', () => {
+    it('非法 JSON 被丢弃，不影响后续正常帧', async () => {
+      const onState = jest.fn();
+      const { socket, ws } = await connectSocket({ onState });
+      opened = socket;
+      ws.onmessage?.({ data: '{not json' });
+      ws.emit({ type: 'state', data: { phase: 'playing' } });
+      expect(onState).toHaveBeenCalledWith({ phase: 'playing' });
+    });
+
+    it('空 data 被丢弃', async () => {
+      const onState = jest.fn();
+      const { socket, ws } = await connectSocket({ onState });
+      opened = socket;
+      ws.onmessage?.({ data: '' });
+      expect(onState).not.toHaveBeenCalled();
+    });
+
+    it('ack 缺 body 时按空对象处理，不抛错', async () => {
+      const onAck = jest.fn();
+      const { socket, ws } = await connectSocket({ onAck });
+      opened = socket;
+      ws.emit({ type: 'ack', status: 400 });
+      expect(onAck).toHaveBeenCalledWith({ reqId: undefined, status: 400, body: {} });
+    });
+
+    it('ack 的 status 类型异常时归一为 0（视为非 4xx，不误报拒绝）', async () => {
+      const onAck = jest.fn();
+      const onActionRejected = jest.fn();
+      const { socket, ws } = await connectSocket({ onAck, onActionRejected });
+      opened = socket;
+      ws.emit({ type: 'ack', status: 'nope', body: {} });
+      expect(onAck).toHaveBeenCalledWith({ reqId: undefined, status: 0, body: {} });
+      expect(onActionRejected).not.toHaveBeenCalled();
+    });
+
+    it('普通断连不立刻拒绝在途请求，而是等回执超时（断连时动作可能已生效，不能谎报未送达）', async () => {
+      const { socket, ws } = await connectSocket();
+      opened = socket;
+      const promise = socket.request('draw').catch((e: Error) => e);
+      ws.close();
+      jest.advanceTimersByTime(1000);
+      let settled = false;
+      void promise.then(() => {
+        settled = true;
+      });
+      await Promise.resolve();
+      expect(settled).toBe(false);
+      jest.advanceTimersByTime(5000);
+      const err = await promise;
+      expect(err).toMatchObject({ name: 'BattleActionTimeoutError', action: 'draw' });
+    });
+
+    it('主动 close 时在途请求被立即按失败收尾（用户已退出，不再等待）', async () => {
+      const { socket } = await connectSocket();
+      opened = socket;
+      const promise = socket.request('draw').catch((e: Error) => e);
+      socket.close();
+      const err = await promise;
+      expect((err as Error).message).toBe('连接已关闭');
+    });
+
+    it('未连接时 request 抛 BattleActionNotSentError（页面据此回退 HTTP）', async () => {
+      const { socket } = await connectSocket();
+      opened = socket;
+      socket.close();
+      await expect(socket.request('draw')).rejects.toMatchObject({
+        name: 'BattleActionNotSentError',
+      });
+    });
+
+    it('请求超过回执超时窗口 → BattleActionTimeoutError（结果未知不能盲目重试）', async () => {
+      const { socket } = await connectSocket();
+      opened = socket;
+      const promise = socket.request('surrender').catch((e: Error) => e);
+      jest.advanceTimersByTime(10000);
+      const err = await promise;
+      expect(err).toMatchObject({ name: 'BattleActionTimeoutError', action: 'surrender' });
+    });
+  });
+
+  describe('连接查询', () => {
+    it('isConnected 随 open/close 变化', async () => {
+      const { socket, ws } = await connectSocket();
+      opened = socket;
+      expect(socket.isConnected).toBe(true);
+      socket.close();
+      expect(socket.isConnected).toBe(false);
+      expect(ws.readyState).toBe(FakeWebSocket.CLOSED);
+    });
+
+    it('close 之后再 setHidden 不会重连（用户主动退出）', async () => {
+      const { socket } = await connectSocket();
+      socket.close();
+      socket.setHidden(true);
+      socket.setHidden(false);
+      jest.advanceTimersByTime(60000);
+      expect(FakeWebSocket.instances).toHaveLength(1);
+    });
+  });
+});

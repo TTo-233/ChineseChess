@@ -331,33 +331,10 @@ function calcHongBing(col: number, row: number, moveQiZi: number, qiPan: number[
   }
 }
 
-/**
- * 在将帅的可移动路径中，排除对方车马炮卒的攻击点
- */
-export function isKilledPoint(
-  jiangOrShuai: number, col: number, row: number,
-  qiPan: number[][], piecePositions: Array<{ col: number; row: number; alive: boolean }>
-): boolean {
-  const myQiPan = qiPan.map(r => [...r]);
-  myQiPan[col][row] = jiangOrShuai;
-  myQiPan[piecePositions[jiangOrShuai].col][piecePositions[jiangOrShuai].row] = -1;
-
-  if (jiangOrShuai === 16) {
-    for (let qizi = 5; qizi <= 15; qizi++) {
-      if (!piecePositions[qizi].alive) continue;
-      const thisPoints = getPathPoints(qizi, myQiPan, piecePositions);
-      if (thisPoints[col][row]) return true;
-    }
-  }
-  if (jiangOrShuai === 0) {
-    for (let qizi = 21; qizi <= 31; qizi++) {
-      if (!piecePositions[qizi].alive) continue;
-      const thisPoints = getPathPoints(qizi, myQiPan, piecePositions);
-      if (thisPoints[col][row]) return true;
-    }
-  }
-  return false;
-}
+// 【R-11】原 isKilledPoint 已删除：全仓无任何调用者（定义处是唯一命中）。
+// 它自身还有与 R-2 同源的越界隐患 —— myQiPan[piecePositions[jiangOrShuai].col]
+// 在缺帅/缺将时 col 为 -1，会写到 myQiPan[-1] 上。保留一个无人调用又会误导维护者
+// 以为"这里有防护"的导出，比删掉更糟。
 
 /**
  * 棋子移动到指定位置后，本方是否还被将军。
@@ -419,24 +396,35 @@ export function afterMoveStillJiangJun(
     if (!blocked) return true;
   }
 
+  // 【R-2 · P0 崩溃防护·与 GameEngine.isJiangJun 同源】piecePositions 里的缺席子
+  // col/row 是 -1（createFromFen 的初始化值），下面 thisPoints[x][y] 会变成
+  // thisPoints[-1][-1] → TypeError: Cannot read properties of undefined。
+  // 缺将/缺帅的局面（畸形残局 FEN）没有"己方将被"的语义，直接跳过一次判定。
+  const shuai = piecePositions[16];
+  const jiang = piecePositions[0];
+  const shuaiOffBoard = !shuai || !shuai.alive || shuai.col < 0 || shuai.col > 8 || shuai.row < 0 || shuai.row > 9;
+  const jiangOffBoard = !jiang || !jiang.alive || jiang.col < 0 || jiang.col > 8 || jiang.row < 0 || jiang.row > 9;
+
   for (let i = 0; i < 9; i++) {
     for (let j = 0; j < 10; j++) {
       const localQiZi = myQiPan[i][j];
       if (qiZi > 15) {
         if (localQiZi >= 5 && localQiZi <= 15) {
           if (!piecePositions[localQiZi].alive) continue;
+          if (!(qiZi === 16) && shuaiOffBoard) continue;
           const thisPoints = getPathPoints(localQiZi, myQiPan, myPositions);
-          const x = (qiZi === 16) ? x1 : piecePositions[16].col;
-          const y = (qiZi === 16) ? y1 : piecePositions[16].row;
+          const x = (qiZi === 16) ? x1 : shuai.col;
+          const y = (qiZi === 16) ? y1 : shuai.row;
           if (thisPoints[x][y]) return true;
         }
       }
       if (qiZi < 16) {
         if (localQiZi >= 21 && localQiZi <= 31) {
           if (!piecePositions[localQiZi].alive) continue;
+          if (qiZi !== 0 && jiangOffBoard) continue;
           const thisPoints = getPathPoints(localQiZi, myQiPan, myPositions);
-          const x = (qiZi === 0) ? x1 : piecePositions[0].col;
-          const y = (qiZi === 0) ? y1 : piecePositions[0].row;
+          const x = (qiZi === 0) ? x1 : jiang.col;
+          const y = (qiZi === 0) ? y1 : jiang.row;
           if (thisPoints[x][y]) return true;
         }
       }

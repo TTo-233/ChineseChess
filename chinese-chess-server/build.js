@@ -402,6 +402,40 @@ for (const [name, lines, verdict, detail] of rows) {
   if (detail) console.log(detail);
 }
 
+// 【I-9】--only 传了不存在的区名时必须失败。
+// 以前所有区名都被 `name !== ONLY` continue 掉，failed 保持 0，脚本仍打印 ✅ 并 exit 0 ——
+// 于是「--check --only <打错的区名>」这种最容易被复制粘贴的定点校验命令等于什么都没跑。
+// 注意这条断言放在比对循环之后：这样「区名只存在于一侧」的情况仍然先按 MISSING 报出来
+// （用户能看到真实原因），再补一句「你是不是想比对另一个区」。
+if (ONLY && !names.includes(ONLY)) {
+  console.log(
+    `\n❌ 指定了 --only ${ONLY}，但本次产物里没有这个区域（比对区域 0 个）。`
+  );
+  console.log('   可用区名：');
+  for (const n of names) console.log(`     - ${n}`);
+  process.exit(1);
+}
+
+// 【I-10】切区锚点必须在两侧都存在。
+// splitRegions 只在 `// src/...` 标记命中时才切出 src/** 区；若两侧同时丢锚点（例如 esbuild
+// 升级后不再输出模块注释，或调整 minify / legalComments / format / target 后重建并提交了新 dist），
+// 整份产物会塌成唯一的 00-PRELUDE（INFO 区），判据退化成"第三方包名序列一致"，
+// src/ 与 dist/ 可以任意不同仍判 ✅。单侧丢锚点本来就会走 MISSING 失败，这里补上两侧都丢的缺口。
+if (!ONLY) {
+  const distHasSrc = [...distRegions.keys()].some((n) => n.startsWith('src/'));
+  const builtHasSrc = [...builtRegions.keys()].some((n) => n.startsWith('src/'));
+  if (!distHasSrc || !builtHasSrc) {
+    console.log(
+      `\n❌ 缺少 src/ 区域锚点：dist ${distHasSrc ? '有' : '无'}、本次重建 ${builtHasSrc ? '有' : '无'}。`
+    );
+    console.log(
+      '   splitRegions 依赖产物里的 `// src/...` 注释切区；两侧同时丢失会把整份产物降级成单个 INFO 区，'
+    );
+    console.log('   使 dist 与 src/ 的比对形同虚设。请检查 esbuild 是否还会输出模块注释（本仓库锁定 0.27.2）。');
+    process.exit(1);
+  }
+}
+
 if (failed === 0) {
   const mode = PORTING
     ? '（--porting：整行注释 / void 0≡undefined / 尾逗号 / 多声明符展开 / function( 空格 / 引号风格 / 裸 require≡ESM import 视为等价）'

@@ -12,15 +12,21 @@
  * 实际棋盘区域：左上(67,53) 到 右下(698,750)
  * 棋子位置区域：左上(110,96) 到 右下(650,704)
  * 棋盘宽度 = 移动端宽度，棋盘图片等比例缩放
+ *
+ * 【C-85】几何常量的真实口径来自 @/utils/chess/boardStyles（每个棋盘样式自带 imgWidth/
+ * imgHeight/imgLeft/imgTop 与 gridSpacingX/Y），下面的常量只用于推导"原始图片坐标系下的
+ * 网格间距"这一个归一化基准。历史注释称 BoardEditor 复用 ORIGINAL_IMAGE_*，
+ * 实际 BoardEditor 只 import COLS/ROWS 与 boardStyles 的 gridSpacingX/Y —— 该说法已删除。
  */
 
 import React, { useRef, useEffect, useState, useMemo, useCallback, memo } from 'react';
-import { View, Image, StyleSheet, Dimensions, Text, GestureResponderEvent, Animated, TouchableOpacity } from 'react-native';
+import { View, Image, StyleSheet, useWindowDimensions, Text, GestureResponderEvent, Animated, TouchableOpacity } from 'react-native';
 import type { GameState } from '@/utils/chess/GameEngine';
 import { getPieceImage, PIECE_NAMES } from '@/utils/chess/pieceImages';
 import { useBoardStyle } from '@/utils/chess/boardStyleStore';
 import { gridSpacingX, gridSpacingY } from '@/utils/chess/boardStyles';
-import { RED_SIDE, BLACK_SIDE } from '@/utils/chess/types';
+// 【C-86】原 import { RED_SIDE, BLACK_SIDE } from '@/utils/chess/types' 是未使用 import
+// （全文件只命中这一行），已删除。
 import MoveEffectOverlay, { type MoveEffect } from '@/components/MoveEffectOverlay';
 import Svg, { Circle, Line } from 'react-native-svg';
 import { FONT } from '@/utils/typography';
@@ -62,21 +68,22 @@ interface ChessBoardProps {
   onBoardLayout?: (size: { width: number; height: number }) => void;
 }
 
-// 原始图片尺寸（export：摆棋编辑器 BoardEditor 复用同一套几何换算）
-export const ORIGINAL_IMAGE_WIDTH = 767;
-export const ORIGINAL_IMAGE_HEIGHT = 842;
+// 原始图片尺寸（私有：仅用于推导下面的归一化基准，【C-85】已从 export 收为私有，
+// 全仓无外部引用者；外层真实几何以 @/utils/chess/boardStyles 的样式参数为准）
+const ORIGINAL_IMAGE_WIDTH = 767;
+const ORIGINAL_IMAGE_HEIGHT = 842;
 
 // 实际棋盘区域（图片中的坐标）
 const BOARD_LEFT = 67;
 const BOARD_TOP = 53;
 const BOARD_RIGHT = 698;
 const BOARD_BOTTOM = 750;
-export const BOARD_WIDTH = BOARD_RIGHT - BOARD_LEFT; // 631
-export const BOARD_HEIGHT = BOARD_BOTTOM - BOARD_TOP; // 697
+const BOARD_WIDTH = BOARD_RIGHT - BOARD_LEFT; // 631
+const BOARD_HEIGHT = BOARD_BOTTOM - BOARD_TOP; // 697
 
 // 棋子位置区域（图片中的坐标）
-export const PIECE_LEFT = 110;
-export const PIECE_TOP = 96;
+const PIECE_LEFT = 110;
+const PIECE_TOP = 96;
 const PIECE_RIGHT = 650;
 const PIECE_BOTTOM = 704;
 const PIECE_AREA_WIDTH = PIECE_RIGHT - PIECE_LEFT; // 540
@@ -89,9 +96,9 @@ export const ROWS = 10;
 // 被吃棋子摘要行固定高度（抽屉向下展开的锚定偏移量）
 const CAPTURED_SUMMARY_H = 30;
 
-// 计算网格间距（原始图片中的像素）
-export const GRID_SPACING_X = PIECE_AREA_WIDTH / (COLS - 1); // 540 / 8 = 67.5
-export const GRID_SPACING_Y = PIECE_AREA_HEIGHT / (ROWS - 1); // 608 / 9 ≈ 67.56
+// 计算网格间距（原始图片中的像素；【C-85】私有，仅作 unitScale 的归一化分母）
+const GRID_SPACING_X = PIECE_AREA_WIDTH / (COLS - 1); // 540 / 8 = 67.5
+const GRID_SPACING_Y = PIECE_AREA_HEIGHT / (ROWS - 1); // 608 / 9 ≈ 67.56
 
 // ==================== Memoized Piece Component ====================
 
@@ -230,7 +237,11 @@ export default function ChessBoard({
   banMoves = null,
   onBoardLayout,
 }: ChessBoardProps) {
-  const screenWidth = Dimensions.get('window').width;
+  // 【C-77】改用 useWindowDimensions：Dimensions.get('window') 只在模块求值时取一次快照，
+  // 旋转屏幕 / 浏览器改窗口 / 分屏后不会更新，棋盘宽度会停在旧视口（表现为棋盘溢出、
+  // 控件行超宽）。同项目 endgame/index.tsx:75、Modal/AppModal.tsx:99、JueShaOverlay.tsx:98
+  // 已是这个写法。
+  const { width: screenWidth } = useWindowDimensions();
 
   // 棋盘宽度 = 屏幕宽度（留少量边距）
   const boardWidth = screenWidth - 16;
@@ -455,7 +466,11 @@ export default function ChessBoard({
     }
 
     const { x, y } = getPos(lastMove.fromCol, lastMove.fromRow);
-    const markerSize = pieceSize * unitScale * 0.8;
+    // 【C-75】pieceSize 已经是屏幕像素（= 棋子直径 × scale），unitScale 是无量纲比例，
+    //   两者相乘等于把缩放乘了两次（0.8 · 直径 · scale²）。390px 宽屏 scale≈0.593 时
+    //   markerSize 只剩 ≈18.5px，而这个环又画在棋子层之下，窄屏上基本看不见 ——
+    //   「上一步从哪来」的提示等于没有。同文件其余尺寸一律只用 pieceSize。
+    const markerSize = pieceSize * 0.8;
     const innerSize = markerSize * 0.4;
     const borderWidth = Math.max(markerSize * 0.06, 2);
 
@@ -491,7 +506,7 @@ export default function ChessBoard({
         />
       </View>
     );
-  }, [lastMove, getPos, pieceSize, unitScale, validMoves]);
+  }, [lastMove, getPos, pieceSize, validMoves]);
 
   // 移动后的棋子额外效果：在最近落子（lastMove 目标格）的棋子外圈绘制白色较窄光圈，
   // 上下左右断开形成四段圆弧（缺口对准正上/正下/正左/正右），与棋子保持间距，
@@ -892,7 +907,8 @@ export function CapturedPiecesDrawer({ side, gameState, playerSide, maxBoardHeig
 
   // 与 ChessBoard 相同的尺寸计算（80% 棋子图 + 角标按基准比例联动）；
   // 棋盘因纵向空间不足缩小时，明细棋子同步缩小
-  const screenWidth = Dimensions.get('window').width;
+  // 【C-77】同 ChessBoard 主组件：Dimensions.get('window') 是模块级快照，改为订阅式 hook
+  const { width: screenWidth } = useWindowDimensions();
   const drawerStyle = useBoardStyle();
   const widthScale = (screenWidth - 16) / drawerStyle.scaleBaseWidth;
   const scale = maxBoardHeight && maxBoardHeight > 0

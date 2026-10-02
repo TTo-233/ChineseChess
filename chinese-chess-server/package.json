@@ -10,6 +10,9 @@
     "preinstall": "npx only-allow pnpm",
     "postinstall": "node build.js",
     "verify": "node build.js --check",
+    "verify:action-outcome": "node scripts/verify-action-outcome.cjs",
+    "verify:lan-disconnect": "node scripts/verify-lan-disconnect.cjs",
+    "verify:hardening": "node scripts/verify-server-hardening.cjs",
     "start": "node scripts/start.mjs"
   },
   "dependencies": {

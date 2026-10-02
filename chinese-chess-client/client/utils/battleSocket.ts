@@ -46,12 +46,15 @@ export interface BattleSocketHandlers {
   /**
    * 动作被服务端拒绝（ack 的 status >= 400）。
    *
-   * ⚠️ 服务端仅在 `status < 400` 时额外广播 state（dist/index.js:28776-28778），
-   * 因此被拒绝的动作**不会收到任何 state 推送**——本回调是该类失败的唯一信号。
-   * 页面必须消费它：回退本地乐观更新 + 向用户提示原因，否则界面会静默卡住。
+   * 【I-1 / C-10】服务端在 `status < 400` 时广播 state；4xx 被拒动作**也会**补推一次
+   * 权威状态，但受按房间计数的限流约束（同一房间 3 秒内最多 8 次，见
+   * `chinese-chess-server/src/routes/lanGame.ts` 的 `shouldSyncRejection` 与
+   * `chinese-chess-server/src/routes/battleWs.ts:284-297`），超限的拒绝不会推送。
+   * 所以本回执仍必须消费：页面据此回退本地乐观更新 + 向用户提示原因，
+   * 否则界面会静默卡住（例：悔棋被 400 拒绝后按钮仍停在「等待对方同意」）。
    *
    * 注意：经 request() 发出的动作已经会以 Promise 拒绝的方式暴露失败，
-   * 调用方若已处理，无需再依赖本回调；本回调面向 send() 发出的即发即忘动作
+   * 调用方若已处理，无需再依赖本回调；本回调面向即发即忘的动作
    * 以及需要全局统一兜底的场景。
    */
   onActionRejected?: (info: {
@@ -103,9 +106,10 @@ const BATTLE_ACTION_TYPES = new Set<BattleActionType>([
 // 服务端返回的致命错误（重连无意义，应停止并提示/退出）
 //
 // ⚠️ 契约来源：服务端 `type: "error"` 帧**只有 message，没有任何错误码**
-// （dist/index.js:28797-28846 共 9 处），因此这里只能按文案匹配。下列每一条都对应
-// 服务端一处 `sendJson(...)` 后紧跟 `ws.close()` 的**握手阶段拒绝**分支——每次重连
-// 都会得到同样结果，必须停止重连。
+// （`chinese-chess-server/src/routes/battleWs.ts:320-351` 的握手阶段拒绝分支，
+// 【I-1】原注释引的是已废弃的 dist/index.js 行号），因此这里只能按文案匹配。
+// 下列每一条都对应服务端一处 `sendJson(...)` 后紧跟 `ws.close()` 的
+// **握手阶段拒绝**分支——每次重连都会得到同样结果，必须停止重连。
 //
 // '缺少 roomId' / '缺少 playerId' 曾经漏在白名单外（症状：服务端关连接 → 客户端
 // onclose → scheduleReconnect → 再次被拒 → ……形成无限重连循环，仅受 8s 退避限速）。
@@ -119,6 +123,10 @@ const FATAL_ERROR_MESSAGES = [
   // 席位不完整（一方已离场）时服务端拒绝观战：席位只会在再次开局后恢复，
   // 在此之前的每次重连都会被同样的错误拒绝，属于重连无意义的终态
   '对局已有玩家离开，观战已结束',
+  // 【S-1 / §3.1】会话凭证缺失/失效（服务端在玩家握手时校验 sessionToken）。
+  // 两者都是"重连多少次都会被同样拒绝"的终态：不加入白名单会形成无限重连循环。
+  '缺少会话凭证',
+  '身份校验失败，请重新进入房间',
 ];
 
 // 自动重连次数上限。
@@ -135,6 +143,10 @@ export class BattleSocket {
   private readonly roomId: string;
   private readonly identityId: string;
   private readonly role: BattleSocketRole;
+  // 【S-1 / §3.1】玩家连接的会话凭证（role='spectator' 时为 null：观战者是只读连接，
+  // 不参与任何状态变更，因此服务端不要求它出示 token）。
+  // connect() 每轮重连都会重读，以便页面恢复后能带上刷新过的 token。
+  private readonly getSessionToken: (() => string | null) | null;
   private readonly handlers: BattleSocketHandlers;
   private closedByUser = false;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -164,10 +176,18 @@ export class BattleSocket {
    */
   private readonly pending = new Map<string, { resolve: () => void; reject: (error: Error) => void }>();
 
-  constructor(roomId: string, identityId: string, handlers: BattleSocketHandlers, role: BattleSocketRole = 'player') {
+  constructor(
+    roomId: string,
+    identityId: string,
+    handlers: BattleSocketHandlers,
+    role: BattleSocketRole = 'player',
+    // 【S-1 / §3.1】玩家角色必须提供会话凭证读取器；观战角色传 null 即可。
+    getSessionToken: (() => string | null) | null = null,
+  ) {
     this.roomId = roomId;
     this.identityId = identityId;
     this.role = role;
+    this.getSessionToken = getSessionToken;
     this.handlers = handlers;
   }
 
@@ -179,7 +199,15 @@ export class BattleSocket {
     if (this.role === 'spectator') {
       this.url = `${base}?roomId=${room}&spectatorId=${encodeURIComponent(this.identityId)}&role=spectator`;
     } else {
-      this.url = `${base}?roomId=${room}&playerId=${encodeURIComponent(this.identityId)}`;
+      // 【S-1 / §3.1】玩家连接必须带 sessionToken：服务端校验它与 URL 里的 playerId
+      // 指向同一个成员，否则任何知道 roomId + playerId 的人都能建立"合法"玩家连接，
+      // 复位对方的在线状态以抵消断线判负，并在消息通道里以对方身份走棋/认输/同意悔棋。
+      // ⚠️ token 走 query 会被反向代理与服务器访问日志记录——这是协议层遗留形态，
+      // 彻底解法是握手后首帧认证（见 §3.1 的后续建议），本轮只先堵住越权。
+      const token = this.getSessionToken?.() ?? '';
+      this.url =
+        `${base}?roomId=${room}&playerId=${encodeURIComponent(this.identityId)}` +
+        `&sessionToken=${encodeURIComponent(token)}`;
     }
     this.openSocket();
   }
@@ -415,7 +443,14 @@ export class BattleSocket {
     return BATTLE_ACTION_TYPES.has(type) ? type : null;
   }
 
-  /** 把所有在途请求按失败收尾（连接断开/致命错误/主动关闭时调用） */
+  /**
+   * 把所有在途请求按失败收尾（致命错误/自动重连用尽/主动关闭时调用）。
+   *
+   * **普通断连不走这里**：onclose 只停心跳并进入退避重连，在途请求继续等到
+   * `ACTION_ACK_TIMEOUT_MS` 超时。理由是断连时帧可能已经送达服务端并生效
+   * （重连后会补推权威状态），此时立刻 reject 会把"结果未知"谎报成"未送达"，
+   * 页面据此提示重试就可能重复执行一次已经生效的着法。超时（结果未知）才是诚实的信号。
+   */
   private rejectPending(error: Error): void {
     if (this.pending.size === 0) return;
     const waiters = [...this.pending.values()];
@@ -423,18 +458,15 @@ export class BattleSocket {
     for (const waiter of waiters) waiter.reject(error);
   }
 
-  /** 发送对局动作；返回是否成功发出（false 时调用方应走 HTTP 兜底） */
-  send(type: string, payload: Record<string, unknown> = {}): boolean {
-    this.reqCounter += 1;
-    return this.sendRaw({ type, reqId: `req-${this.reqCounter}`, ...payload });
-  }
-
   /**
    * 发送动作并等待服务端裁决（ack）。
    *
-   * 与 send() 的区别：send() 只回答「帧是否发出」，无法区分「服务端接受了」与
-   * 「服务端拒绝了」——而服务端**只在接受时才广播 state**，被拒绝的动作没有任何
-   * 后续信号。需要知道裁决结果的动作（走子/悔棋/求和/认输）请用本方法。
+   * 【C-52】原还有一个 send(type, payload) 只发不等、返回 boolean 的薄封装，
+   * 全仓无任何调用者（页面只用 request()），已删除。留着它有两个害处：
+   * 它看起来仍是正常的公开 API，但它发出的 reqId 是 `req-<n>`，actionOf() 取到
+   * `'req'` 不在 BATTLE_ACTION_TYPES 白名单里 → 断线重连后这个在途请求永远等不到
+   * 裁决，只能等超时；而且它无法区分「服务端接受」与「服务端拒绝」。
+   * 需要知道裁决结果的动作（走子/悔棋/求和/认输）一律用本方法。
    *
    * 三类失败以不同错误抛出，调用方据此决定后续动作（见 battleProtocol/index.ts）：
    * - BattleActionNotSentError：连接不可用 → 回退 HTTP；

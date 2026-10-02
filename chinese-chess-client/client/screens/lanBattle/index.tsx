@@ -36,6 +36,8 @@ import { useBattleClock } from '@/hooks/useBattleClock';
 import { useBattleStateSync } from '@/hooks/useBattleStateSync';
 import { playJiangJunSound, playSound, preloadSounds, unloadAllSounds } from '@/utils/SoundManager';
 import { getOnlineServerUrl } from '@/utils/serverConfig';
+import { applyServerNow, serverElapsedMs, serverNow, serverRemainingSec } from '@/utils/serverClock';
+import { getRoomSessionToken, peekRoomSessionToken, clearRoomSessionToken } from '@/utils/playerIdentity';
 import { BattleSocket } from '@/utils/battleSocket';
 import { isActionNotSent, BattleActionRejectedError, type BattleActionType, type BattleMove } from '@/utils/battleProtocol';
 import { saveReplay } from '@/utils/replayStorage';
@@ -191,6 +193,12 @@ export default function LanBattleScreen() {
   }>();
 
   const [gameState, setGameState] = useState<GameState>(createInitialState());
+  // 【S-1 / §3.1】房间会话凭证：服务端在创建/加入房间时签发，之后所有写操作都靠它鉴权
+  // （playerId 退化为显示用标识）。首帧从持久化里恢复——App 被杀掉后重进对局页仍要能续上，
+  // 否则玩家会被判断线判负。ref 而非 state：写请求是命令式的，不需要触发重渲染。
+  const sessionTokenRef = useRef('');
+  // token 恢复完成标记：true 表示已尝试过（无论成功与否），用于避免重复的存储读取
+  const tokenResolvedRef = useRef(false);
   // gameState 镜像 ref：供终局结算等异步回调读取最新局面（着法序列）
   const gameStateRef = useRef(gameState);
   gameStateRef.current = gameState;
@@ -290,7 +298,9 @@ export default function LanBattleScreen() {
   // 是否由本端上传初始局面（双方均准备的那次 ready 响应方）；另一端等待同步，避免重复上传互相覆盖
   const amUploaderRef = useRef(false);
   const uploadedRef = useRef(false);
-  const revealTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // 【C-47】原 revealTimerRef 是死引用：全文件只有 clearTimeout、从未有任何一处给它赋值
+  // （公示倒数用的是下面的 countdownTimerRef），会让读者以为公示阶段还有一个 timeout。
+  // 已连同 3 处清理点一并删除。
   const countdownTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   // 吃子/将军特效（含连续将军节流策略）
   const { moveEffect, triggerMoveEffect } = useMoveEffect();
@@ -549,7 +559,12 @@ export default function LanBattleScreen() {
        */
       await fetch(`${base}/api/v1/lan/rooms/${roomId}/reconnect`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          // 【S-1 / §3.1】鉴权凭证。改造后服务端只认 token，不再接受 body 里的 playerId：
+          // 玩家 id 可枚举，任何知道 id 的人都能替对方"重连"清零断线判负倒计时。
+          ...(sessionTokenRef.current ? { 'x-session-token': sessionTokenRef.current } : {}),
+        },
         body: JSON.stringify({ playerId }),
       });
     } catch (error) {
@@ -565,7 +580,12 @@ export default function LanBattleScreen() {
       const base = await getOnlineServerUrl();
       await fetch(`${base}/api/v1/lan/rooms/${roomId}/heartbeat`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          // 【S-1 / §3.1】心跳同样凭 token 定位成员：否则任何知道 playerId 的人都能
+          // 持续替对方上报心跳，维持 connected=true 规避断线判负。
+          ...(sessionTokenRef.current ? { 'x-session-token': sessionTokenRef.current } : {}),
+        },
         body: JSON.stringify({ playerId, hidden: pageHiddenRef.current }),
       });
     } catch (error) {
@@ -600,7 +620,10 @@ export default function LanBattleScreen() {
     setOpponentDisconnected(false);
     setUndoRequestFromOpponent(false);
     setDrawRequestFromOpponent(false);
-  }, []);
+    // 【S-1 / §3.1】会话终结 → 本地凭证已无意义（席位已被服务端移除或房间已销毁），
+    // 必须清掉，否则下次进同一 roomId 的房间会带着过期 token，且在存储里无限堆积。
+    void clearRoomSessionToken(roomId, playerId);
+  }, [roomId, playerId]);
 
   // 页面可见性变化（Web 切标签页 / 移动端切后台）→ 立即同步服务端：
   // - 进入后台：趁定时器尚未被节流，立刻上报 hidden=true，服务端在宽容窗口内不判定断线
@@ -657,9 +680,8 @@ export default function LanBattleScreen() {
           if (data.room) {
             const room = data.room;
             // 服务端时钟校正：后续所有与服务端时间戳的比较统一使用校正时间
-            if (typeof room.serverNow === 'number') {
-              serverTimeOffsetRef.current = room.serverNow - Date.now();
-            }
+            // 第 3 批：偏移量的写入单点在 @/utils/serverClock 的 applyServerNow（§8 表 #7）
+            applyServerNow(serverTimeOffsetRef, room.serverNow);
             // 等待阶段表情同步（兜底通道）：WS 断开时经 2s 轮询仍可收到对方表情，按 id 去重
             if (Array.isArray(room.emojiMessages)) {
               for (const m of room.emojiMessages) {
@@ -770,7 +792,8 @@ export default function LanBattleScreen() {
               room.sideReveal &&
               room.phase === 'waiting' &&
               !uploadedRef.current &&
-              Date.now() + serverTimeOffsetRef.current - room.sideReveal.time > 12000
+              // 第 3 批：走 serverNow（§8 表 #7）
+              serverNow(serverTimeOffsetRef) - room.sideReveal.time > 12000
             ) {
               uploadInitialGame();
             }
@@ -948,9 +971,51 @@ export default function LanBattleScreen() {
     applyServerStateRef.current = applyServerState;
   });
 
+  // 【S-1 / §3.1】会话凭证是否已恢复就绪（供 WS 建连 effect 等待）。
+  // 用 state 而非纯 ref：effect 需要在"就绪"这一刻重渲染一次才会执行；
+  // tokenResolvedRef 只做「同一 roomId 不重复读存储」的去重。
+  const [sessionTokenReady, setSessionTokenReady] = useState(false);
+
+  // 恢复房间会话凭证（异步）：AsyncStorage 读取完成后才能带上 x-session-token。
+  // 必须先于 WS 建连：connect() 要读 sessionTokenRef.current 拼 URL，
+  // 早于恢复完成就会用空 token 建连、被服务端以「缺少会话凭证」拒绝（该拒绝是致命的，
+  // 会进入 FATAL_ERROR_MESSAGES 而不再重连，页面就此静默失效）。
+  useEffect(() => {
+    if (!roomId || !playerId || tokenResolvedRef.current) return;
+    tokenResolvedRef.current = true;
+    let cancelled = false;
+    void (async () => {
+      // 先试内存缓存（大厅刚创建/加入时已写入，绝大多数走这条零异步路径）
+      const cached = peekRoomSessionToken(roomId, playerId);
+      if (cached) {
+        if (cancelled) return;
+        sessionTokenRef.current = cached;
+        setSessionTokenReady(true);
+        return;
+      }
+      // 缓存未命中：读持久化（App 被杀掉后重进对局页的冷启动路径）
+      const token = await getRoomSessionToken(roomId, playerId);
+      if (cancelled) return;
+      sessionTokenRef.current = token;
+      setSessionTokenReady(true);
+      if (!token) {
+        // 本地没有可用凭证：可能是清了应用数据、换了设备，或房间在服务端已被 GC 后
+        // 以同一 roomId 重建。此时所有写操作都会 403、界面空转在准备阶段，
+        // 直接切终态让用户回大厅重新加入，别让界面假装"还在房间里"。
+        if (!intentionalExitRef.current) handleSessionGone('removed');
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [roomId, playerId, handleSessionGone]);
+
   // 建立在线对局 WebSocket：实时接收状态推送、发送对局动作；断线自动重连由 BattleSocket 内部处理
   useEffect(() => {
     if (!roomId || !playerId) return;
+    // 凭证恢复未完成前不建连：服务端会以「缺少会话凭证」拒绝，而该拒绝是致命的
+    //（进入 FATAL_ERROR_MESSAGES 后不再重连）。等上面的恢复 effect 置位后重渲染再连。
+    if (!sessionTokenReady) return;
     const socket = new BattleSocket(roomId, playerId, {
       onState: data => applyServerStateRef.current(data),
       onStatusChange: connected => {
@@ -979,7 +1044,9 @@ export default function LanBattleScreen() {
       // 协议级失败（「观战者无法执行该操作」「未知消息类型」等）：此前被静默丢弃，
       // 表现为「点了没反应」。服务端文案本身就是面向用户的，直接透出。
       onError: message => showNotice(message),
-    });
+      // WS 建连时传入凭证读取器（【S-1 / §3.1】）：connect() 每次重连都重读，
+      // 因此凭证刷新后无需重建 BattleSocket 也能带上新 token。
+    }, 'player', () => sessionTokenRef.current || null);
     battleSocketRef.current = socket;
     // 同步当前可见性：后台标签页刷新/直接打开对局链接时，连接建立后首个心跳就要带 hidden=true
     socket.setHidden(pageHiddenRef.current);
@@ -988,7 +1055,9 @@ export default function LanBattleScreen() {
       battleSocketRef.current = null;
       socket.close();
     };
-  }, [roomId, playerId, sendReconnect, handleSessionGone]);
+    // sessionTokenReady 是刻意依赖：凭证恢复完成才建连（见上方注释）。
+    // 读取走 ref（connect 每轮重连都重读），因此 token 内容变化不会重建本 effect。
+  }, [roomId, playerId, sessionTokenReady, sendReconnect, handleSessionGone]);
 
   // 对局中轮询游戏状态（WebSocket 兜底通道：仅在 WS 未连接时启用）
   useEffect(() => {
@@ -1059,7 +1128,8 @@ export default function LanBattleScreen() {
 
     const timer = setInterval(() => {
       if (gameStartTimeRef.current > 0) {
-        setGameDuration(Date.now() - gameStartTimeRef.current);
+        // 第 3 批 / §8 #7：gameStartTime 来自服务端载荷，须用校正后的服务端时间求差
+        setGameDuration(serverElapsedMs(serverTimeOffsetRef, gameStartTimeRef.current));
       }
     }, 1000);
 
@@ -1072,67 +1142,67 @@ export default function LanBattleScreen() {
     setValidMoves(null);
     setLastMove(null);
     setPhase('playing');
-    lastMoveTimeRef.current = Date.now();
+    // 【C-40】步时锚点必须落在服务端时间轴上（与 useBattleStateSync 写入的服务端
+    // lastMoveTime 同源），否则下次快照覆盖后倒计时会跳一次。
+    // 第 3 批：走 serverNow（§8 表 #7）
+    lastMoveTimeRef.current = serverNow(serverTimeOffsetRef);
     setTurnTimeLeft(turnTimeLimit);
   };
 
-  // 上传初始局面并开局（仅上传方/接管方执行一次）
+  // 请求开局（仅上传方/接管方执行一次）
+  //
+  // 【S-8】服务端已删除「客户端上传完整初始局面」的旧协议：开局时由 startPlayingRoom()
+  // 自行 buildInitialState() 生成权威初始局面（含让子），客户端不再有任何机会改写它。
+  // 因此这里只剩"请服务端开局"一步，且**必须读回校验**——/start 被拒（对方在倒数期间退出、
+  // 公示已被清理、token 失效等）时本端不能自认为已开局，否则会带着空/过期局面继续走子。
   const uploadInitialGame = async () => {
-    // 注意：这里**不能**提前置 uploadedRef.current = true。
-    // 服务端已把上传收紧为「仅房内玩家、且仅在本局尚无着法时接受」，
-    // 若本端在房间还没登记进玩家时就抢先上传，会被 403 拒绝，而房间的棋盘仍是空的，
-    // 对局会永远卡住。改为「确认服务端已采用本端局面的那一刻」才置位。
+    // 不能提前置 uploadedRef.current = true：只有确认服务端已开局才置位，
+    // 失败必须留出重试机会（轮询与接管路径都依赖它）。
     if (uploadedRef.current) return;
     try {
       const base = await getOnlineServerUrl();
       /**
        * 服务端文件：chinese-chess-server/src/routes/lanGame.ts
        * 接口：POST /api/v1/lan/rooms/:roomId/start
-       * Body 参数：playerId: string
+       * 鉴权：请求头 x-session-token（或 body.sessionToken）
+       * Body 参数：playerId: string（仅供日志/兼容，服务端已不再据此鉴权）
        */
       const startResp = await fetch(`${base}/api/v1/lan/rooms/${roomId}/start`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(sessionTokenRef.current ? { 'x-session-token': sessionTokenRef.current } : {}),
+        },
         body: JSON.stringify({ playerId }),
       });
       const startData = await startResp.json();
       if (!startData?.success) {
-        // 开局被服务端拒绝（如对方在倒数期间退出、公示已被清理）→ 不再上传初始局面；
-        // 本端是否留在对局由轮询对账决定（服务端 waiting + 公示清空 → 自动回退准备阶段）
+        // 开局被服务端拒绝 → 不置位；本端是否留在对局由轮询对账决定
+        // （服务端 waiting + 公示清空 → 自动回退准备阶段）
         uploadedRef.current = false;
+        // 【S-1】403 身份校验失败：本端 token 已失效（例如房间被 GC 后重建、或
+        // 幂等重入时被重新签发）。按会话终结处理，否则后续每 2s 轮询都会静默空转，
+        // 玩家会一直卡在"准备完成但对不了局"的界面。
+        if (startResp.status === 403) {
+          clearRoomSessionToken(roomId, playerId);
+          handleSessionGone('removed');
+        }
         return;
       }
       // 记录本局纪元：重赛后旧快照（旧 matchId）不得再把本端拉回对局
       if (typeof startData.matchId === 'number') {
         playedMatchIdRef.current = Math.max(playedMatchIdRef.current, startData.matchId);
       }
-      // 让子房间：初始局面移除红方让出的棋子（服务端透传设置，双方以房间设置为准）
-      const initialState = applyHandicap(createInitialState(), roomHandicapRef.current);
-      /**
-       * 服务端文件：chinese-chess-server/src/routes/lanGame.ts
-       * 接口：POST /api/v1/lan/rooms/:roomId/gameState
-       * Body 参数：playerId: string, gameState: GameState（已应用让子）
-       */
-      await fetch(`${base}/api/v1/lan/rooms/${roomId}/gameState`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ playerId, gameState: initialState }),
-      });
-      // 上传后必须**读回校验**，不能假定成功。服务端该接口被收紧为
-      // 「仅房内玩家 + 本局尚无着法」才接受（403，见 chinese-chess-server/src/routes/lanGame.ts）：
-      //   - 本端尚未被登记进房间 → 403，此时服务端棋盘仍为空，必须留出重试机会；
-      //   - 房间已有一份（他人上传的）棋盘 → 服务端已可开局，无需再传，也不必重试。
-      // 旧实现只看 fetch 是否抛异常，因此 403 被当成成功、且 uploadedRef 在请求前就置了位，
-      // 结果是「服务端没有棋盘 / 客户端也无法再补传」的永久不同步。
-      const verify = await fetch(`${base}/api/v1/lan/rooms/${roomId}/gameState`);
-      const verified = await verify.json();
-      const accepted = !!verified?.gameState;
-      if (accepted) uploadedRef.current = true;
-      else console.warn('初始局面尚未被服务端接受，将留待重试同步:', verified);
-      gameStartTimeRef.current = Date.now();
+      // 开局成功即视为本端已对齐服务端权威局面（旧协议下这里还要上传并读回校验，
+      // 现已删除——权威局面由服务端自建，客户端无从、也无权改写）
+      uploadedRef.current = true;
+      // 【第 3 批 / §8 #7】开局时刻取**服务端时间轴**：该值随后要与服务端载荷里的
+      // gameStartTime 做差算局时，本机 Date.now() 会引入设备时钟偏差（表现为局时忽长忽短）。
+      // 服务端还没广播 gameStartTime 时，这里给一个同坐标系的值，后续会被真实值覆盖。
+      gameStartTimeRef.current = serverNow(serverTimeOffsetRef);
     } catch (error) {
       // uploadedRef 未置位，故本次失败天然允许后续轮询/接管重试
-      console.error('同步初始状态失败:', error);
+      console.error('请求开局失败:', error);
     }
   };
 
@@ -1173,12 +1243,15 @@ export default function LanBattleScreen() {
     setSidePickVisible(true);
     setSidePickResultMode(true);
     setPhase('reveal');
-    const anchor = gameStartAt ?? (Date.now() + serverTimeOffsetRef.current + 3000);
-    const serverNow = () => Date.now() + serverTimeOffsetRef.current;
-    setCountdown(Math.max(1, Math.ceil((anchor - serverNow()) / 1000)));
+    // 第 3 批：锚点与采样统一走 serverNow（§8 表 #7）
+    // 页面此前本地定义了一个同名 lambda，与本模块导入的 serverNow 功能相同，
+    // 两份同义写法并存正是「改一处漏一处」的来源，这里去掉本地影子。
+    const anchor = gameStartAt ?? (serverNow(serverTimeOffsetRef) + 3000);
+    const serverTick = () => serverNow(serverTimeOffsetRef);
+    setCountdown(Math.max(1, Math.ceil((anchor - serverTick()) / 1000)));
     // 250ms 采样：两端轮询发现公示存在时间差，锚定倒数可自动对齐到同一开局时刻
     countdownTimerRef.current = setInterval(() => {
-      const remain = Math.ceil((anchor - serverNow()) / 1000);
+      const remain = Math.ceil((anchor - serverTick()) / 1000);
       if (remain > 0) {
         setCountdown(remain);
       } else {
@@ -1193,7 +1266,6 @@ export default function LanBattleScreen() {
 
   // 公示期间对方退出房间：服务端已清空公示，本端中止倒数、回到准备阶段
   const abortRevealSequence = () => {
-    if (revealTimerRef.current) { clearTimeout(revealTimerRef.current); revealTimerRef.current = null; }
     if (countdownTimerRef.current) { clearInterval(countdownTimerRef.current); countdownTimerRef.current = null; }
     revealStartedRef.current = false;
     amUploaderRef.current = false;
@@ -1208,7 +1280,6 @@ export default function LanBattleScreen() {
 
   // 对方已开局时提前结束本地公示/倒数序列（两端轮询存在时间差）
   const finishSequenceEarly = () => {
-    if (revealTimerRef.current) { clearTimeout(revealTimerRef.current); revealTimerRef.current = null; }
     if (countdownTimerRef.current) { clearInterval(countdownTimerRef.current); countdownTimerRef.current = null; }
     setSidePickVisible(false);
     setSidePickResultMode(false);
@@ -1230,7 +1301,10 @@ export default function LanBattleScreen() {
        */
       const response = await fetch(`${base}/api/v1/lan/rooms/${roomId}/side`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(sessionTokenRef.current ? { 'x-session-token': sessionTokenRef.current } : {}),
+        },
         body: JSON.stringify({ playerId, side }),
       });
       const data = await response.json();
@@ -1238,9 +1312,8 @@ export default function LanBattleScreen() {
         setMyPreference(prev); // 失败回滚
         return;
       }
-      if (typeof data.serverNow === 'number') {
-        serverTimeOffsetRef.current = data.serverNow - Date.now();
-      }
+      // 第 3 批：偏移量写入走 applyServerNow（§8 表 #7）
+      applyServerNow(serverTimeOffsetRef, data.serverNow);
       if (data.sideAssigned) {
         // 双方均已选边：本端为上传方，以服务端锚定的统一开局时刻公示倒数
         amUploaderRef.current = true;
@@ -1285,7 +1358,11 @@ export default function LanBattleScreen() {
        */
       const response = await fetch(`${base}/api/v1/lan/rooms/${roomId}/settings`, {
         method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          // 【S-1 / §3.1】房主校验改由 token 决定（服务端不再信任 body.playerId）
+          ...(sessionTokenRef.current ? { 'x-session-token': sessionTokenRef.current } : {}),
+        },
         body: JSON.stringify({
           playerId,
           name: trimmedName,
@@ -1354,7 +1431,10 @@ export default function LanBattleScreen() {
            */
           const response = await fetch(`${base}/api/v1/lan/rooms/${roomId}/ready`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: {
+              'Content-Type': 'application/json',
+              ...(sessionTokenRef.current ? { 'x-session-token': sessionTokenRef.current } : {}),
+            },
             body: JSON.stringify({ playerId, ready: next }),
           });
           data = await response.json();
@@ -1488,7 +1568,8 @@ export default function LanBattleScreen() {
 
     // 长将长捉超限（方案 10 娱乐向改造）：**不拦截落子、不判负**。
     // banMoves 仅用于棋盘标红「走这里会继续长将/长捉」，落子照常进行；
-    // 服务端（dist/index.js 的 ruleEngine 二次校验）同样不再拦截禁着。
+    // 服务端（`chinese-chess-server/src/routes/lanGame.ts:1273-1281` 的
+    // ruleEngine.getValidMoves/makeMove）同样不再拦截禁着。
 
     const result = makeMove(gameState, selectedPieceId, toCol, toRow);
 
@@ -1538,7 +1619,7 @@ export default function LanBattleScreen() {
           winner: null,
           isWin: false,
           // eslint-disable-next-line react-hooks/purity -- 事件回调中计算对局时长
-          duration: gameStartTimeRef.current ? Date.now() - gameStartTimeRef.current : 0,
+          duration: serverElapsedMs(serverTimeOffsetRef, gameStartTimeRef.current),
           moveCount: result.newState.moveHistory.length,
           surrenderBy: null,
           isDraw: true,
@@ -1551,7 +1632,7 @@ export default function LanBattleScreen() {
           winner: winnerSide,
           isWin,
           // eslint-disable-next-line react-hooks/purity -- 事件回调中计算对局时长
-          duration: gameStartTimeRef.current ? Date.now() - gameStartTimeRef.current : 0,
+          duration: serverElapsedMs(serverTimeOffsetRef, gameStartTimeRef.current),
           moveCount: result.newState.moveHistory.length,
           surrenderBy: null,
         });
@@ -1560,13 +1641,16 @@ export default function LanBattleScreen() {
     }
     // 重置限时计时器
     // eslint-disable-next-line react-hooks/purity -- 事件回调中重置计时起点
-    lastMoveTimeRef.current = Date.now();
+    // 【C-40】锚点落在服务端时间轴上（理由同 enterPlayingLocal）；第 3 批走 serverNow
+    lastMoveTimeRef.current = serverNow(serverTimeOffsetRef);
     setTurnTimeLeft(turnTimeLimit);
   };
 
   // 动作类型 → HTTP 兜底端点（与 WebSocket 消息类型同名）
   const HTTP_ACTION_PATH: Record<BattleActionType, string> = {
-    move: 'gameState',
+    // 【S-8】服务端已把「上传完整局面」的旧协议分支删除，改名 POST /rooms/:roomId/move，
+    // 只接受 { move: { pieceId, toCol, toRow } }。旧名 gameState 已被 GET（只读局面）占用。
+    move: 'move',
     surrender: 'surrender',
     undo: 'undo',
     undoResponse: 'undoResponse',
@@ -1606,11 +1690,28 @@ export default function LanBattleScreen() {
     // HTTP 兜底：仅在本端无法经 WS 送达时使用
     try {
       const base = await getOnlineServerUrl();
-      await fetch(`${base}/api/v1/lan/rooms/${roomId}/${HTTP_ACTION_PATH[type]}`, {
+      const response = await fetch(`${base}/api/v1/lan/rooms/${roomId}/${HTTP_ACTION_PATH[type]}`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          // 【S-1 / §3.1】与 WS 通道同一套鉴权：服务端不再从 body 读 playerId
+          ...(sessionTokenRef.current ? { 'x-session-token': sessionTokenRef.current } : {}),
+        },
         body: JSON.stringify({ playerId, ...payload }),
       });
+      // 【S-14】原实现不读 response.ok 与 body.success：被服务端拒绝的动作（不是你的回合 /
+      // 非法走法 / 协商已被对方处理 / token 失效）会静默失败——界面不回滚也不提示，
+      // 用户以为已认输/已悔棋，实际服务端什么都没做。
+      if (!response.ok) {
+        const errBody = await response.json().catch(() => null);
+        if (response.status === 403) {
+          // 身份失效：清掉本地 token 并切终态，避免后续动作反复 403 空转
+          clearRoomSessionToken(roomId, playerId);
+          handleSessionGone('removed');
+          return;
+        }
+        showNotice('操作未被服务端接受', typeof errBody?.message === 'string' ? errBody.message : undefined);
+      }
     } catch (error) {
       console.error(`发送动作失败(${type}):`, error);
       showNotice('网络异常，操作发送失败');
@@ -1646,7 +1747,7 @@ export default function LanBattleScreen() {
         winner: null,
         isWin: false,
         // eslint-disable-next-line react-hooks/purity -- 事件回调中计算对局时长
-        duration: gameStartTimeRef.current ? Date.now() - gameStartTimeRef.current : 0,
+        duration: serverElapsedMs(serverTimeOffsetRef, gameStartTimeRef.current),
         moveCount: settled.moveHistory.length,
         surrenderBy: null,
         isDraw: true,
@@ -1661,7 +1762,7 @@ export default function LanBattleScreen() {
         winner: winnerSide,
         isWin: winnerSide === mySide,
         // eslint-disable-next-line react-hooks/purity -- 事件回调中计算对局时长
-        duration: gameStartTimeRef.current ? Date.now() - gameStartTimeRef.current : 0,
+        duration: serverElapsedMs(serverTimeOffsetRef, gameStartTimeRef.current),
         moveCount: settled.moveHistory.length,
         surrenderBy: null,
       });
@@ -1744,7 +1845,9 @@ export default function LanBattleScreen() {
     if (result.isGameOver) {
       settleFromState(result.newState, result.gameOverReason);
     }
-    lastMoveTimeRef.current = Date.now();
+    // 【C-40】超时走棋后同样把锚点放回服务端时间轴，否则下一次快照会把倒计时拉回 0
+    // 第 3 批：走 serverNow（§8 表 #7）
+    lastMoveTimeRef.current = serverNow(serverTimeOffsetRef);
     setTurnTimeLeft(turnTimeLimit);
   };
 
@@ -1753,9 +1856,20 @@ export default function LanBattleScreen() {
     if (phase !== 'playing' || turnTimeLimit <= 0) return;
 
     const timer = setInterval(() => {
-      const elapsed = Math.floor((Date.now() - lastMoveTimeRef.current) / 1000);
-      const remaining = Math.max(0, turnTimeLimit - elapsed);
+      // 【C-40】lastMoveTimeRef 是服务端时间戳（useBattleStateSync 写入 data.lastMoveTime），
+      //   必须与校正后的服务端时间比较，不能直接用本机 Date.now()：两端设备时钟有差时
+      //   （常见于用户手动改时间、系统未自动校时）elapsed 会被算成负值或远超真实值 ——
+      //   前者让剩余时间不降，后者让 remaining 立刻归零，于是 doRandomMove() 替用户走棋。
+      //   偏移量的定义与用法见上面 serverTimeOffsetRef 的注释与 useBattleClock 内同一套约定。
+      //   第 3 批起这条路径走 @/utils/serverClock 的 serverRemainingSec（§8 表 #7）
+      const remaining = serverRemainingSec(serverTimeOffsetRef, turnTimeLimit, lastMoveTimeRef.current);
       setTurnTimeLeft(remaining);
+
+      // 【C-41】悔棋/求和协商期间服务端会冻结棋钟（clockPausedAt 非空），
+      //   此时步时也必须跟着冻结：否则钟面看着在走（computeClockText 已按锚点冻结，
+      //   但这里没读），remaining 会走成 0 并触发 doRandomMove()，把协商中的这步棋替用户走掉；
+      //   服务端随后会静默清掉 pendingUndo/pendingDraw（驳回或超时），用户以为自己已经悔过棋。
+      if (clockSnapRef.current?.clockPausedAt != null) return;
 
       // 超时随机走一步棋
       if (remaining <= 0 && isMyTurn) {
@@ -1794,7 +1908,13 @@ export default function LanBattleScreen() {
     await sendBattleAction('surrender', {});
   };
 
-  // 悔棋（需对方同意）：撤销双方各一步，目标局面随请求提交给服务端
+  // 悔棋（需对方同意）
+  //
+  // 【S-2】改造前本函数在本地 undoMove 两步后把「目标局面」随请求提交给服务端，
+  // 而服务端在对方同意时**直接采纳**这份客户端上传的局面——等于把权威局面交给
+  // 任一方任意改写（可以伪造"对手少子、自己多子"的局面）。现在服务端保存自己的
+  // 走子前快照栈（stateHistory），对方同意时从自己的快照回退 2 步，客户端不再上传局面。
+  // 本地仍保留同样的 2 步守卫，让"不足 2 手时不可悔棋"的规则在两端一致且即时反馈。
   const handleUndo = async () => {
     if (!isMyTurn || gameState.moveHistory.length < 2 || undoPendingRef.current) return;
     if (undoBlockedRef.current) {
@@ -1802,15 +1922,15 @@ export default function LanBattleScreen() {
       return;
     }
 
-    // 悔棋 = 回退对方一步 + 回退我方一步，回到我方走棋前
+    // 悔棋 = 回退对方一步 + 回退我方一步，回到我方走棋前。
+    // 这里只用于守卫（不足两步不可悔棋），不再把结果发给服务端。
     const afterOpponent = undoMove(gameState);
-    const proposed = afterOpponent ? undoMove(afterOpponent) : null;
-    if (!proposed) return;
+    if (!afterOpponent || !undoMove(afterOpponent)) return;
 
     // 先进入「等待对方同意」态：服务端拒绝或超时时由 handleActionRejected 回退该态
     undoPendingRef.current = true;
     setUndoPending(true);
-    await sendBattleAction('undo', { proposedState: proposed });
+    await sendBattleAction('undo', {});
   };
 
   // 响应对方的悔棋请求
@@ -1900,7 +2020,7 @@ export default function LanBattleScreen() {
 
   // 棋局开始前的展示用局面：存在让子时，本地标准初始局面需同步移除被让棋子，
   // 棋盘才能在被让位置渲染幽灵标记（否则被正常棋子占据而遮蔽，误导用户以为不让子）；
-  // playing/ended 阶段直接用服务端局面（上传方 uploadInitialGame 已应用让子）
+  // playing/ended 阶段直接用服务端局面（权威局面由服务端 startPlayingRoom() 自建并应用让子）
   const displayGameState = useMemo(() => {
     if (roomHandicap.length === 0) return gameState;
     if (phase === 'playing' || phase === 'ended') return gameState;
@@ -1965,7 +2085,6 @@ export default function LanBattleScreen() {
 
   // 重置本地状态回到准备阶段（重新对局）
   const resetForRematch = () => {
-    if (revealTimerRef.current) { clearTimeout(revealTimerRef.current); revealTimerRef.current = null; }
     if (countdownTimerRef.current) { clearInterval(countdownTimerRef.current); countdownTimerRef.current = null; }
     setGameState(createInitialState());
     setSelectedPieceId(null);
@@ -2033,7 +2152,11 @@ export default function LanBattleScreen() {
        */
       const response = await fetch(`${base}/api/v1/lan/rooms/${roomId}/returnToRoom`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          // 【S-1 / §3.1】鉴权凭证（服务端不再从 body 读 playerId）
+          ...(sessionTokenRef.current ? { 'x-session-token': sessionTokenRef.current } : {}),
+        },
         body: JSON.stringify({ playerId }),
       });
       const data = await response.json();
@@ -2106,7 +2229,11 @@ export default function LanBattleScreen() {
       await Promise.race([
         fetch(`${base}/api/v1/lan/rooms/${roomId}/leave`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            // 【S-1 / §3.1】离场也凭 token：否则陌生人可用 playerId 把别人踢出房间
+            ...(sessionTokenRef.current ? { 'x-session-token': sessionTokenRef.current } : {}),
+          },
           body: JSON.stringify({ playerId }),
         }).catch((err: unknown) => console.error('离开房间请求失败:', err)),
         new Promise(resolve => setTimeout(resolve, 800)),
@@ -2208,7 +2335,10 @@ export default function LanBattleScreen() {
       .then(base =>
         fetch(`${base}/api/v1/lan/rooms/${roomId}/leave`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            ...(sessionTokenRef.current ? { 'x-session-token': sessionTokenRef.current } : {}),
+          },
           body: JSON.stringify({ playerId }),
         })
       )
@@ -2233,13 +2363,30 @@ export default function LanBattleScreen() {
         .then(base =>
           fetch(`${base}/api/v1/lan/rooms/${roomId}/leave`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: {
+              'Content-Type': 'application/json',
+              ...(sessionTokenRef.current ? { 'x-session-token': sessionTokenRef.current } : {}),
+            },
             body: JSON.stringify({ playerId }),
           })
         )
         .catch(() => undefined);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // 【C-44】公示倒数定时器此前只在 abortRevealSequence / finishSequenceEarly /
+  // resetForRematch 三条业务分支里清理，没有 unmount 清理：用户在「公示 → 倒数开局」
+  // 这几秒内直接返回/退房（甚至 Web 刷新）时，250ms 的 countdownTimerRef 会继续跑并对
+  // 已卸载组件 setState，对局已经开始时还会再调一次 startGame()。这里补一个只做清理的
+  // 空依赖 effect（【C-47】原 revealTimerRef 是只 clear 不赋值的死引用，已连同清理点删除）。
+  useEffect(() => {
+    return () => {
+      if (countdownTimerRef.current) {
+        clearInterval(countdownTimerRef.current);
+        countdownTimerRef.current = null;
+      }
+    };
   }, []);
 
   // 安卓系统返回键（侧边返回手势）：对局进行中先弹二次确认，其余阶段与顶部返回按钮一致——
@@ -2850,6 +2997,7 @@ export default function LanBattleScreen() {
                       <SettingSelect
                         label="局时"
                         valueText={BASE_TIME_OPTIONS.find(o => o.value === baseVal)?.label ?? `${baseVal}秒`}
+                        value={baseVal}
                         options={BASE_TIME_OPTIONS}
                         disabled={!canEdit}
                         open={openSelect === 'base'}
@@ -2859,6 +3007,7 @@ export default function LanBattleScreen() {
                       <SettingSelect
                         label="步时"
                         valueText={TURN_TIME_OPTIONS.find(o => o.value === turnVal)?.label ?? `${turnVal}秒`}
+                        value={turnVal}
                         options={TURN_TIME_OPTIONS}
                         disabled={!canEdit}
                         open={openSelect === 'turn'}
@@ -2870,6 +3019,7 @@ export default function LanBattleScreen() {
                       <SettingSelect
                         label="加秒"
                         valueText={baseVal === 0 ? '不限时' : (INCREMENT_OPTIONS.find(o => o.value === incVal)?.label ?? `${incVal}秒`)}
+                        value={baseVal === 0 ? -1 : incVal}
                         options={INCREMENT_OPTIONS}
                         disabled={!canEdit || baseVal === 0 || byoVal > 0}
                         open={openSelect === 'inc'}
@@ -2879,6 +3029,7 @@ export default function LanBattleScreen() {
                       <SettingSelect
                         label="读秒"
                         valueText={baseVal === 0 ? '不限时' : (BYOYOMI_OPTIONS.find(o => o.value === byoVal)?.label ?? `${byoVal}秒`)}
+                        value={baseVal === 0 ? -1 : byoVal}
                         options={BYOYOMI_OPTIONS}
                         disabled={!canEdit || baseVal === 0 || incVal > 0}
                         open={openSelect === 'byo'}

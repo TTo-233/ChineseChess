@@ -201,8 +201,16 @@ export function isMoveKingSafe(
  * 这些非将子，敌方将/帅不在扫描区间内 —— 所以"将帅照面"在这里不算被将军。
  * 照面由 afterMoveStillJiangJun 的飞将段单独判定（走子后），或由 AIEngine 的
  * areGeneralsFacing 判定。切勿在重构成统一走法生成函数时把照面并入本函数：
- * 引擎语义下"走完造成照面"的着法是**合法**的（实测走完后 isJiangJun=false、
- * hasAnyLegalMove=true），并进去会让一批合法着法凭空消失。
+ * 【R-10 · 原注释此处曾写"引擎语义下走完造成照面的着法是合法的
+ * （实测走完后 isJiangJun=false、hasAnyLegalMove=true）"，是错的，已改】
+ * 照面着法在全仓一律按**非法**处理并被拦下：
+ *   · MoveCheck.ts afterMoveStillJiangJun 的飞将段判 true；
+ *   · GameEngine.ts hasAnyLegalMove / isMoveKingSafe 据此不认；
+ *   · 服务端 ruleEngine.bundle.ts 的 getValidMoves 逐点 isMoveKingSafe 过滤掉；
+ *   · songjiang.test.ts 与 ruleEngineParity.test.ts 各有用例钉死。
+ * 原文那句"hasAnyLegalMove=true"只在"照面着法**已经落盘之后**、轮到这个局面的人
+ * 重新求着法"时才成立，与"这着着法本身合法"是两回事 —— 照面段属于
+ * afterMoveStillJiangJun，不属于本函数。
  *
  * 与 afterMoveStillJiangJun 的分工：
  *   · 本函数  = 静态判据，回答"当前这个局面谁在被将"。
@@ -214,6 +222,17 @@ export function isJiangJun(state: GameState, jiangOrShuai: number): number[] {
   const result = [-1, -1, -1];
   if (jiangOrShuai !== 0 && jiangOrShuai !== 16) return result;
 
+  // 【R-2 · P0 崩溃防护】被查的将/帅必须"在盘上"：createFromFen 对缺席子初始化
+  // { col: -1, row: -1, alive: false }，而下面用 col/row 去索引 thisPoints[x][y]
+  // 会变成 thisPoints[-1][-1] → TypeError: Cannot read properties of undefined。
+  // 畸形/缺将的残局 FEN（如 '4k4/9/9/9/4r4/9/9/9/9/9 w'）只要走到这里就会崩。
+  // 缺将局面没有"被将军"的语义，直接按未被将处理。
+  const target = state.pieces[jiangOrShuai];
+  if (!target || !target.alive) return result;
+  if (target.col < 0 || target.col >= BOARD_COLS || target.row < 0 || target.row >= BOARD_ROWS) {
+    return result;
+  }
+
   const positions = toPiecePositions(state.pieces);
 
   if (jiangOrShuai === 16) {
@@ -221,8 +240,8 @@ export function isJiangJun(state: GameState, jiangOrShuai: number): number[] {
     for (let qizi = 5; qizi <= 15; qizi++) {
       if (!state.pieces[qizi].alive) continue;
       const thisPoints = getPathPoints(qizi, state.qiPan, positions);
-      const x = state.pieces[16].col;
-      const y = state.pieces[16].row;
+      const x = target.col;
+      const y = target.row;
       if (thisPoints[x][y]) {
         result[0] = 16;
         if (result[1] === -1) result[1] = qizi;
@@ -235,8 +254,8 @@ export function isJiangJun(state: GameState, jiangOrShuai: number): number[] {
     for (let qizi = 21; qizi <= 31; qizi++) {
       if (!state.pieces[qizi].alive) continue;
       const thisPoints = getPathPoints(qizi, state.qiPan, positions);
-      const x = state.pieces[0].col;
-      const y = state.pieces[0].row;
+      const x = target.col;
+      const y = target.row;
       if (thisPoints[x][y]) {
         result[0] = 0;
         if (result[1] === -1) result[1] = qizi;
@@ -611,6 +630,29 @@ export function createFromFen(fen: string): GameState {
   let col = 0;
   let row = 0;
   const usedFen = [...FEN_CHARS];
+
+  // 【R-1 · P0 崩溃防护】下面两处 `qiPan[col][row]` 只在「行宽恰为 9、行数恰为 10」时
+  // 才安全（qiPan 外层按 BOARD_COLS 建、内层按 BOARD_ROWS 建，越界后写的是 undefined，
+  // 直接抛 `TypeError: Cannot set properties of undefined`）。畸形 FEN（'9k8/…' 之类
+  // 行宽越界、或行数不足/超出）会让 col 冲到 9 或 row 冲到 10 而崩，故先做一次整体校验：
+  //   · 不合法 → 直接返回「全空 + 红先」的初始状态，不抛异常（大量调用方没有 try/catch）。
+  //     这里选择退化而不是抛错，是为了与既有「非法字符被静默跳过」的行为保持一致，
+  //     调用方若要区分，请自行先调 isFenBoardWidthValid 预检。
+  //   · 合法   → 逐字符解析，此时 col/row 天然落在 [0,9) / [0,10) 内。
+  // 该校验此前只有 aiDispatcher.ts:349（发往服务端前自检）一个调用方，
+  // 引擎自身入口不自检 —— 任何把外部 FEN 直接喂进 createFromFen 的路径都会崩。
+  if (!isFenBoardWidthValid(boardStr)) {
+    return {
+      qiPan,
+      pieces,
+      sideTag: fenParts[1] === 'b' ? BLACK_SIDE : RED_SIDE,
+      moveHistory: [],
+      gameStatus: 'playing',
+      isCheck: false,
+      checkMessage: '',
+      zobristHash: 0,
+    };
+  }
 
   for (const c of boardStr) {
     if (c === '/') {

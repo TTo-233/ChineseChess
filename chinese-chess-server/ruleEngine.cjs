@@ -20,6 +20,7 @@ var __toCommonJS = (mod) => __copyProps(__defProp({}, "__esModule", { value: tru
 // D:\Code\ChineseChess\chinese-chess-client\client\utils\chess\ruleEngine.bundle.ts
 var ruleEngine_bundle_exports = {};
 __export(ruleEngine_bundle_exports, {
+  applyHandicap: () => applyHandicap,
   cloneGameState: () => cloneGameState,
   createInitialState: () => createInitialState,
   getSelectableMovesForParity: () => getSelectableMovesForParity,
@@ -339,24 +340,30 @@ function afterMoveStillJiangJun(qiZi, x0, y0, x1, y1, qiPan, piecePositions) {
     }
     if (!blocked) return true;
   }
+  const shuai = piecePositions[16];
+  const jiang = piecePositions[0];
+  const shuaiOffBoard = !shuai || !shuai.alive || shuai.col < 0 || shuai.col > 8 || shuai.row < 0 || shuai.row > 9;
+  const jiangOffBoard = !jiang || !jiang.alive || jiang.col < 0 || jiang.col > 8 || jiang.row < 0 || jiang.row > 9;
   for (let i = 0; i < 9; i++) {
     for (let j = 0; j < 10; j++) {
       const localQiZi = myQiPan[i][j];
       if (qiZi > 15) {
         if (localQiZi >= 5 && localQiZi <= 15) {
           if (!piecePositions[localQiZi].alive) continue;
+          if (!(qiZi === 16) && shuaiOffBoard) continue;
           const thisPoints = getPathPoints(localQiZi, myQiPan, myPositions);
-          const x = qiZi === 16 ? x1 : piecePositions[16].col;
-          const y = qiZi === 16 ? y1 : piecePositions[16].row;
+          const x = qiZi === 16 ? x1 : shuai.col;
+          const y = qiZi === 16 ? y1 : shuai.row;
           if (thisPoints[x][y]) return true;
         }
       }
       if (qiZi < 16) {
         if (localQiZi >= 21 && localQiZi <= 31) {
           if (!piecePositions[localQiZi].alive) continue;
+          if (qiZi !== 0 && jiangOffBoard) continue;
           const thisPoints = getPathPoints(localQiZi, myQiPan, myPositions);
-          const x = qiZi === 0 ? x1 : piecePositions[0].col;
-          const y = qiZi === 0 ? y1 : piecePositions[0].row;
+          const x = qiZi === 0 ? x1 : jiang.col;
+          const y = qiZi === 0 ? y1 : jiang.row;
           if (thisPoints[x][y]) return true;
         }
       }
@@ -875,6 +882,18 @@ function cloneGameState(state) {
     ruleState: state.ruleState ? cloneRuleState(state.ruleState) : void 0
   };
 }
+function applyHandicap(state, handicapIds) {
+  if (!Array.isArray(handicapIds) || handicapIds.length === 0) return state;
+  for (const id of handicapIds) {
+    const piece = state.pieces[id];
+    if (!piece || !piece.alive) continue;
+    piece.alive = false;
+    if (state.qiPan[piece.col]?.[piece.row] === id) {
+      state.qiPan[piece.col][piece.row] = -1;
+    }
+  }
+  return state;
+}
 function toPiecePositions(pieces) {
   return pieces.map((p) => ({ col: p.col, row: p.row, alive: p.alive }));
 }
@@ -908,13 +927,18 @@ function isMoveKingSafe(state, pieceId, toCol, toRow) {
 function isJiangJun(state, jiangOrShuai) {
   const result = [-1, -1, -1];
   if (jiangOrShuai !== 0 && jiangOrShuai !== 16) return result;
+  const target = state.pieces[jiangOrShuai];
+  if (!target || !target.alive) return result;
+  if (target.col < 0 || target.col >= BOARD_COLS || target.row < 0 || target.row >= BOARD_ROWS) {
+    return result;
+  }
   const positions = toPiecePositions(state.pieces);
   if (jiangOrShuai === 16) {
     for (let qizi = 5; qizi <= 15; qizi++) {
       if (!state.pieces[qizi].alive) continue;
       const thisPoints = getPathPoints(qizi, state.qiPan, positions);
-      const x = state.pieces[16].col;
-      const y = state.pieces[16].row;
+      const x = target.col;
+      const y = target.row;
       if (thisPoints[x][y]) {
         result[0] = 16;
         if (result[1] === -1) result[1] = qizi;
@@ -929,8 +953,8 @@ function isJiangJun(state, jiangOrShuai) {
     for (let qizi = 21; qizi <= 31; qizi++) {
       if (!state.pieces[qizi].alive) continue;
       const thisPoints = getPathPoints(qizi, state.qiPan, positions);
-      const x = state.pieces[0].col;
-      const y = state.pieces[0].row;
+      const x = target.col;
+      const y = target.row;
       if (thisPoints[x][y]) {
         result[0] = 0;
         if (result[1] === -1) result[1] = qizi;
@@ -1063,6 +1087,7 @@ function getValidMoves2(state, pieceId) {
 var getSelectableMovesForParity = getValidMoves;
 // Annotate the CommonJS export names for ESM import in node:
 0 && (module.exports = {
+  applyHandicap,
   cloneGameState,
   createInitialState,
   getSelectableMovesForParity,

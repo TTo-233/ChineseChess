@@ -18807,14 +18807,14 @@ var require_etag = __commonJS({
   "node_modules/.pnpm/etag@1.8.1/node_modules/etag/index.js"(exports, module) {
     "use strict";
     module.exports = etag;
-    var crypto = __require("crypto");
+    var crypto2 = __require("crypto");
     var Stats = __require("fs").Stats;
     var toString = Object.prototype.toString;
     function entitytag(entity) {
       if (entity.length === 0) {
         return '"0-2jmj7l5rSw0yVb/vlWAYkK/YBwk"';
       }
-      var hash = crypto.createHash("sha1").update(entity, "utf8").digest("base64").substring(0, 27);
+      var hash = crypto2.createHash("sha1").update(entity, "utf8").digest("base64").substring(0, 27);
       var len = typeof entity === "string" ? Buffer.byteLength(entity, "utf8") : entity.length;
       return '"' + len.toString(16) + "-" + hash + '"';
     }
@@ -21723,11 +21723,11 @@ var require_request = __commonJS({
 // node_modules/.pnpm/cookie-signature@1.0.7/node_modules/cookie-signature/index.js
 var require_cookie_signature = __commonJS({
   "node_modules/.pnpm/cookie-signature@1.0.7/node_modules/cookie-signature/index.js"(exports) {
-    var crypto = __require("crypto");
+    var crypto2 = __require("crypto");
     exports.sign = function(val, secret) {
       if ("string" !== typeof val) throw new TypeError("Cookie value must be provided as a string.");
       if (null == secret) throw new TypeError("Secret key must be provided.");
-      return val + "." + crypto.createHmac("sha256", secret).update(val).digest("base64").replace(/\=+$/, "");
+      return val + "." + crypto2.createHmac("sha256", secret).update(val).digest("base64").replace(/\=+$/, "");
     };
     exports.unsign = function(val, secret) {
       if ("string" !== typeof val) throw new TypeError("Signed cookie string must be provided.");
@@ -21736,7 +21736,7 @@ var require_cookie_signature = __commonJS({
       return sha1(mac) == sha1(val) ? str : false;
     };
     function sha1(str) {
-      return crypto.createHash("sha1").update(str).digest("hex");
+      return crypto2.createHash("sha1").update(str).digest("hex");
     }
   }
 });
@@ -26659,14 +26659,124 @@ import http from "http";
 
 // src/routes/lanGame.ts
 var import_express = __toESM(require_express2(), 1);
+import crypto from "node:crypto";
 import ruleEngine from "../ruleEngine.cjs";
+
+// src/routes/actionOutcome.ts
+var CODE_BY_STATUS = {
+  400: "bad_request",
+  401: "unauthorized",
+  403: "forbidden",
+  404: "not_found",
+  409: "conflict",
+  429: "rate_limited"
+};
+function failBody(status, message, extra = {}, code) {
+  const fallback = DEFAULT_MESSAGE_BY_STATUS[status] ?? "\u64CD\u4F5C\u88AB\u670D\u52A1\u7AEF\u62D2\u7EDD";
+  return {
+    success: false,
+    error: code ?? CODE_BY_STATUS[status] ?? (status >= 500 ? "server_error" : "bad_request"),
+    message: message || fallback,
+    ...extra
+  };
+}
+var DEFAULT_MESSAGE_BY_STATUS = {
+  400: "\u8BF7\u6C42\u4E0D\u88AB\u63A5\u53D7",
+  401: "\u8EAB\u4EFD\u6821\u9A8C\u5931\u8D25",
+  403: "\u4F60\u6CA1\u6709\u6743\u9650\u6267\u884C\u8BE5\u64CD\u4F5C",
+  404: "\u623F\u95F4\u5DF2\u4E0D\u5B58\u5728",
+  409: "\u64CD\u4F5C\u5DF2\u88AB\u5904\u7406",
+  429: "\u64CD\u4F5C\u8FC7\u4E8E\u9891\u7E41\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5",
+  500: "\u670D\u52A1\u7AEF\u6545\u969C\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5"
+};
+function actionFailure(status, message, extra = {}, code) {
+  return { status, body: failBody(status, message, extra, code) };
+}
+var lookupRoom = () => null;
+var broadcaster = () => {
+};
+function registerRoomAccess(lookup, broadcast) {
+  lookupRoom = lookup;
+  broadcaster = broadcast;
+}
+var REJECTION_SYNC_WINDOW_MS = 3e3;
+var REJECTION_SYNC_LIMIT = 8;
+function shouldSyncRejection(roomId, status, nowMs) {
+  if (status < 400 || status >= 500) return false;
+  const room = lookupRoom(roomId);
+  if (!room) return false;
+  const lastSyncAt = room.lastRejectionSyncAt || 0;
+  if (nowMs - lastSyncAt >= REJECTION_SYNC_WINDOW_MS) {
+    room.rejectionSyncCount = 0;
+    room.lastRejectionSyncAt = nowMs;
+  }
+  const count = room.rejectionSyncCount || 0;
+  if (count < REJECTION_SYNC_LIMIT) {
+    room.rejectionSyncCount = count + 1;
+    room.lastRejectionSyncAt = nowMs;
+    return true;
+  }
+  return false;
+}
+function settleActionOutcome(roomId, result) {
+  const room = lookupRoom(roomId);
+  if (result.status < 400) {
+    if (room && room.rejectionSyncCount) room.rejectionSyncCount = 0;
+    if (room) broadcaster(room);
+    return true;
+  }
+  if (shouldSyncRejection(roomId, result.status, Date.now())) {
+    if (room) broadcaster(room);
+    return true;
+  }
+  return false;
+}
+function respondAction(res, roomId, result) {
+  settleActionOutcome(roomId, result);
+  res.status(result.status).json(result.body);
+}
+
+// src/routes/lanGame.ts
 var router = import_express.default.Router();
+var SESSION_TOKEN_BYTES = 32;
+function issueSessionToken() {
+  return crypto.randomBytes(SESSION_TOKEN_BYTES).toString("base64url");
+}
+function tokenEquals(a, b) {
+  if (typeof a !== "string" || typeof b !== "string") return false;
+  if (a.length !== b.length || a.length === 0) return false;
+  return crypto.timingSafeEqual(Buffer.from(a, "utf8"), Buffer.from(b, "utf8"));
+}
+function readSessionToken(req) {
+  const header = req.headers["x-session-token"];
+  const fromHeader = Array.isArray(header) ? header[0] : header;
+  if (typeof fromHeader === "string" && fromHeader) return fromHeader;
+  const fromBody = req.body?.sessionToken;
+  if (typeof fromBody === "string" && fromBody) return fromBody;
+  const fromQuery = req.query.sessionToken;
+  return typeof fromQuery === "string" ? fromQuery : "";
+}
+function findPlayerByToken(room, token) {
+  if (!token) return null;
+  return room.players.find((p) => tokenEquals(p.sessionToken, token)) ?? null;
+}
+function FORBIDDEN(message = "\u8EAB\u4EFD\u6821\u9A8C\u5931\u8D25\uFF0C\u8BF7\u91CD\u65B0\u8FDB\u5165\u623F\u95F4") {
+  return actionFailure(403, message, {}, "forbidden");
+}
+function stripPlayerToken(player) {
+  const { sessionToken: _secret, ...rest } = player;
+  return rest;
+}
+function stripRoomTokens(room) {
+  const { players, stateHistory: _history, ...rest } = room;
+  return { ...rest, players: players.map(stripPlayerToken) };
+}
 router.use((req, _res, next) => {
   const match = req.path.match(/^\/rooms\/([^/]+)/);
-  const playerId = req.body?.playerId ?? req.query.playerId;
-  if (match && playerId) {
+  const token = readSessionToken(req);
+  if (match && token) {
     const room = rooms.get(match[1]);
-    const player = room?.players.find((p) => p.id === playerId);
+    const player = room ? findPlayerByToken(room, token) : null;
     if (player) player.lastWsAt = Date.now();
   }
   next();
@@ -26692,6 +26802,7 @@ var ACTIVE_ROOM_TTL = 2 * 60 * 60 * 1e3;
 var GC_INTERVAL = 60 * 1e3;
 var START_COUNTDOWN_MS = 3e3;
 var START_TOLERANCE_MS = 500;
+var STATE_HISTORY_MAX = 200;
 function pruneSpectators(room) {
   const now = Date.now();
   const before = room.spectators.length;
@@ -26703,33 +26814,14 @@ var roomBroadcaster = () => {
 };
 function registerRoomBroadcaster(fn) {
   roomBroadcaster = fn;
+  registerRoomAccess((id) => rooms.get(id), (r) => roomBroadcaster(r));
 }
+registerRoomAccess((id) => rooms.get(id), (r) => roomBroadcaster(r));
 var socketLivenessProbe = () => true;
 function registerSocketLivenessProbe(fn) {
   socketLivenessProbe = fn;
 }
 var WAITING_SWEEP_GRACE_MS = 30 * 1e3;
-var syncRejectionCount = 0;
-function respondAction(res, roomId, result) {
-  var rejected = result.status >= 400;
-  if (result.status < 400) {
-    syncRejectionCount = 0;
-  }
-  var roomForSync = rooms.get(roomId);
-  if (rejected && result.status < 500 && roomForSync) {
-    var nowSync = Date.now();
-    var lastSyncAt = roomForSync.lastRejectionSyncAt || 0;
-    if (nowSync - lastSyncAt >= 3e3) {
-      syncRejectionCount = 0;
-    }
-    if (syncRejectionCount < 8) {
-      syncRejectionCount += 1;
-      roomForSync.lastRejectionSyncAt = nowSync;
-      roomBroadcaster(roomForSync);
-    }
-  }
-  res.status(result.status).json(result.body);
-}
 function generateRoomId() {
   let id = "";
   do {
@@ -26784,6 +26876,13 @@ function expirePendingUndo(room) {
     changed = true;
   }
   return changed;
+}
+function clearEndedNegotiations(room) {
+  room.clockPausedAt = null;
+  room.pendingUndo = null;
+  room.undoResult = null;
+  room.pendingDraw = null;
+  room.drawResult = null;
 }
 function expirePendingDraw(room) {
   let changed = false;
@@ -26848,7 +26947,7 @@ function detectDisconnect(room) {
       room.winner = disconnectedPlayer.side === "red" ? "black" : "red";
       room.endReason = "disconnect";
       room.phase = "ended";
-      room.clockPausedAt = null;
+      clearEndedNegotiations(room);
       room.lastActivity = now;
       changed = true;
     }
@@ -26867,7 +26966,7 @@ function detectClockTimeout(room) {
   room.winner = current === "red" ? "black" : "red";
   room.endReason = "timeout";
   room.phase = "ended";
-  room.clockPausedAt = null;
+  clearEndedNegotiations(room);
   room.lastActivity = Date.now();
   return true;
 }
@@ -27002,7 +27101,7 @@ function healStaleEndedRoom(room) {
   if (!room.players.some((p) => p.id === room.hostId)) {
     transferHost(room);
   }
-  actRematch(room.id, {});
+  actRematch(room.id, {}, room.players[0].sessionToken);
   return true;
 }
 function hasCompleteSeating(room) {
@@ -27027,24 +27126,13 @@ function settleAbandonedPlayingRoom(room, leaverId) {
   room.winner = leaverSide === "red" ? "black" : "red";
   room.endReason = "leave";
   room.surrenderBy = null;
-  room.clockPausedAt = null;
+  clearEndedNegotiations(room);
   room.disconnectedPlayerId = null;
   room.disconnectTime = null;
-  room.pendingUndo = null;
-  room.undoResult = null;
-  room.pendingDraw = null;
-  room.drawResult = null;
   room.lastActivity = Date.now();
   return true;
 }
-function tryAutoStart(room) {
-  if (room.phase !== "waiting") return false;
-  if (!room.sideReveal || !room.gameStartAt) return false;
-  if (Date.now() < room.gameStartAt) return false;
-  if (room.players.length < 2) return false;
-  if (!room.players.every((p) => p.ready)) return false;
-  const sides = room.players.map((p) => p.side);
-  if (!sides.includes("red") || !sides.includes("black")) return false;
+function startPlayingRoom(room) {
   room.phase = "playing";
   room.matchId += 1;
   room.gameStartTime = Date.now();
@@ -27055,6 +27143,18 @@ function tryAutoStart(room) {
   room.players.forEach((p) => {
     p.lastHeartbeat = Date.now();
   });
+  room.gameState = ruleEngine.applyHandicap(ruleEngine.createInitialState(), room.settings.handicap);
+  room.stateHistory = [];
+}
+function tryAutoStart(room) {
+  if (room.phase !== "waiting") return false;
+  if (!room.sideReveal || !room.gameStartAt) return false;
+  if (Date.now() < room.gameStartAt) return false;
+  if (room.players.length < 2) return false;
+  if (!room.players.every((p) => p.ready)) return false;
+  const sides = room.players.map((p) => p.side);
+  if (!sides.includes("red") || !sides.includes("black")) return false;
+  startPlayingRoom(room);
   return true;
 }
 var gameTickTimer = setInterval(() => {
@@ -27109,27 +27209,28 @@ function parseHandicap(handicap) {
 router.post("/rooms", (req, res) => {
   const { playerName, playerId, turnTimeSeconds, roomName, password, baseTimeSeconds, incrementSeconds, byoyomiSeconds, handicap } = req.body;
   if (!playerName) {
-    return res.status(400).json({ error: "\u73A9\u5BB6\u540D\u79F0\u4E0D\u80FD\u4E3A\u7A7A" });
+    return res.status(400).json(failBody(400, "\u73A9\u5BB6\u540D\u79F0\u4E0D\u80FD\u4E3A\u7A7A"));
   }
   const trimmedPassword = typeof password === "string" ? password.trim() : "";
   const trimmedRoomName = typeof roomName === "string" ? roomName.trim() : "";
   if (trimmedRoomName.length > 5) {
-    return res.status(400).json({ error: "\u623F\u95F4\u540D\u6700\u957F 5 \u4E2A\u5B57\u7B26" });
+    return res.status(400).json(failBody(400, "\u623F\u95F4\u540D\u6700\u957F 5 \u4E2A\u5B57\u7B26"));
   }
   if (trimmedPassword && !/^\d{1,6}$/.test(trimmedPassword)) {
-    return res.status(400).json({ error: "\u5BC6\u7801\u9700\u4E3A 6 \u4F4D\u4EE5\u5185\u7EAF\u6570\u5B57" });
+    return res.status(400).json(failBody(400, "\u5BC6\u7801\u9700\u4E3A 6 \u4F4D\u4EE5\u5185\u7EAF\u6570\u5B57"));
   }
   const rawTurnSeconds = Number(turnTimeSeconds);
   const turnTimeLimit = Number.isFinite(rawTurnSeconds) && rawTurnSeconds > 0 ? Math.min(Math.round(rawTurnSeconds), 3600) : 0;
   const clockSettings = parseClockSettings(baseTimeSeconds, incrementSeconds, byoyomiSeconds);
   if ("error" in clockSettings) {
-    return res.status(400).json({ error: clockSettings.error });
+    return res.status(400).json(failBody(400, clockSettings.error));
   }
   const handicapIds = parseHandicap(handicap);
   if ("error" in handicapIds) {
-    return res.status(400).json({ error: handicapIds.error });
+    return res.status(400).json(failBody(400, handicapIds.error));
   }
   const roomId = generateRoomId();
+  const hostSessionToken = issueSessionToken();
   const room = {
     id: roomId,
     name: trimmedRoomName || defaultRoomName(),
@@ -27146,7 +27247,8 @@ router.post("/rooms", (req, res) => {
         lastHeartbeat: Date.now(),
         lastWsAt: Date.now(),
         undoRefusals: 0,
-        drawRefusals: 0
+        drawRefusals: 0,
+        sessionToken: hostSessionToken
       }
     ],
     gameState: null,
@@ -27183,11 +27285,13 @@ router.post("/rooms", (req, res) => {
     returnedToRoom: {},
     spectators: [],
     emojiMessages: [],
+    stateHistory: [],
+    // 【S-2】悔棋快照栈，开局时由 startPlayingRoom 重置
     createdAt: Date.now(),
     lastActivity: Date.now()
   };
   rooms.set(roomId, room);
-  res.json({ roomId, room });
+  res.json({ roomId, room: stripRoomTokens(room), sessionToken: hostSessionToken });
 });
 router.get("/rooms", (_req, res) => {
   const roomList = Array.from(rooms.values()).filter((room) => room.phase === "waiting" || room.phase === "playing").map((room) => {
@@ -27264,32 +27368,38 @@ router.post("/rooms/:roomId/join", (req, res) => {
   const { roomId } = req.params;
   const { playerName, playerId, password } = req.body;
   if (!playerName) {
-    return res.status(400).json({ success: false, message: "\u73A9\u5BB6\u540D\u79F0\u4E0D\u80FD\u4E3A\u7A7A" });
+    return res.status(400).json(failBody(400, "\u73A9\u5BB6\u540D\u79F0\u4E0D\u80FD\u4E3A\u7A7A"));
   }
   const room = rooms.get(roomId);
   if (!room) {
-    return res.status(404).json({ success: false, message: "\u623F\u95F4\u4E0D\u5B58\u5728\u6216\u5DF2\u5173\u95ED" });
+    return res.status(404).json(failBody(404, "\u623F\u95F4\u4E0D\u5B58\u5728\u6216\u5DF2\u5173\u95ED"));
   }
   const existing = room.players.find((p) => p.id === playerId);
   if (existing) {
     existing.name = playerName;
     existing.connected = true;
     existing.lastHeartbeat = Date.now();
-    return res.json({ success: true, room, player: existing });
+    existing.sessionToken = issueSessionToken();
+    return res.json({
+      success: true,
+      room: stripRoomTokens(room),
+      player: stripPlayerToken(existing),
+      sessionToken: existing.sessionToken
+    });
   }
   if (room.players.length >= 2) {
-    return res.status(400).json({ success: false, message: "\u623F\u95F4\u5DF2\u6EE1" });
+    return res.status(400).json(failBody(400, "\u623F\u95F4\u5DF2\u6EE1"));
   }
   if (room.phase !== "waiting") {
-    return res.status(400).json({ success: false, message: "\u8BE5\u623F\u95F4\u5BF9\u5C40\u5DF2\u5F00\u59CB" });
+    return res.status(400).json(failBody(400, "\u8BE5\u623F\u95F4\u5BF9\u5C40\u5DF2\u5F00\u59CB"));
   }
   if (room.password) {
     const inputPassword = typeof password === "string" ? password.trim() : "";
     if (!inputPassword) {
-      return res.status(401).json({ success: false, message: "\u8BE5\u623F\u95F4\u9700\u8981\u5BC6\u7801", needPassword: true });
+      return res.status(401).json(failBody(401, "\u8BE5\u623F\u95F4\u9700\u8981\u5BC6\u7801", { needPassword: true }));
     }
     if (inputPassword !== room.password) {
-      return res.status(401).json({ success: false, message: "\u623F\u95F4\u5BC6\u7801\u9519\u8BEF", needPassword: true });
+      return res.status(401).json(failBody(401, "\u623F\u95F4\u5BC6\u7801\u9519\u8BEF", { needPassword: true }));
     }
   }
   const player = {
@@ -27302,17 +27412,24 @@ router.post("/rooms/:roomId/join", (req, res) => {
     lastHeartbeat: Date.now(),
     lastWsAt: Date.now(),
     undoRefusals: 0,
-    drawRefusals: 0
+    drawRefusals: 0,
+    sessionToken: issueSessionToken()
+    // 【S-1】加入即签发
   };
   room.players.push(player);
   room.lastActivity = Date.now();
-  res.json({ success: true, room, player });
+  res.json({
+    success: true,
+    room: stripRoomTokens(room),
+    player: stripPlayerToken(player),
+    sessionToken: player.sessionToken
+  });
 });
 router.get("/rooms/:roomId", (req, res) => {
   const { roomId } = req.params;
   const room = rooms.get(roomId);
   if (!room) {
-    return res.status(404).json({ error: "\u623F\u95F4\u4E0D\u5B58\u5728" });
+    return res.status(404).json(failBody(404, "\u623F\u95F4\u4E0D\u5B58\u5728"));
   }
   res.json({
     room: {
@@ -27350,35 +27467,36 @@ router.get("/rooms/:roomId", (req, res) => {
 });
 router.patch("/rooms/:roomId/settings", (req, res) => {
   const { roomId } = req.params;
-  const { playerId, name, password, turnTimeSeconds, baseTimeSeconds, incrementSeconds, byoyomiSeconds, handicap } = req.body;
+  const { name, password, turnTimeSeconds, baseTimeSeconds, incrementSeconds, byoyomiSeconds, handicap } = req.body;
   const room = rooms.get(roomId);
   if (!room) {
-    return res.status(404).json({ error: "\u623F\u95F4\u4E0D\u5B58\u5728" });
+    return res.status(404).json(failBody(404, "\u623F\u95F4\u4E0D\u5B58\u5728"));
   }
   if (room.phase !== "waiting") {
-    return res.status(400).json({ error: "\u5BF9\u5C40\u5DF2\u5F00\u59CB\uFF0C\u65E0\u6CD5\u4FEE\u6539\u623F\u95F4\u8BBE\u7F6E" });
+    return res.status(400).json(failBody(400, "\u5BF9\u5C40\u5DF2\u5F00\u59CB\uFF0C\u65E0\u6CD5\u4FEE\u6539\u623F\u95F4\u8BBE\u7F6E"));
   }
-  if (room.players[0]?.id !== playerId) {
-    return res.status(403).json({ error: "\u4EC5\u623F\u4E3B\u53EF\u4FEE\u6539\u623F\u95F4\u8BBE\u7F6E" });
+  const actor = findPlayerByToken(room, readSessionToken(req));
+  if (!actor || actor.id !== room.hostId) {
+    return res.status(403).json(failBody(403, "\u4EC5\u623F\u4E3B\u53EF\u4FEE\u6539\u623F\u95F4\u8BBE\u7F6E"));
   }
   if (name !== void 0) {
     const trimmed = String(name).trim();
     if (!trimmed || trimmed.length > 5) {
-      return res.status(400).json({ error: "\u623F\u95F4\u540D\u9700\u4E3A 1~5 \u4E2A\u5B57\u7B26" });
+      return res.status(400).json(failBody(400, "\u623F\u95F4\u540D\u9700\u4E3A 1~5 \u4E2A\u5B57\u7B26"));
     }
     room.name = trimmed;
   }
   if (password !== void 0) {
     const pwd = String(password ?? "").trim();
     if (pwd && !/^\d{1,6}$/.test(pwd)) {
-      return res.status(400).json({ error: "\u5BC6\u7801\u9700\u4E3A 6 \u4F4D\u4EE5\u5185\u7EAF\u6570\u5B57" });
+      return res.status(400).json(failBody(400, "\u5BC6\u7801\u9700\u4E3A 6 \u4F4D\u4EE5\u5185\u7EAF\u6570\u5B57"));
     }
     room.password = pwd || null;
   }
   if (turnTimeSeconds !== void 0) {
     const secs = Number(turnTimeSeconds);
     if (!Number.isFinite(secs) || secs < 0 || secs > 3600) {
-      return res.status(400).json({ error: "\u9650\u65F6\u9700\u5728 0~3600 \u79D2\u4E4B\u95F4\uFF080=\u4E0D\u9650\u65F6\uFF09" });
+      return res.status(400).json(failBody(400, "\u9650\u65F6\u9700\u5728 0~3600 \u79D2\u4E4B\u95F4\uFF080=\u4E0D\u9650\u65F6\uFF09"));
     }
     room.settings.turnTimeLimit = Math.round(secs);
   }
@@ -27389,7 +27507,7 @@ router.patch("/rooms/:roomId/settings", (req, res) => {
       byoyomiSeconds !== void 0 ? byoyomiSeconds : room.settings.byoyomiSeconds
     );
     if ("error" in parsed) {
-      return res.status(400).json({ error: parsed.error });
+      return res.status(400).json(failBody(400, parsed.error));
     }
     room.settings.baseTimeSeconds = parsed.baseTimeSeconds;
     room.settings.incrementSeconds = parsed.incrementSeconds;
@@ -27398,7 +27516,7 @@ router.patch("/rooms/:roomId/settings", (req, res) => {
   if (handicap !== void 0) {
     const parsed = parseHandicap(handicap);
     if ("error" in parsed) {
-      return res.status(400).json({ error: parsed.error });
+      return res.status(400).json(failBody(400, parsed.error));
     }
     room.settings.handicap = parsed.ids;
   }
@@ -27421,30 +27539,30 @@ router.patch("/rooms/:roomId/settings", (req, res) => {
     serverNow: Date.now()
   });
 });
-function actSide(roomId, body) {
-  const { playerId, side } = body;
+function actSide(roomId, body, sessionToken) {
+  const { side } = body;
   const room = rooms.get(roomId);
   if (!room) {
-    return { status: 404, body: { success: false, message: "\u623F\u95F4\u4E0D\u5B58\u5728" } };
+    return actionFailure(404, "\u623F\u95F4\u4E0D\u5B58\u5728");
   }
   if (room.phase !== "waiting") {
-    return { status: 400, body: { success: false, message: "\u5BF9\u5C40\u5DF2\u5F00\u59CB" } };
+    return actionFailure(400, "\u5BF9\u5C40\u5DF2\u5F00\u59CB");
   }
   if (room.settings.handicap.length > 0) {
-    return { status: 400, body: { success: false, message: "\u8BA9\u5B50\u5BF9\u5C40\u7531\u623F\u4E3B\u6267\u7EA2\u5148\u884C\uFF0C\u65E0\u9700\u9009\u8FB9" } };
+    return actionFailure(400, "\u8BA9\u5B50\u5BF9\u5C40\u7531\u623F\u4E3B\u6267\u7EA2\u5148\u884C\uFF0C\u65E0\u9700\u9009\u8FB9");
   }
   if (side !== "red" && side !== "black") {
-    return { status: 400, body: { success: false, message: "\u6267\u68CB\u65B9\u53EA\u80FD\u662F red \u6216 black" } };
+    return actionFailure(400, "\u6267\u68CB\u65B9\u53EA\u80FD\u662F red \u6216 black");
   }
-  const player = room.players.find((p) => p.id === playerId);
+  const player = findPlayerByToken(room, sessionToken);
   if (!player) {
-    return { status: 404, body: { success: false, message: "\u73A9\u5BB6\u4E0D\u5728\u623F\u95F4\u4E2D" } };
+    return FORBIDDEN();
   }
   if (room.players.length < 2 || !room.players.every((p) => p.ready)) {
-    return { status: 400, body: { success: false, message: "\u53CC\u65B9\u5747\u51C6\u5907\u540E\u624D\u80FD\u9009\u8FB9" } };
+    return actionFailure(400, "\u53CC\u65B9\u5747\u51C6\u5907\u540E\u624D\u80FD\u9009\u8FB9");
   }
   if (room.sideReveal) {
-    return { status: 400, body: { success: false, message: "\u6267\u68CB\u7ED3\u679C\u5DF2\u516C\u793A\uFF0C\u4E0D\u80FD\u66F4\u6539" } };
+    return actionFailure(400, "\u6267\u68CB\u7ED3\u679C\u5DF2\u516C\u793A\uFF0C\u4E0D\u80FD\u66F4\u6539");
   }
   player.sidePreference = side;
   room.lastActivity = Date.now();
@@ -27468,7 +27586,7 @@ function actSide(roomId, body) {
   return { status: 200, body: { success: true, sideAssigned: false, sidePreference: player.sidePreference } };
 }
 router.post("/rooms/:roomId/side", (req, res) => {
-  respondAction(res, req.params.roomId, actSide(req.params.roomId, req.body));
+  respondAction(res, req.params.roomId, actSide(req.params.roomId, req.body, readSessionToken(req)));
 });
 function assignSides(room) {
   const [a, b] = room.players;
@@ -27484,23 +27602,22 @@ function assignSides(room) {
   b.side = aRed ? "black" : "red";
   return true;
 }
-function actReady(roomId, body) {
-  const { playerId } = body;
+function actReady(roomId, body, sessionToken) {
   const ready = body.ready !== false;
   const room = rooms.get(roomId);
   if (!room) {
-    return { status: 404, body: { success: false, message: "\u623F\u95F4\u4E0D\u5B58\u5728" } };
+    return actionFailure(404, "\u623F\u95F4\u4E0D\u5B58\u5728");
   }
   if (room.phase !== "waiting") {
-    return { status: 400, body: { success: false, message: "\u5BF9\u5C40\u5DF2\u5F00\u59CB" } };
+    return actionFailure(400, "\u5BF9\u5C40\u5DF2\u5F00\u59CB");
   }
-  const player = room.players.find((p) => p.id === playerId);
+  const player = findPlayerByToken(room, sessionToken);
   if (!player) {
-    return { status: 404, body: { success: false, message: "\u73A9\u5BB6\u4E0D\u5728\u623F\u95F4\u4E2D" } };
+    return FORBIDDEN();
   }
   if (!ready) {
     if (room.sideReveal) {
-      return { status: 400, body: { success: false, message: "\u9009\u8FB9\u5DF2\u516C\u793A\uFF0C\u65E0\u6CD5\u53D6\u6D88\u51C6\u5907" } };
+      return actionFailure(400, "\u9009\u8FB9\u5DF2\u516C\u793A\uFF0C\u65E0\u6CD5\u53D6\u6D88\u51C6\u5907");
     }
     room.players.forEach((p) => {
       p.sidePreference = null;
@@ -27527,136 +27644,111 @@ function actReady(roomId, body) {
   };
 }
 router.post("/rooms/:roomId/ready", (req, res) => {
-  respondAction(res, req.params.roomId, actReady(req.params.roomId, req.body));
+  respondAction(res, req.params.roomId, actReady(req.params.roomId, req.body, readSessionToken(req)));
 });
-function actStart(roomId, body) {
-  const { playerId } = body;
+function actStart(roomId, _body, sessionToken) {
   const room = rooms.get(roomId);
   if (!room) {
-    return { status: 404, body: { success: false, message: "\u623F\u95F4\u4E0D\u5B58\u5728" } };
-  }
-  if (!room.players.some((p) => p.id === playerId)) {
-    return { status: 403, body: { success: false, message: "\u4EC5\u623F\u95F4\u5185\u73A9\u5BB6\u53EF\u5F00\u59CB\u5BF9\u5C40" } };
+    return actionFailure(404, "\u623F\u95F4\u4E0D\u5B58\u5728");
   }
   if (room.phase === "playing") {
     return { status: 200, body: { success: true, gameStartTime: room.gameStartTime, matchId: room.matchId, alreadyStarted: true } };
   }
+  if (!findPlayerByToken(room, sessionToken)) {
+    return FORBIDDEN();
+  }
   if (room.players.length < 2) {
-    return { status: 400, body: { success: false, message: "\u73A9\u5BB6\u672A\u9F50\uFF0C\u65E0\u6CD5\u5F00\u5C40" } };
+    return actionFailure(400, "\u73A9\u5BB6\u672A\u9F50\uFF0C\u65E0\u6CD5\u5F00\u5C40");
   }
   if (!room.players.every((p) => p.ready)) {
-    return { status: 400, body: { success: false, message: "\u5C1A\u6709\u73A9\u5BB6\u672A\u51C6\u5907\uFF0C\u65E0\u6CD5\u5F00\u5C40" } };
+    return actionFailure(400, "\u5C1A\u6709\u73A9\u5BB6\u672A\u51C6\u5907\uFF0C\u65E0\u6CD5\u5F00\u5C40");
   }
   const sides = room.players.map((p) => p.side);
   if (!sides.includes("red") || !sides.includes("black")) {
-    return { status: 400, body: { success: false, message: "\u9635\u8425\u672A\u5206\u914D\u5B8C\u6574\uFF0C\u65E0\u6CD5\u5F00\u5C40" } };
+    return actionFailure(400, "\u9635\u8425\u672A\u5206\u914D\u5B8C\u6574\uFF0C\u65E0\u6CD5\u5F00\u5C40");
   }
   if (!room.sideReveal || !room.gameStartAt) {
-    return { status: 400, body: { success: false, message: "\u5F00\u5C40\u5DF2\u53D6\u6D88\uFF0C\u65E0\u6CD5\u5F00\u59CB\u5BF9\u5C40" } };
+    return actionFailure(400, "\u5F00\u5C40\u5DF2\u53D6\u6D88\uFF0C\u65E0\u6CD5\u5F00\u59CB\u5BF9\u5C40");
   }
   if (Date.now() < room.gameStartAt - START_TOLERANCE_MS) {
-    return { status: 400, body: { success: false, message: "\u5F00\u5C40\u65F6\u523B\u672A\u5230\uFF0C\u8BF7\u7A0D\u5019" } };
+    return actionFailure(400, "\u5F00\u5C40\u65F6\u523B\u672A\u5230\uFF0C\u8BF7\u7A0D\u5019");
   }
-  room.phase = "playing";
-  room.matchId += 1;
-  room.gameStartTime = Date.now();
-  room.gameStartAt = null;
-  room.lastMoveTime = Date.now();
-  room.lastActivity = Date.now();
-  room.clocks = room.settings.baseTimeSeconds > 0 ? { red: room.settings.baseTimeSeconds * 1e3, black: room.settings.baseTimeSeconds * 1e3 } : null;
-  room.players.forEach((p) => {
-    p.lastHeartbeat = Date.now();
-  });
+  startPlayingRoom(room);
   return { status: 200, body: { success: true, gameStartTime: room.gameStartTime, matchId: room.matchId } };
 }
 router.post("/rooms/:roomId/start", (req, res) => {
-  respondAction(res, req.params.roomId, actStart(req.params.roomId, req.body));
+  respondAction(res, req.params.roomId, actStart(req.params.roomId, req.body, readSessionToken(req)));
 });
-function actMove(roomId, body) {
+function actMove(roomId, body, sessionToken) {
   const room = rooms.get(roomId);
   if (!room) {
-    return { status: 404, body: { error: "\u623F\u95F4\u4E0D\u5B58\u5728" } };
+    return actionFailure(404, "\u623F\u95F4\u4E0D\u5B58\u5728");
   }
-  if (body && body.move && typeof body.move === "object") {
-    const { playerId, move } = body;
-    if (room.phase !== "playing" || !room.gameState) {
-      return { status: 400, body: { success: false, message: "\u5BF9\u5C40\u672A\u5728\u8FDB\u884C\u4E2D" } };
+  if (!body || !body.move || typeof body.move !== "object") {
+    return actionFailure(400, "\u4EC5\u63A5\u53D7 { move: { pieceId, toCol, toRow } }\uFF0C\u4E0D\u518D\u652F\u6301\u5B8C\u6574\u5C40\u9762\u4E0A\u4F20");
+  }
+  const { move } = body;
+  if (room.phase !== "playing" || !room.gameState) {
+    return actionFailure(400, "\u5BF9\u5C40\u672A\u5728\u8FDB\u884C\u4E2D");
+  }
+  const player = findPlayerByToken(room, sessionToken);
+  if (!player || !player.side) {
+    return player ? actionFailure(400, "\u5C1A\u672A\u5206\u914D\u9635\u8425") : FORBIDDEN();
+  }
+  const mySide = player.side;
+  const state = room.gameState;
+  const stateSideIsRed = state.sideTag === true || state.sideTag === "red";
+  if (stateSideIsRed !== (mySide === "red")) {
+    return actionFailure(400, "\u4E0D\u662F\u4F60\u7684\u56DE\u5408");
+  }
+  const { pieceId, toCol, toRow } = move;
+  if (!Number.isInteger(pieceId) || !Number.isInteger(toCol) || !Number.isInteger(toRow)) {
+    return actionFailure(400, "\u7740\u6CD5\u683C\u5F0F\u9519\u8BEF");
+  }
+  if (toCol < 0 || toCol > 8 || toRow < 0 || toRow > 9) {
+    return actionFailure(400, "\u843D\u70B9\u8D85\u51FA\u68CB\u76D8\u8303\u56F4");
+  }
+  const valid = ruleEngine.getValidMoves(state, pieceId);
+  if (!valid[toCol] || !valid[toCol][toRow]) {
+    return actionFailure(400, "\u975E\u6CD5\u8D70\u6CD5");
+  }
+  const result = ruleEngine.makeMove(state, pieceId, toCol, toRow);
+  room.stateHistory.push(state);
+  if (room.stateHistory.length > STATE_HISTORY_MAX) {
+    room.stateHistory.splice(0, room.stateHistory.length - STATE_HISTORY_MAX);
+  }
+  if (room.clocks && room.lastMoveTime) {
+    const elapsed = (room.clockPausedAt ?? Date.now()) - room.lastMoveTime;
+    room.clocks[mySide] = Math.max(0, room.clocks[mySide] - elapsed) + room.settings.incrementSeconds * 1e3;
+  }
+  room.gameState = result.newState;
+  room.lastMoveTime = Date.now();
+  room.lastActivity = Date.now();
+  if (result.isGameOver) {
+    room.phase = "ended";
+    if (result.newState.gameStatus === "draw") {
+      room.winner = null;
+      room.endReason = "draw";
+    } else {
+      room.winner = result.newState.gameStatus === "red_win" ? "red" : "black";
+      room.endReason = "checkmate";
     }
-    const player = room.players.find((p) => p.id === playerId);
-    if (!player || !player.side) {
-      return { status: 400, body: { success: false, message: "\u73A9\u5BB6\u4E0D\u5728\u623F\u95F4\u4E2D\u6216\u672A\u5206\u914D\u9635\u8425" } };
-    }
-    const mySide = player.side;
-    const state = room.gameState;
-    const stateSideIsRed = state.sideTag === true || state.sideTag === "red";
-    if (stateSideIsRed !== (mySide === "red")) {
-      return { status: 400, body: { success: false, message: "\u4E0D\u662F\u4F60\u7684\u56DE\u5408" } };
-    }
-    const { pieceId, toCol, toRow } = move;
-    if (!Number.isInteger(pieceId) || !Number.isInteger(toCol) || !Number.isInteger(toRow)) {
-      return { status: 400, body: { success: false, message: "\u7740\u6CD5\u683C\u5F0F\u9519\u8BEF" } };
-    }
-    const valid = ruleEngine.getValidMoves(state, pieceId);
-    if (!valid[toCol] || !valid[toCol][toRow]) {
-      return { status: 400, body: { success: false, message: "\u975E\u6CD5\u8D70\u6CD5" } };
-    }
-    const result = ruleEngine.makeMove(state, pieceId, toCol, toRow);
-    if (room.clocks && room.lastMoveTime) {
-      const elapsed = (room.clockPausedAt ?? Date.now()) - room.lastMoveTime;
-      room.clocks[mySide] = Math.max(0, room.clocks[mySide] - elapsed) + room.settings.incrementSeconds * 1e3;
-    }
-    room.gameState = result.newState;
-    room.lastMoveTime = Date.now();
+    clearEndedNegotiations(room);
+  } else {
     room.clockPausedAt = null;
-    room.lastActivity = Date.now();
     room.pendingUndo = null;
     room.pendingDraw = null;
-    if (result.isGameOver) {
-      room.phase = "ended";
-      if (result.newState.gameStatus === "draw") {
-        room.winner = null;
-        room.endReason = "draw";
-      } else {
-        room.winner = result.newState.gameStatus === "red_win" ? "red" : "black";
-        room.endReason = "checkmate";
-      }
-    }
-    return { status: 200, body: { success: true } };
   }
-  const { gameState, gameOver, winner } = body;
-  const prevMoveCount = Array.isArray(room.gameState?.moveHistory) ? room.gameState.moveHistory.length : 0;
-  const nextMoveCount = Array.isArray(gameState?.moveHistory) ? gameState.moveHistory.length : 0;
-  var uploader = room.players && room.players.find(function(p) {
-    return p.id === body.playerId;
-  });
-  if (!uploader) {
-    return { status: 403, body: { success: false, error: "forbidden", message: "\u4EC5\u623F\u95F4\u5185\u73A9\u5BB6\u53EF\u4E0A\u4F20\u521D\u59CB\u5C40\u9762" } };
-  }
-  if (prevMoveCount !== 0 || nextMoveCount !== 0) {
-    return { status: 403, body: { success: false, error: "forbidden", message: "\u672C\u5C40\u5DF2\u4EA7\u751F\u7740\u6CD5\uFF0C\u4E0D\u63A5\u53D7\u5B8C\u6574\u5C40\u9762\u4E0A\u4F20" } };
-  }
-  if (room.clocks && nextMoveCount > prevMoveCount && room.lastMoveTime) {
-    const nextSideTag = gameState.sideTag;
-    const mover = nextSideTag === true || nextSideTag === "red" ? "black" : "red";
-    const elapsed = (room.clockPausedAt ?? Date.now()) - room.lastMoveTime;
-    room.clocks[mover] = Math.max(0, room.clocks[mover] - elapsed) + room.settings.incrementSeconds * 1e3;
-  }
-  room.gameState = gameState;
-  room.lastMoveTime = Date.now();
-  room.clockPausedAt = null;
-  room.lastActivity = Date.now();
-  room.pendingUndo = null;
-  room.pendingDraw = null;
   return { status: 200, body: { success: true } };
 }
-router.post("/rooms/:roomId/gameState", (req, res) => {
-  respondAction(res, req.params.roomId, actMove(req.params.roomId, req.body));
+router.post("/rooms/:roomId/move", (req, res) => {
+  respondAction(res, req.params.roomId, actMove(req.params.roomId, req.body, readSessionToken(req)));
 });
 router.get("/rooms/:roomId/gameState", (req, res) => {
   const { roomId } = req.params;
   const room = rooms.get(roomId);
   if (!room) {
-    return res.status(404).json({ error: "\u623F\u95F4\u4E0D\u5B58\u5728" });
+    return res.status(404).json(failBody(404, "\u623F\u95F4\u4E0D\u5B58\u5728"));
   }
   expirePendingUndo(room);
   expirePendingDraw(room);
@@ -27670,16 +27762,16 @@ router.post("/rooms/:roomId/spectate", (req, res) => {
   const { spectatorId, spectatorName } = req.body;
   const room = rooms.get(roomId);
   if (!room) {
-    return res.status(404).json({ success: false, message: "\u623F\u95F4\u4E0D\u5B58\u5728" });
+    return res.status(404).json(failBody(404, "\u623F\u95F4\u4E0D\u5B58\u5728"));
   }
   if (!spectatorId) {
-    return res.status(400).json({ success: false, message: "\u7F3A\u5C11\u89C2\u6218\u8005\u6807\u8BC6" });
+    return res.status(400).json(failBody(400, "\u7F3A\u5C11\u89C2\u6218\u8005\u6807\u8BC6"));
   }
   if (room.phase === "waiting") {
-    return res.status(400).json({ success: false, message: "\u5BF9\u5C40\u5C1A\u672A\u5F00\u59CB\uFF0C\u6682\u65E0\u6CD5\u89C2\u6218" });
+    return res.status(400).json(failBody(400, "\u5BF9\u5C40\u5C1A\u672A\u5F00\u59CB\uFF0C\u6682\u65E0\u6CD5\u89C2\u6218"));
   }
   if (!hasCompleteSeating(room)) {
-    return res.status(400).json({ success: false, message: "\u5BF9\u5C40\u5DF2\u6709\u73A9\u5BB6\u79BB\u5F00\uFF0C\u89C2\u6218\u5DF2\u7ED3\u675F" });
+    return res.status(400).json(failBody(400, "\u5BF9\u5C40\u5DF2\u6709\u73A9\u5BB6\u79BB\u5F00\uFF0C\u89C2\u6218\u5DF2\u7ED3\u675F"));
   }
   pruneSpectators(room);
   const name = typeof spectatorName === "string" && spectatorName.trim() ? spectatorName.trim().slice(0, 16) : "\u89C2\u4F17";
@@ -27709,7 +27801,7 @@ router.post("/rooms/:roomId/spectate/heartbeat", (req, res) => {
   const { spectatorId } = req.body;
   const room = rooms.get(roomId);
   if (!room) {
-    return res.status(404).json({ success: false, message: "\u623F\u95F4\u4E0D\u5B58\u5728" });
+    return res.status(404).json(failBody(404, "\u623F\u95F4\u4E0D\u5B58\u5728"));
   }
   pruneSpectators(room);
   const existing = room.spectators.find((s) => s.id === spectatorId);
@@ -27723,45 +27815,47 @@ router.post("/rooms/:roomId/spectate/leave", (req, res) => {
   const { spectatorId } = req.body;
   const room = rooms.get(roomId);
   if (!room) {
-    return res.status(404).json({ success: false, message: "\u623F\u95F4\u4E0D\u5B58\u5728" });
+    return res.status(404).json(failBody(404, "\u623F\u95F4\u4E0D\u5B58\u5728"));
   }
   room.spectators = room.spectators.filter((s) => s.id !== spectatorId);
   res.json({ success: true, spectatorCount: room.spectators.length });
 });
-function actSurrender(roomId, body) {
-  const { playerId } = body;
+function actSurrender(roomId, _body, sessionToken) {
   const room = rooms.get(roomId);
   if (!room) {
-    return { status: 404, body: { success: false, message: "\u623F\u95F4\u4E0D\u5B58\u5728" } };
+    return actionFailure(404, "\u623F\u95F4\u4E0D\u5B58\u5728");
   }
   if (room.phase !== "playing") {
-    return { status: 400, body: { success: false, message: "\u5BF9\u5C40\u672A\u5728\u8FDB\u884C\u4E2D" } };
+    return actionFailure(400, "\u5BF9\u5C40\u672A\u5728\u8FDB\u884C\u4E2D");
   }
-  const player = room.players.find((p) => p.id === playerId);
+  const player = findPlayerByToken(room, sessionToken);
   if (!player) {
-    return { status: 404, body: { success: false, message: "\u73A9\u5BB6\u4E0D\u5728\u623F\u95F4\u4E2D" } };
+    return FORBIDDEN();
   }
   const winnerSide = player.side === "red" ? "black" : "red";
   room.winner = winnerSide;
-  room.surrenderBy = playerId;
+  room.surrenderBy = player.id;
   room.endReason = "resign";
   room.phase = "ended";
-  room.clockPausedAt = null;
+  clearEndedNegotiations(room);
   room.lastActivity = Date.now();
   const duration = room.gameStartTime ? Date.now() - room.gameStartTime : 0;
   const moveCount = room.gameState?.moveHistory?.length || 0;
   return {
     status: 200,
-    body: { success: true, winner: winnerSide, surrenderBy: playerId, duration, moveCount }
+    body: { success: true, winner: winnerSide, surrenderBy: player.id, duration, moveCount }
   };
 }
 router.post("/rooms/:roomId/surrender", (req, res) => {
-  respondAction(res, req.params.roomId, actSurrender(req.params.roomId, req.body));
+  respondAction(res, req.params.roomId, actSurrender(req.params.roomId, req.body, readSessionToken(req)));
 });
-function actRematch(roomId, _body) {
+function actRematch(roomId, _body, sessionToken) {
   const room = rooms.get(roomId);
   if (!room) {
-    return { status: 404, body: { success: false, message: "\u623F\u95F4\u4E0D\u5B58\u5728" } };
+    return actionFailure(404, "\u623F\u95F4\u4E0D\u5B58\u5728");
+  }
+  if (!findPlayerByToken(room, sessionToken)) {
+    return FORBIDDEN();
   }
   if (room.phase !== "ended") {
     return { status: 200, body: { success: true } };
@@ -27772,19 +27866,16 @@ function actRematch(roomId, _body) {
   room.gameStartAt = null;
   room.clocks = null;
   room.lastMoveTime = null;
-  room.clockPausedAt = null;
+  clearEndedNegotiations(room);
   room.winner = null;
   room.surrenderBy = null;
   room.endReason = null;
   room.disconnectedPlayerId = null;
   room.disconnectTime = null;
-  room.pendingUndo = null;
-  room.undoResult = null;
-  room.pendingDraw = null;
-  room.drawResult = null;
   room.sideReveal = null;
   room.emojiMessages = [];
   room.returnedToRoom = {};
+  room.stateHistory = [];
   room.players.forEach((p) => {
     p.ready = false;
     p.side = null;
@@ -27798,24 +27889,23 @@ function actRematch(roomId, _body) {
   return { status: 200, body: { success: true } };
 }
 router.post("/rooms/:roomId/rematch", (req, res) => {
-  respondAction(res, req.params.roomId, actRematch(req.params.roomId, req.body));
+  respondAction(res, req.params.roomId, actRematch(req.params.roomId, req.body, readSessionToken(req)));
 });
-function actReturnToRoom(roomId, body) {
-  const { playerId } = body;
+function actReturnToRoom(roomId, _body, sessionToken) {
   const room = rooms.get(roomId);
   if (!room) {
-    return { status: 404, body: { success: false, message: "\u623F\u95F4\u4E0D\u5B58\u5728" } };
+    return actionFailure(404, "\u623F\u95F4\u4E0D\u5B58\u5728");
   }
-  const player = room.players.find((p) => p.id === playerId);
+  const player = findPlayerByToken(room, sessionToken);
   if (!player) {
-    return { status: 404, body: { success: false, message: "\u73A9\u5BB6\u4E0D\u5728\u623F\u95F4\u4E2D" } };
+    return FORBIDDEN();
   }
   if (room.phase !== "ended") {
     return { status: 200, body: { success: true, phase: room.phase } };
   }
   if (!room.returnedToRoom) room.returnedToRoom = {};
-  actRematch(roomId, {});
-  room.returnedToRoom[playerId] = Date.now();
+  actRematch(roomId, {}, sessionToken);
+  room.returnedToRoom[player.id] = Date.now();
   return { status: 200, body: { success: true, phase: room.phase } };
 }
 var RETURNED_GRACE_MS = 30 * 1e3;
@@ -27835,31 +27925,30 @@ function expireReturnedPlayers(room, now) {
   return changed;
 }
 router.post("/rooms/:roomId/returnToRoom", (req, res) => {
-  respondAction(res, req.params.roomId, actReturnToRoom(req.params.roomId, req.body));
+  respondAction(res, req.params.roomId, actReturnToRoom(req.params.roomId, req.body, readSessionToken(req)));
 });
-function actUndo(roomId, body) {
-  const { playerId, proposedState } = body;
+function actUndo(roomId, _body, sessionToken) {
   const room = rooms.get(roomId);
   if (!room) {
-    return { status: 404, body: { success: false, message: "\u623F\u95F4\u4E0D\u5B58\u5728" } };
+    return actionFailure(404, "\u623F\u95F4\u4E0D\u5B58\u5728");
   }
   if (room.phase !== "playing") {
-    return { status: 400, body: { success: false, message: "\u5BF9\u5C40\u672A\u5728\u8FDB\u884C\u4E2D" } };
+    return actionFailure(400, "\u5BF9\u5C40\u672A\u5728\u8FDB\u884C\u4E2D");
   }
-  const player = room.players.find((p) => p.id === playerId);
+  const player = findPlayerByToken(room, sessionToken);
   if (!player) {
-    return { status: 404, body: { success: false, message: "\u73A9\u5BB6\u4E0D\u5728\u623F\u95F4\u4E2D" } };
-  }
-  if (!proposedState) {
-    return { status: 400, body: { success: false, message: "\u7F3A\u5C11\u6094\u68CB\u76EE\u6807\u5C40\u9762" } };
+    return FORBIDDEN();
   }
   if (room.pendingUndo) {
-    return { status: 400, body: { success: false, message: "\u5DF2\u6709\u5F85\u5904\u7406\u7684\u6094\u68CB\u8BF7\u6C42" } };
+    return actionFailure(400, "\u5DF2\u6709\u5F85\u5904\u7406\u7684\u6094\u68CB\u8BF7\u6C42");
   }
   if (player.undoRefusals >= MAX_NEGOTIATION_REFUSALS) {
-    return { status: 400, body: { success: false, message: "\u5BF9\u65B9\u5DF2\u8FDE\u7EED\u62D2\u7EDD 2 \u6B21\uFF0C\u672C\u5C40\u4E0D\u80FD\u518D\u53D1\u8D77\u6094\u68CB" } };
+    return actionFailure(400, "\u5BF9\u65B9\u5DF2\u8FDE\u7EED\u62D2\u7EDD 2 \u6B21\uFF0C\u672C\u5C40\u4E0D\u80FD\u518D\u53D1\u8D77\u6094\u68CB");
   }
-  room.pendingUndo = { playerId, proposedState, requestTime: Date.now() };
+  if (!room.stateHistory || room.stateHistory.length === 0) {
+    return actionFailure(400, "\u6CA1\u6709\u53EF\u56DE\u9000\u7684\u7740\u6CD5");
+  }
+  room.pendingUndo = { playerId: player.id, requestTime: Date.now() };
   room.undoResult = null;
   pauseClock(room);
   room.lastActivity = Date.now();
@@ -27869,23 +27958,23 @@ function actUndo(roomId, body) {
   };
 }
 router.post("/rooms/:roomId/undo", (req, res) => {
-  respondAction(res, req.params.roomId, actUndo(req.params.roomId, req.body));
+  respondAction(res, req.params.roomId, actUndo(req.params.roomId, req.body, readSessionToken(req)));
 });
-function actUndoResponse(roomId, body) {
-  const { playerId, agreed } = body;
+function actUndoResponse(roomId, body, sessionToken) {
+  const { agreed } = body;
   const room = rooms.get(roomId);
   if (!room) {
-    return { status: 404, body: { success: false, message: "\u623F\u95F4\u4E0D\u5B58\u5728" } };
+    return actionFailure(404, "\u623F\u95F4\u4E0D\u5B58\u5728");
+  }
+  const responder = findPlayerByToken(room, sessionToken);
+  if (!responder) {
+    return FORBIDDEN("\u4EC5\u623F\u95F4\u5185\u73A9\u5BB6\u53EF\u54CD\u5E94\u6094\u68CB\u8BF7\u6C42");
   }
   if (!room.pendingUndo) {
-    return { status: 400, body: { success: false, message: "\u6CA1\u6709\u5F85\u5904\u7406\u7684\u6094\u68CB\u8BF7\u6C42" } };
+    return actionFailure(400, "\u6CA1\u6709\u5F85\u5904\u7406\u7684\u6094\u68CB\u8BF7\u6C42");
   }
-  if (room.pendingUndo.playerId === playerId) {
-    return { status: 400, body: { success: false, message: "\u4E0D\u80FD\u54CD\u5E94\u81EA\u5DF1\u7684\u6094\u68CB\u8BF7\u6C42" } };
-  }
-  const undoResponder = room.players.find((p) => p.id === playerId);
-  if (!undoResponder) {
-    return { status: 403, body: { success: false, message: "\u4EC5\u623F\u95F4\u5185\u73A9\u5BB6\u53EF\u54CD\u5E94\u6094\u68CB\u8BF7\u6C42" } };
+  if (room.pendingUndo.playerId === responder.id) {
+    return actionFailure(400, "\u4E0D\u80FD\u54CD\u5E94\u81EA\u5DF1\u7684\u6094\u68CB\u8BF7\u6C42");
   }
   const requesterId = room.pendingUndo.playerId;
   resumeClock(room);
@@ -27894,8 +27983,26 @@ function actUndoResponse(roomId, body) {
     undoRequester.undoRefusals = agreed ? 0 : undoRequester.undoRefusals + 1;
   }
   if (agreed) {
-    room.gameState = room.pendingUndo.proposedState;
+    const UNDO_DEPTH = 2;
+    if (!room.stateHistory || room.stateHistory.length < UNDO_DEPTH) {
+      room.undoResult = {
+        playerId: requesterId,
+        agreed: false,
+        reason: "no_snapshot",
+        time: Date.now()
+      };
+      room.pendingUndo = null;
+      room.lastActivity = Date.now();
+      return actionFailure(409, "\u5DF2\u65E0\u53EF\u56DE\u9000\u7684\u7740\u6CD5");
+    }
+    const keep = room.stateHistory.length - UNDO_DEPTH;
+    room.gameState = room.stateHistory[keep];
+    room.stateHistory.length = keep;
     room.lastMoveTime = Date.now();
+    room.phase = "playing";
+    room.winner = null;
+    room.endReason = null;
+    room.surrenderBy = null;
   }
   room.undoResult = {
     playerId: requesterId,
@@ -27908,28 +28015,27 @@ function actUndoResponse(roomId, body) {
   return { status: 200, body: { success: true, agreed: !!agreed } };
 }
 router.post("/rooms/:roomId/undoResponse", (req, res) => {
-  respondAction(res, req.params.roomId, actUndoResponse(req.params.roomId, req.body));
+  respondAction(res, req.params.roomId, actUndoResponse(req.params.roomId, req.body, readSessionToken(req)));
 });
-function actDraw(roomId, body) {
-  const { playerId } = body;
+function actDraw(roomId, _body, sessionToken) {
   const room = rooms.get(roomId);
   if (!room) {
-    return { status: 404, body: { success: false, message: "\u623F\u95F4\u4E0D\u5B58\u5728" } };
+    return actionFailure(404, "\u623F\u95F4\u4E0D\u5B58\u5728");
   }
   if (room.phase !== "playing") {
-    return { status: 400, body: { success: false, message: "\u5BF9\u5C40\u672A\u5728\u8FDB\u884C\u4E2D" } };
+    return actionFailure(400, "\u5BF9\u5C40\u672A\u5728\u8FDB\u884C\u4E2D");
   }
-  const player = room.players.find((p) => p.id === playerId);
+  const player = findPlayerByToken(room, sessionToken);
   if (!player) {
-    return { status: 404, body: { success: false, message: "\u73A9\u5BB6\u4E0D\u5728\u623F\u95F4\u4E2D" } };
+    return FORBIDDEN();
   }
   if (room.pendingDraw) {
-    return { status: 400, body: { success: false, message: "\u5DF2\u6709\u5F85\u5904\u7406\u7684\u6C42\u548C\u8BF7\u6C42" } };
+    return actionFailure(400, "\u5DF2\u6709\u5F85\u5904\u7406\u7684\u6C42\u548C\u8BF7\u6C42");
   }
   if (player.drawRefusals >= MAX_NEGOTIATION_REFUSALS) {
-    return { status: 400, body: { success: false, message: "\u5BF9\u65B9\u5DF2\u8FDE\u7EED\u62D2\u7EDD 2 \u6B21\uFF0C\u672C\u5C40\u4E0D\u80FD\u518D\u53D1\u8D77\u6C42\u548C" } };
+    return actionFailure(400, "\u5BF9\u65B9\u5DF2\u8FDE\u7EED\u62D2\u7EDD 2 \u6B21\uFF0C\u672C\u5C40\u4E0D\u80FD\u518D\u53D1\u8D77\u6C42\u548C");
   }
-  room.pendingDraw = { playerId, requestTime: Date.now() };
+  room.pendingDraw = { playerId: player.id, requestTime: Date.now() };
   room.drawResult = null;
   pauseClock(room);
   room.lastActivity = Date.now();
@@ -27939,23 +28045,23 @@ function actDraw(roomId, body) {
   };
 }
 router.post("/rooms/:roomId/draw", (req, res) => {
-  respondAction(res, req.params.roomId, actDraw(req.params.roomId, req.body));
+  respondAction(res, req.params.roomId, actDraw(req.params.roomId, req.body, readSessionToken(req)));
 });
-function actDrawResponse(roomId, body) {
-  const { playerId, agreed } = body;
+function actDrawResponse(roomId, body, sessionToken) {
+  const { agreed } = body;
   const room = rooms.get(roomId);
   if (!room) {
-    return { status: 404, body: { success: false, message: "\u623F\u95F4\u4E0D\u5B58\u5728" } };
+    return actionFailure(404, "\u623F\u95F4\u4E0D\u5B58\u5728");
+  }
+  const responder = findPlayerByToken(room, sessionToken);
+  if (!responder) {
+    return FORBIDDEN("\u4EC5\u623F\u95F4\u5185\u73A9\u5BB6\u53EF\u54CD\u5E94\u6C42\u548C\u8BF7\u6C42");
   }
   if (!room.pendingDraw) {
-    return { status: 400, body: { success: false, message: "\u6CA1\u6709\u5F85\u5904\u7406\u7684\u6C42\u548C\u8BF7\u6C42" } };
+    return actionFailure(400, "\u6CA1\u6709\u5F85\u5904\u7406\u7684\u6C42\u548C\u8BF7\u6C42");
   }
-  if (room.pendingDraw.playerId === playerId) {
-    return { status: 400, body: { success: false, message: "\u4E0D\u80FD\u54CD\u5E94\u81EA\u5DF1\u7684\u6C42\u548C\u8BF7\u6C42" } };
-  }
-  const drawResponder = room.players.find((p) => p.id === playerId);
-  if (!drawResponder) {
-    return { status: 403, body: { success: false, message: "\u4EC5\u623F\u95F4\u5185\u73A9\u5BB6\u53EF\u54CD\u5E94\u6C42\u548C\u8BF7\u6C42" } };
+  if (room.pendingDraw.playerId === responder.id) {
+    return actionFailure(400, "\u4E0D\u80FD\u54CD\u5E94\u81EA\u5DF1\u7684\u6C42\u548C\u8BF7\u6C42");
   }
   const requesterId = room.pendingDraw.playerId;
   resumeClock(room);
@@ -27968,52 +28074,57 @@ function actDrawResponse(roomId, body) {
     room.surrenderBy = null;
     room.endReason = "draw";
     room.phase = "ended";
+    clearEndedNegotiations(room);
   }
-  room.drawResult = {
-    playerId: requesterId,
-    agreed: !!agreed,
-    reason: agreed ? "agreed" : "refused",
-    time: Date.now()
-  };
+  if (!agreed) {
+    room.drawResult = {
+      playerId: requesterId,
+      agreed: false,
+      reason: "refused",
+      time: Date.now()
+    };
+  } else {
+    room.drawResult = null;
+  }
   room.pendingDraw = null;
   room.lastActivity = Date.now();
   return { status: 200, body: { success: true, agreed: !!agreed } };
 }
 router.post("/rooms/:roomId/drawResponse", (req, res) => {
-  respondAction(res, req.params.roomId, actDrawResponse(req.params.roomId, req.body));
+  respondAction(res, req.params.roomId, actDrawResponse(req.params.roomId, req.body, readSessionToken(req)));
 });
-function actEmoji(roomId, body) {
-  const { playerId, emoji, id } = body;
+function actEmoji(roomId, body, sessionToken) {
+  const { emoji, id } = body;
   const room = rooms.get(roomId);
   if (!room) {
-    return { status: 404, body: { success: false, message: "\u623F\u95F4\u4E0D\u5B58\u5728" } };
+    return actionFailure(404, "\u623F\u95F4\u4E0D\u5B58\u5728");
   }
-  const player = room.players.find((p) => p.id === playerId);
+  const player = findPlayerByToken(room, sessionToken);
   if (!player) {
-    return { status: 403, body: { success: false, message: "\u4EC5\u623F\u95F4\u5185\u73A9\u5BB6\u53EF\u53D1\u9001\u8868\u60C5" } };
+    return FORBIDDEN("\u4EC5\u623F\u95F4\u5185\u73A9\u5BB6\u53EF\u53D1\u9001\u8868\u60C5");
   }
   if (!emoji || typeof emoji !== "string") {
-    return { status: 400, body: { success: false, message: "\u8868\u60C5\u5185\u5BB9\u4E0D\u80FD\u4E3A\u7A7A" } };
+    return actionFailure(400, "\u8868\u60C5\u5185\u5BB9\u4E0D\u80FD\u4E3A\u7A7A");
   }
   pruneEmojis(room);
   const emojiText = emoji.slice(0, 8);
-  const msgId = typeof id === "string" && id.trim() ? id.trim().slice(0, 64) : `${playerId}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+  const msgId = typeof id === "string" && id.trim() ? id.trim().slice(0, 64) : `${player.id}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
   if (!room.emojiMessages.some((m) => m.id === msgId)) {
-    room.emojiMessages.push({ id: msgId, playerId, emoji: emojiText, time: Date.now() });
+    room.emojiMessages.push({ id: msgId, playerId: player.id, emoji: emojiText, time: Date.now() });
   }
   room.lastActivity = Date.now();
-  return { status: 200, body: { success: true, emojiMessage: { id: msgId, playerId, emoji: emojiText } } };
+  return { status: 200, body: { success: true, emojiMessage: { id: msgId, playerId: player.id, emoji: emojiText } } };
 }
 router.post("/rooms/:roomId/emoji", (req, res) => {
-  respondAction(res, req.params.roomId, actEmoji(req.params.roomId, req.body));
+  respondAction(res, req.params.roomId, actEmoji(req.params.roomId, req.body, readSessionToken(req)));
 });
-function actHeartbeat(roomId, body) {
-  const { playerId, hidden } = body;
+function actHeartbeat(roomId, body, sessionToken) {
+  const { hidden } = body;
   const room = rooms.get(roomId);
   if (!room) {
-    return { status: 404, body: { error: "\u623F\u95F4\u4E0D\u5B58\u5728" } };
+    return actionFailure(404, "\u623F\u95F4\u4E0D\u5B58\u5728");
   }
-  const player = room.players.find((p) => p.id === playerId);
+  const player = findPlayerByToken(room, sessionToken);
   if (player) {
     const now = Date.now();
     player.lastHeartbeat = now;
@@ -28027,7 +28138,7 @@ function actHeartbeat(roomId, body) {
     if (!player.connected) {
       player.connected = true;
     }
-    if (room.disconnectedPlayerId === playerId) {
+    if (room.disconnectedPlayerId === player.id) {
       room.disconnectedPlayerId = null;
       room.disconnectTime = null;
     }
@@ -28036,24 +28147,24 @@ function actHeartbeat(roomId, body) {
   return { status: 200, body: { success: true } };
 }
 router.post("/rooms/:roomId/heartbeat", (req, res) => {
-  respondAction(res, req.params.roomId, actHeartbeat(req.params.roomId, req.body));
+  respondAction(res, req.params.roomId, actHeartbeat(req.params.roomId, req.body, readSessionToken(req)));
 });
 router.post("/rooms/:roomId/reconnect", (req, res) => {
   const { roomId } = req.params;
-  const { playerId } = req.body;
+  const sessionToken = readSessionToken(req);
   const room = rooms.get(roomId);
   if (!room) {
-    return res.status(404).json({ success: false, message: "\u623F\u95F4\u4E0D\u5B58\u5728" });
+    return res.status(404).json(failBody(404, "\u623F\u95F4\u4E0D\u5B58\u5728"));
   }
-  const player = room.players.find((p) => p.id === playerId);
+  const player = findPlayerByToken(room, sessionToken);
   if (!player) {
-    return res.status(404).json({ success: false, message: "\u73A9\u5BB6\u4E0D\u5728\u623F\u95F4\u4E2D" });
+    return res.status(403).json(failBody(403, "\u8EAB\u4EFD\u6821\u9A8C\u5931\u8D25\uFF0C\u8BF7\u91CD\u65B0\u52A0\u5165\u623F\u95F4", {}, "forbidden"));
   }
   player.connected = true;
   player.lastHeartbeat = Date.now();
   player.hidden = false;
   player.hiddenSince = 0;
-  if (room.disconnectedPlayerId === playerId) {
+  if (room.disconnectedPlayerId === player.id) {
     room.disconnectedPlayerId = null;
     room.disconnectTime = null;
   }
@@ -28068,11 +28179,16 @@ router.post("/rooms/:roomId/reconnect", (req, res) => {
 });
 router.post("/rooms/:roomId/leave", (req, res) => {
   const { roomId } = req.params;
-  const { playerId } = req.body;
+  const sessionToken = readSessionToken(req);
   const room = rooms.get(roomId);
   if (!room) {
-    return res.status(404).json({ error: "\u623F\u95F4\u4E0D\u5B58\u5728" });
+    return res.status(404).json(failBody(404, "\u623F\u95F4\u4E0D\u5B58\u5728"));
   }
+  const player = findPlayerByToken(room, sessionToken);
+  if (!player) {
+    return res.status(403).json(failBody(403, "\u8EAB\u4EFD\u6821\u9A8C\u5931\u8D25\uFF0C\u8BF7\u91CD\u65B0\u52A0\u5165\u623F\u95F4", {}, "forbidden"));
+  }
+  const playerId = player.id;
   const wasHost = room.hostId === playerId;
   const abandoned = settleAbandonedPlayingRoom(room, playerId);
   const settled = abandoned && rooms.has(roomId);
@@ -28094,7 +28210,7 @@ router.post("/rooms/:roomId/leave", (req, res) => {
       room.sideReveal = null;
       room.gameStartAt = null;
     } else if (room.phase === "ended" && !settled) {
-      actRematch(roomId, {});
+      actRematch(roomId, {}, sessionToken);
     }
   }
   if (rooms.has(roomId)) roomBroadcaster(rooms.get(roomId));
@@ -28665,6 +28781,10 @@ function sendJson(ws, data) {
     }
   }
 }
+function rejectHandshake(ws, status, message) {
+  sendJson(ws, { type: "error", ...failBody(status, message) });
+  ws.close();
+}
 function broadcastRoom(room) {
   const socks = roomSockets.get(room.id);
   if (!socks || socks.size === 0) return;
@@ -28758,7 +28878,7 @@ function handleMessage(ws, raw) {
   const meta = socketMeta.get(ws);
   if (!meta) return;
   meta.lastActivity = Date.now();
-  const { roomId, role, playerId, spectatorId } = meta;
+  const { roomId, role, playerId, spectatorId, sessionToken } = meta;
   touchPlayerWs(roomId, playerId);
   const room = rooms.get(roomId);
   if (!room) return;
@@ -28779,62 +28899,54 @@ function handleMessage(ws, raw) {
         if (existing) existing.lastSeen = Date.now();
       }
     } else {
-      actHeartbeat(roomId, { playerId, hidden: typeof msg.hidden === "boolean" ? msg.hidden : void 0 });
+      actHeartbeat(roomId, { hidden: typeof msg.hidden === "boolean" ? msg.hidden : void 0 }, sessionToken || "");
     }
     return;
   }
   if (role === "spectator") {
-    sendJson(ws, { type: "error", reqId, message: "\u89C2\u6218\u8005\u65E0\u6CD5\u6267\u884C\u8BE5\u64CD\u4F5C" });
+    sendJson(ws, { type: "error", reqId, ...failBody(403, "\u89C2\u6218\u8005\u65E0\u6CD5\u6267\u884C\u8BE5\u64CD\u4F5C") });
     return;
   }
   let result = null;
   switch (type) {
     case "ready":
-      result = actReady(roomId, { playerId, ready: msg.ready });
+      result = actReady(roomId, { ready: msg.ready }, sessionToken || "");
       break;
     case "side":
-      result = actSide(roomId, { playerId, side: msg.side });
+      result = actSide(roomId, { side: msg.side }, sessionToken || "");
       break;
     case "start":
-      result = actStart(roomId, { playerId });
+      result = actStart(roomId, {}, sessionToken || "");
       break;
     case "move":
-      result = actMove(roomId, {
-        playerId,
-        move: msg.move,
-        gameState: msg.gameState,
-        gameOver: msg.gameOver,
-        winner: msg.winner
-      });
+      result = actMove(roomId, { move: msg.move }, sessionToken || "");
       break;
     case "surrender":
-      result = actSurrender(roomId, { playerId });
+      result = actSurrender(roomId, {}, sessionToken || "");
       break;
     case "rematch":
-      result = actRematch(roomId, { playerId });
+      result = actRematch(roomId, {}, sessionToken || "");
       break;
     case "undo":
-      result = actUndo(roomId, { playerId, proposedState: msg.proposedState });
+      result = actUndo(roomId, {}, sessionToken || "");
       break;
     case "undoResponse":
-      result = actUndoResponse(roomId, { playerId, agreed: msg.agreed });
+      result = actUndoResponse(roomId, { agreed: msg.agreed }, sessionToken || "");
       break;
     case "draw":
-      result = actDraw(roomId, { playerId });
+      result = actDraw(roomId, {}, sessionToken || "");
       break;
     case "drawResponse":
-      result = actDrawResponse(roomId, { playerId, agreed: msg.agreed });
+      result = actDrawResponse(roomId, { agreed: msg.agreed }, sessionToken || "");
       break;
     case "emoji":
-      result = actEmoji(roomId, { playerId, emoji: msg.emoji, id: msg.id });
+      result = actEmoji(roomId, { emoji: msg.emoji, id: msg.id }, sessionToken || "");
       break;
     default:
-      sendJson(ws, { type: "error", reqId, message: "\u672A\u77E5\u6D88\u606F\u7C7B\u578B" });
+      sendJson(ws, { type: "error", reqId, ...failBody(400, "\u672A\u77E5\u6D88\u606F\u7C7B\u578B") });
       return;
   }
-  if (result.status < 400) {
-    broadcastRoom(room);
-  }
+  settleActionOutcome(roomId, result);
   sendJson(ws, { type: "ack", reqId, status: result.status, body: result.body });
 }
 function attachBattleWebSocket(server2) {
@@ -28842,41 +28954,38 @@ function attachBattleWebSocket(server2) {
   wss.on("connection", (ws, req) => {
     let roomId = "";
     let playerId = "";
+    let sessionToken = "";
     let spectatorId = "";
     let role = "player";
     try {
       const url = new URL(req.url || "", "http://localhost");
       roomId = url.searchParams.get("roomId") || "";
       playerId = url.searchParams.get("playerId") || "";
+      sessionToken = url.searchParams.get("sessionToken") || "";
       spectatorId = url.searchParams.get("spectatorId") || "";
       role = url.searchParams.get("role") === "spectator" ? "spectator" : "player";
     } catch {
     }
     if (!roomId) {
-      sendJson(ws, { type: "error", message: "\u7F3A\u5C11 roomId" });
-      ws.close();
+      rejectHandshake(ws, 400, "\u7F3A\u5C11 roomId");
       return;
     }
     const room = rooms.get(roomId);
     if (!room) {
-      sendJson(ws, { type: "error", message: "\u623F\u95F4\u4E0D\u5B58\u5728" });
-      ws.close();
+      rejectHandshake(ws, 404, "\u623F\u95F4\u4E0D\u5B58\u5728");
       return;
     }
     if (role === "spectator") {
       if (!spectatorId) {
-        sendJson(ws, { type: "error", message: "\u7F3A\u5C11\u89C2\u6218\u8005\u6807\u8BC6" });
-        ws.close();
+        rejectHandshake(ws, 400, "\u7F3A\u5C11\u89C2\u6218\u8005\u6807\u8BC6");
         return;
       }
       if (room.phase === "waiting") {
-        sendJson(ws, { type: "error", message: "\u5BF9\u5C40\u5C1A\u672A\u5F00\u59CB\uFF0C\u6682\u65E0\u6CD5\u89C2\u6218" });
-        ws.close();
+        rejectHandshake(ws, 400, "\u5BF9\u5C40\u5C1A\u672A\u5F00\u59CB\uFF0C\u6682\u65E0\u6CD5\u89C2\u6218");
         return;
       }
       if (!hasCompleteSeating(room)) {
-        sendJson(ws, { type: "error", message: "\u5BF9\u5C40\u5DF2\u6709\u73A9\u5BB6\u79BB\u5F00\uFF0C\u89C2\u6218\u5DF2\u7ED3\u675F" });
-        ws.close();
+        rejectHandshake(ws, 400, "\u5BF9\u5C40\u5DF2\u6709\u73A9\u5BB6\u79BB\u5F00\uFF0C\u89C2\u6218\u5DF2\u7ED3\u675F");
         return;
       }
       if (!roomSockets.has(roomId)) roomSockets.set(roomId, /* @__PURE__ */ new Set());
@@ -28894,19 +29003,25 @@ function attachBattleWebSocket(server2) {
       broadcastRoom(room);
     } else {
       if (!playerId) {
-        sendJson(ws, { type: "error", message: "\u7F3A\u5C11 playerId" });
-        ws.close();
+        rejectHandshake(ws, 400, "\u7F3A\u5C11 playerId");
         return;
       }
-      const player = room.players.find((p) => p.id === playerId);
+      if (!sessionToken) {
+        rejectHandshake(ws, 400, "\u7F3A\u5C11\u4F1A\u8BDD\u51ED\u8BC1");
+        return;
+      }
+      const player = findPlayerByToken(room, sessionToken);
       if (!player) {
-        sendJson(ws, { type: "error", message: "\u73A9\u5BB6\u4E0D\u5728\u623F\u95F4\u4E2D" });
-        ws.close();
+        rejectHandshake(ws, 403, "\u8EAB\u4EFD\u6821\u9A8C\u5931\u8D25\uFF0C\u8BF7\u91CD\u65B0\u8FDB\u5165\u623F\u95F4");
+        return;
+      }
+      if (player.id !== playerId) {
+        rejectHandshake(ws, 403, "\u8EAB\u4EFD\u6821\u9A8C\u5931\u8D25\uFF0C\u8BF7\u91CD\u65B0\u8FDB\u5165\u623F\u95F4");
         return;
       }
       if (!roomSockets.has(roomId)) roomSockets.set(roomId, /* @__PURE__ */ new Set());
       roomSockets.get(roomId).add(ws);
-      socketMeta.set(ws, { roomId, role, playerId, lastActivity: Date.now() });
+      socketMeta.set(ws, { roomId, role, playerId, sessionToken, lastActivity: Date.now() });
       player.connected = true;
       player.lastHeartbeat = Date.now();
       player.lastWsAt = Date.now();
@@ -28963,22 +29078,27 @@ var port = process.env.PORT || 9091;
 app.use((0, import_cors.default)());
 app.use(import_express3.default.json({ limit: "50mb" }));
 app.use(import_express3.default.urlencoded({ limit: "50mb", extended: true }));
-app.get("/api/v1/health", (req, res) => {
-  console.log("Health check success");
+app.get("/api/v1/health", (_req, res) => {
   res.status(200).json({ status: "ok" });
 });
 app.use("/api/v1/lan", lanGame_default);
 app.use("/api/v1/ai", ai_default);
 app.use("/api", (req, res) => {
-  res.status(404).json({ success: false, error: "not_found", message: `\u63A5\u53E3\u4E0D\u5B58\u5728: ${req.method} ${req.path}` });
+  res.status(404).json(failBody(404, `\u63A5\u53E3\u4E0D\u5B58\u5728: ${req.method} ${req.path}`));
 });
 app.use((err, req, res, next) => {
-  console.error("[Server] \u672A\u6355\u83B7\u8DEF\u7531\u9519\u8BEF:", req.method, req.path, err instanceof Error ? err.message : err);
-  if (res.headersSent) {
-    next(err);
+  const parseFailed = err?.type === "entity.parse.failed";
+  if (!res.headersSent) {
+    if (parseFailed) {
+      res.status(400).json(failBody(400, "\u8BF7\u6C42\u4F53\u4E0D\u662F\u5408\u6CD5 JSON"));
+      return;
+    }
+    console.error("[Server] \u672A\u6355\u83B7\u8DEF\u7531\u9519\u8BEF:", req.method, req.path, err instanceof Error ? err.message : err);
+    res.status(500).json(failBody(500, "\u670D\u52A1\u5668\u5185\u90E8\u9519\u8BEF", {}, "internal_error"));
     return;
   }
-  res.status(500).json({ success: false, error: "internal_error", message: "\u670D\u52A1\u5668\u5185\u90E8\u9519\u8BEF" });
+  console.error("[Server] \u54CD\u5E94\u5DF2\u53D1\u51FA\u540E\u4ECD\u629B\u51FA\u9519\u8BEF:", req.method, req.path, err instanceof Error ? err.message : err);
+  next(err);
 });
 var server = http.createServer(app);
 attachBattleWebSocket(server);

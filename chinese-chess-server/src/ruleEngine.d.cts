@@ -10,12 +10,16 @@
  *
  * ruleEngine.cjs 不是手写文件：它由 `chinese-chess-client/client/utils/chess/ruleEngine.bundle.ts`
  * 经 esbuild 打包而来（两端同源，见 `scripts/verify-rule-engine-parity.mjs`）。这里只声明服务端
- * 实际用到的两个方法，类型放宽为 any：
+ * 实际用到的方法，类型放宽为 any：
  *   - 真正的类型定义在客户端源码里（`client/utils/chess/types.ts` 等）；
- *   - 服务端只做「校验 + 落子」两次调用，声明过细会在两端打包之间反复漂移。
+ *   - 服务端只做「建初始局面 + 校验 + 落子」几次调用，声明过细会在两端打包之间反复漂移。
  * 声明文件不会进入 dist/index.js，改它无需重新构建。
  */
 declare const ruleEngine: {
+  /** 【S-8】服务端自建开局局面：与客户端 `createInitialState` 同源（默认红先）。 */
+  createInitialState(firstMoveSide?: any): any;
+  /** 【S-8】把让子应用到初始局面（红方指定棋子被移除）；空数组原样返回。 */
+  applyHandicap(state: any, handicapIds: number[]): any;
   /** 生成某棋子的全部合法着法；返回按列索引的二维表（`valid[toCol][toRow]` 为真即合法）。 */
   getValidMoves(state: any, pieceId: number): any;
   /** 服务端权威落子：返回 `{ newState, isGameOver, ... }`（含长将长捉与终局判定）。 */

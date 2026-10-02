@@ -391,7 +391,8 @@ async function runHybrid(
   priority: number,
   offlineFallback: () => Promise<AIMoveResult | null>
 ): Promise<HybridMoveResult | null> {
-  // 长对局保护：服务端 moves 上限 512（dist/index.js 的 UCI_RE 校验），再长服务端会 400。
+  // 长对局保护：服务端 moves 上限 512（chinese-chess-server/src/routes/ai.ts:115 的
+  // `rawMoves.length <= 512` 与 :118 的 UCI_RE 逐条校验），再长服务端会 400。
   // 超过上限直接只走本地 AI，并把提示交给 UI（建议求和或重开），
   // 避免每步都白跑一次注定失败的在线请求 + 每步都闪一次"在线走法被拒"。
   if (state.moveHistory.length > MAX_HISTORY_MOVES) {

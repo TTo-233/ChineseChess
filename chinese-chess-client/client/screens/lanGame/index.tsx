@@ -22,7 +22,7 @@ import {
   testServerConnection,
   DEFAULT_SERVER_URL,
 } from '@/utils/serverConfig';
-import { getPlayerId, getPlayerName, savePlayerName } from '@/utils/playerIdentity';
+import { getPlayerId, getPlayerName, savePlayerName, setRoomSessionToken } from '@/utils/playerIdentity';
 import { HandicapBoard } from '@/components/HandicapBoard';
 import {
   SettingSelect,
@@ -55,8 +55,11 @@ function handicapPieceChar(id: number): string | null {
   return null;
 }
 
-/** 让子明细摘要：按车/马/炮/兵顺序去重拼接（大厅房间标签用，最长 4 字） */
-function handicapSummary(ids: number[]): string {
+/** 让子明细摘要：按车/马/炮/兵顺序去重拼接（大厅房间标签用，最长 4 字）
+ *  【C-71】补默认值：服务端未下发 handicap 字段时 ids 为 undefined，
+ *  `ids.map` 直接抛 TypeError → 整个房间列表 FlatList 渲染失败（白屏）。
+ *  同函数的 filteredRooms 已用 `(r.hostName ?? '')` 兜过底，说明协议漂移确实被考虑过。 */
+function handicapSummary(ids: number[] = []): string {
   const chars = new Set(ids.map(handicapPieceChar).filter((c): c is string => c !== null));
   return ['车', '马', '炮', '兵'].filter(c => chars.has(c)).join('');
 }
@@ -153,6 +156,11 @@ export default function LanGameScreen() {
     try {
       const base = await getOnlineServerUrl();
       const response = await fetch(`${base}/api/v1/lan/rooms`);
+      // 【C-55】fetch 只有网络层失败才会 reject；4xx/5xx 的响应对象照样 resolve，
+      // 下面的 response.json() 会把 {"success":false,"error":"...","message":"..."}
+      // 解析成对象，于是 data.rooms 为 undefined → setRooms([]) ——
+      // 服务端报错被伪装成「大厅里一个房间都没有」。
+      if (!response.ok) throw new Error(`获取房间列表失败：HTTP ${response.status}`);
       const data = await response.json();
       setRooms(data.rooms || []);
     } catch (error) {
@@ -171,6 +179,9 @@ export default function LanGameScreen() {
        * Query 参数：playerId: string
        */
       const response = await fetch(`${base}/api/v1/lan/rooms/active?playerId=${encodeURIComponent(id)}`);
+      // 【C-56】同上：不判 response.ok 时，500 的 {"error":...} 会被当成
+      // 「没有活跃对局」→ data.room 为 undefined → 断线重连入口静默消失。
+      if (!response.ok) throw new Error(`查询活跃对局失败：HTTP ${response.status}`);
       const data = await response.json();
       setActiveRoom(data.room ?? null);
     } catch (error) {
@@ -249,7 +260,9 @@ export default function LanGameScreen() {
       // 断线重连时 activeRoom 已带房间名，首帧即显示真实标题
       roomName: room.name,
       side: room.mySide ?? 'red',
-      isHost: false,
+      // 【C-72】isHost 已删除：lanBattle 全文 0 处引用它，房主身份一律取服务端负载里的
+      // room.hostId（:676 setHostId、:2813 canEdit）。留着这个死参数会让人误以为
+      // 房主身份靠路由传递，从而写出"改路由参数就能当房主"的错误假设。
     });
   };
 
@@ -314,10 +327,22 @@ export default function LanGameScreen() {
           password: roomPassword.trim() || undefined,
         }),
       });
+      // 【C-57】不判 response.ok 时，服务端 500 的 {"error":...} 与 4xx 的参数校验错误
+      // 会走同一条 else 分支，catch 里的「无法连接对战服务器」覆盖掉了真实原因
+      // （限流 500 / 参数 400 / 房间名超长），用户只看到一个误导性的网络提示。
+      // 只有 5xx 与非 JSON 响应才当作服务端故障抛给 catch，4xx 保留 data.message 原文。
+      if (!response.ok && response.status >= 500) {
+        throw new Error(`创建房间失败：HTTP ${response.status}`);
+      }
       const data = await response.json();
 
       if (data.roomId) {
         setShowSettings(false);
+        // 【S-1 / §3.1】服务端签发的房间会话凭证（256 bit）。此后所有写操作都靠它鉴权，
+        // playerId 退化为显示用标识。先持久化再跳转：对局页首帧就要用它拼 WS URL。
+        if (typeof data.sessionToken === 'string' && data.sessionToken) {
+          await setRoomSessionToken(data.roomId, playerId, data.sessionToken);
+        }
         router.push('/lanBattle', {
           roomId: data.roomId,
           playerId,
@@ -325,10 +350,16 @@ export default function LanGameScreen() {
           // 一并带上服务端最终的房间名（含留空时自动生成的「房间N」），进入对局页首帧即可显示
           roomName: data.room?.name,
           side: 'red',
-          isHost: true,
+          // 【C-72】isHost 死参数已删除，房主身份由服务端 room.hostId 决定
         });
       } else {
-        setCreateError(data.error || '创建房间失败');
+        // 第 3 批：失败 body 形状全端统一为 { success:false, error:<机器码>, message:<中文> }，
+        // `error` 不再是给人看的文案，展示一律读 message
+        setCreateError(
+          typeof data.message === 'string' && data.message.trim()
+            ? data.message
+            : '创建房间失败',
+        );
       }
     } catch (error) {
       console.error('创建房间失败:', error);
@@ -367,10 +398,22 @@ export default function LanGameScreen() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ playerName: name, playerId, password: password || undefined }),
       });
+      // 【C-58】不判 response.ok 时，服务端 500 的 {"error":...} 会落到
+      // 「加入房间失败」的兜底分支，密码弹窗被关掉、用户以为房间不存在。
+      // 4xx 仍有业务语义（needPassword / 密码错误），照常解析 body；
+      // 只有 5xx 与非 JSON 响应才当作传输/服务端故障走 catch。
+      if (!response.ok && response.status >= 500) {
+        throw new Error(`加入房间失败：HTTP ${response.status}`);
+      }
       const data = await response.json();
 
       if (data.success) {
         setPasswordRoom(null);
+        // 【S-1 / §3.1】接住服务端签发的会话凭证（幂等重入会重新签发，旧 token 立即失效，
+        // 所以这里每次成功都要覆盖写）。
+        if (typeof data.sessionToken === 'string' && data.sessionToken) {
+          await setRoomSessionToken(roomId, playerId, data.sessionToken);
+        }
         router.push('/lanBattle', {
           roomId,
           playerId,
@@ -378,7 +421,7 @@ export default function LanGameScreen() {
           // 房间名取自大厅列表项（加入前即已知），避免对局页首帧显示兜底文案
           roomName: data.room?.name ?? roomName,
           side: 'black',
-          isHost: false,
+          // 【C-72】isHost 死参数已删除，房主身份由服务端 room.hostId 决定
         });
       } else if (data.needPassword) {
         // 需要密码或密码错误：弹出/保留密码框并提示
@@ -751,6 +794,7 @@ export default function LanGameScreen() {
                 <SettingSelect
                   label="局时"
                   valueText={BASE_TIME_OPTIONS.find(o => o.value === baseTime)?.label ?? `${baseTime}秒`}
+                  value={baseTime}
                   options={BASE_TIME_OPTIONS}
                   open={openSelect === 'base'}
                   onToggle={() => setOpenSelect(openSelect === 'base' ? null : 'base')}
@@ -759,6 +803,7 @@ export default function LanGameScreen() {
                 <SettingSelect
                   label="步时"
                   valueText={TURN_TIME_OPTIONS.find(o => o.value === turnLimit)?.label ?? `${turnLimit}秒`}
+                  value={turnLimit}
                   options={TURN_TIME_OPTIONS}
                   open={openSelect === 'turn'}
                   onToggle={() => setOpenSelect(openSelect === 'turn' ? null : 'turn')}
@@ -769,6 +814,7 @@ export default function LanGameScreen() {
                 <SettingSelect
                   label="加秒"
                   valueText={baseTime === 0 ? '不限时' : (INCREMENT_OPTIONS.find(o => o.value === increment)?.label ?? `${increment}秒`)}
+                  value={baseTime === 0 ? -1 : increment}
                   options={INCREMENT_OPTIONS}
                   disabled={baseTime === 0 || byoyomi > 0}
                   open={openSelect === 'inc'}
@@ -778,6 +824,7 @@ export default function LanGameScreen() {
                 <SettingSelect
                   label="读秒"
                   valueText={baseTime === 0 ? '不限时' : (BYOYOMI_OPTIONS.find(o => o.value === byoyomi)?.label ?? `${byoyomi}秒`)}
+                  value={baseTime === 0 ? -1 : byoyomi}
                   options={BYOYOMI_OPTIONS}
                   disabled={baseTime === 0 || increment > 0}
                   open={openSelect === 'byo'}

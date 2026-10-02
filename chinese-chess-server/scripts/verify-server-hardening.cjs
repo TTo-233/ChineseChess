@@ -14,18 +14,25 @@
  *   补丁一  长将长捉不拦截：超限不再拒绝落子、不再按违规次数判负（静态断言覆盖）。
  *   补丁二  畸形 FEN 行宽校验：行宽 ≠ 9 的 FEN 在进入 Pikafish WASM 之前被 400 拦下，
  *           否则 WASM 越界写内存、4 个 worker 一起崩。
- *   补丁三  初始局面上传收紧：完整局面上传（POST /rooms/:id/gameState，无 move）必须
- *           ① 仅限房内玩家；② 仅在本局尚无任何着法时。否则任何人只要知道 6 位房间号，
- *           就能匿名改写进行中的棋盘。
- *   补丁四  旧协议分支不再由请求体驱动终局：附加 {gameOver:true,winner:'red'} 不能伪造胜负。
+ *   补丁七  会话凭证鉴权（【S-1 / §3.1】）：创建/加入房间时签发 sessionToken，
+ *           之后所有写操作必须出示它。只知道 roomId + playerId 不足以冒充他人
+ *           （改造前任何人都能替对方 reconnect 清零断线判负、ready 取消准备、
+ *           leave 把对方踢出并直接判负）。
+ *   补丁八  悔棋由服务端快照回退（【S-2 / §3.2】）：不再采纳客户端上传的目标局面。
+ *   补丁九  旧协议完整局面上传已下线（【S-8 / §3.8】）：POST /move 只收着法；
+ *           初始局面由服务端 startPlayingRoom() 自建，客户端无从改写。
  *   补丁五  被拒绝的动作回推权威状态（由 A2/A3 的隐含前提覆盖：拒绝后客户端仍能拿到权威局面）。
  *   补丁六  房间名「最小空缺优先」：销毁房间后其编号被复用，而不是只增不减。
  *
- * 断言清单（对应源码层六条加固）：
+ * 断言清单（对应源码层加固）：
  *   A 新协议走子（服务端权威裁决）：合法着法 200 且 moveHistory +1；非法走法 400 且棋盘不变；
  *     非当前回合方走子 400。
- *   B 初始局面上传收紧：无着法时房内玩家上传 200；已有 1 手后同一玩家上传 403 且棋盘未回退；
- *     已有 1 手后伪造 gameOver/winner 被拒且 phase 仍为 playing；陌生人上传被拒。
+ *   B 会话凭证鉴权（补丁七）：无 token / 错 token 的写操作一律 403 且状态不变；
+ *     持正确 token 正常放行（排除"一律拒绝"的假阳性）；token 不随房间负载下发。
+ *   S2 悔棋服务端快照（补丁八）：同意悔棋后回到发起前两步的局面，且由服务端决定——
+ *     上传 proposedState 也不再有影响（端点已不接受该字段）。
+ *   S8 旧协议下线（补丁九）：POST /move 收到完整 gameState 或伪造 gameOver/winner 一律 400，
+ *     房间不终局、棋盘未被污染。
  *   C 畸形 FEN 校验：合法 FEN 不返回 invalid_fen；行数/行宽非法的 FEN 返回 400 + invalid_fen。
  *   D 房间名最小空缺优先：连建 3 房（房间1/2/3）→ 销毁「房间1」→ 新建重新得到「房间1」，
  *     而不是「房间3」（旧实现 let n = rooms.size + 1 的结果）。D1 只是基准守卫，D3 才是判据。
@@ -33,6 +40,8 @@
  *
  * 实现要点：走子不硬编码 pieceId/目标格，而是先 GET gameState 拿服务端局面，再用同源的
  * 规则引擎（../ruleEngine.cjs）枚举一个合法着法/非法着法，避免「测错子」这类假阳性。
+ *
+ * 【S-1】所有写操作都通过 post(p, body, token) 携带 x-session-token；查询类走 get(p) 不需要。
  */
 
 const path = require('path');
@@ -55,11 +64,15 @@ const DIST_PATH = path.join(__dirname, '..', 'dist', 'index.js');
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
-async function post(p, body) {
+async function post(p, body, token) {
+  const headers = { 'Content-Type': 'application/json' };
+  // 【S-1 / §3.1】写操作的鉴权凭证。body.sessionToken 是服务端并行的读取通道之一
+  // （另一个是 query），这里统一用请求头 x-session-token 以贴近真实客户端。
+  if (token) headers['x-session-token'] = token;
   const res = await fetch(`${BASE}${p}`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
+    headers,
+    body: JSON.stringify(body ?? {}),
   });
   let json = null;
   try { json = await res.json(); } catch { /* 非 JSON 响应 */ }
@@ -83,7 +96,7 @@ async function postAi(body) {
 }
 
 const roomState = async roomId => (await get(`/rooms/${roomId}/gameState`)).json;
-const heartbeat = (roomId, playerId) => post(`/rooms/${roomId}/heartbeat`, { playerId, hidden: false });
+const heartbeat = (roomId, token) => post(`/rooms/${roomId}/heartbeat`, { hidden: false }, token);
 
 let passed = 0;
 function ok(name, cond, detail) {
@@ -93,13 +106,15 @@ function ok(name, cond, detail) {
 }
 
 /** 房间是否已无成员（用于确认销毁房间确实释放了编号） */
-const leaveAll = async (roomId, playerIds) => {
-  for (const pid of playerIds) await post(`/rooms/${roomId}/leave`, { playerId: pid });
+const leaveAll = async (roomId, seats) => {
+  for (const s of seats) await post(`/rooms/${roomId}/leave`, { playerId: s.id }, s.token);
 };
 
 /**
  * 建一个已进入对局的让子房（让子房双方准备后自动分配阵营，省去选边流程）。
- * @returns {Promise<{roomId: string, pa: string, pb: string, hostSide: 'red'|'black'}>}
+ * 【S-1】返回的 token 是后续所有写操作的凭证；未带 token 的请求应被 403 拒绝。
+ * @returns {Promise<{roomId: string, pa: string, pb: string, hostSide: 'red'|'black',
+ *                    ta: string, tb: string}>}
  */
 async function setupPlayingRoom(tag) {
   const pa = `pa-${tag}`;
@@ -107,19 +122,23 @@ async function setupPlayingRoom(tag) {
   const created = await post('/rooms', { playerName: `A-${tag}`, playerId: pa, handicap: [21] });
   assert.strictEqual(created.status, 200, `建房失败: ${JSON.stringify(created.json)}`);
   const roomId = created.json.roomId;
+  const ta = created.json.sessionToken;
+  assert.ok(ta, '建房响应未签发 sessionToken（【S-1】鉴权无法生效）');
   const joined = await post(`/rooms/${roomId}/join`, { playerName: `B-${tag}`, playerId: pb });
   assert.strictEqual(joined.status, 200, `加入失败: ${JSON.stringify(joined.json)}`);
-  await post(`/rooms/${roomId}/ready`, { playerId: pa, ready: true });
-  const ready = await post(`/rooms/${roomId}/ready`, { playerId: pb, ready: true });
+  const tb = joined.json.sessionToken;
+  assert.ok(tb, '加入响应未签发 sessionToken（【S-1】鉴权无法生效）');
+  await post(`/rooms/${roomId}/ready`, { ready: true }, ta);
+  const ready = await post(`/rooms/${roomId}/ready`, { ready: true }, tb);
   assert.ok(ready.json?.autoRevealed, `让子房未自动公示阵营: ${JSON.stringify(ready.json)}`);
   await sleep(3300); // 等 START_COUNTDOWN_MS（3s）走完
-  const started = await post(`/rooms/${roomId}/start`, { playerId: pa });
+  const started = await post(`/rooms/${roomId}/start`, {}, ta);
   assert.strictEqual(started.json?.success, true, `开局失败: ${JSON.stringify(started.json)}`);
   const state = await roomState(roomId);
   assert.strictEqual(state.phase, 'playing', `未进入对局: ${JSON.stringify(state.phase)}`);
   const host = state.players.find(p => p.id === pa);
   assert.ok(host, `房主不在房间成员里: ${JSON.stringify(state.players)}`);
-  return { roomId, pa, pb, hostSide: host.side };
+  return { roomId, pa, pb, hostSide: host.side, ta, tb };
 }
 
 /**
@@ -160,18 +179,13 @@ function findIllegalTarget(gameState, pieceId) {
 
 /**
  * A. 新协议走子：服务端权威裁决
- * 客户端只发 {playerId, move}，服务端用规则引擎校验并执行（拒绝时 400 且棋盘不变）。
+ * 客户端只发 {move}，服务端用规则引擎校验并执行（拒绝时 400 且棋盘不变）。
+ * 【S-1】所有写操作必须携带 sessionToken。
  */
 async function scenarioAuthorityMoves() {
   console.log('\n[A] 新协议走子：服务端权威裁决');
-  const { roomId, pa, pb, hostSide } = await setupPlayingRoom('mv');
-
-  // 让子房开局后 room.gameState 仍是 null（等待客户端上传初始局面）。
-  // 这里直接上传一份规则引擎生成的初始局面，作为新协议走子的棋盘基准。
-  const initial = ruleEngine.createInitialState(true);
-  const upload = await post(`/rooms/${roomId}/gameState`, { playerId: pa, gameState: initial });
-  ok('A0 让子房无着法时可上传初始局面（旧协议分支仍保留唯一合法用途）',
-    upload.status === 200, `status=${upload.status} body=${JSON.stringify(upload.json)}`);
+  const { roomId, pa, pb, hostSide, ta, tb } = await setupPlayingRoom('mv');
+  const tokenOf = { red: hostSide === 'red' ? ta : tb, black: hostSide === 'red' ? tb : ta };
 
   // A1 合法着法：从服务端局面枚举，不硬编码
   const before = await roomState(roomId);
@@ -179,10 +193,9 @@ async function scenarioAuthorityMoves() {
   const legal = findLegalMoveForSide(before.gameState, hostSide);
   assert.ok(legal, '规则引擎在当前局面上枚举不到任何合法着法，测试基准有误');
   const mover = hostSide; // 开局走子方 = sideTag 对应的红方（让子房房主恒为红）
-  const mv = await post(`/rooms/${roomId}/gameState`, {
-    playerId: mover === 'red' ? pa : pb,
+  const mv = await post(`/rooms/${roomId}/move`, {
     move: { pieceId: legal.pieceId, toCol: legal.toCol, toRow: legal.toRow },
-  });
+  }, tokenOf[mover]);
   ok('A1 合法着法被服务端接受（200）', mv.status === 200,
     `status=${mv.status} body=${JSON.stringify(mv.json)} move=${JSON.stringify(legal)}`);
   const after = await roomState(roomId);
@@ -193,10 +206,9 @@ async function scenarioAuthorityMoves() {
   // A2 非法着法：同一个 pieceId 配一个规则引擎判定为非法的目标格
   const illegal = findIllegalTarget(after.gameState, legal.pieceId);
   assert.ok(illegal, '找不到非法目标格，测试基准有误');
-  const bad = await post(`/rooms/${roomId}/gameState`, {
-    playerId: mover === 'red' ? pa : pb,
+  const bad = await post(`/rooms/${roomId}/move`, {
     move: { pieceId: legal.pieceId, ...illegal },
-  });
+  }, tokenOf[mover]);
   ok('A2 非法着法被服务端拒绝（400）', bad.status === 400,
     `status=${bad.status} body=${JSON.stringify(bad.json)}`);
   const after2 = await roomState(roomId);
@@ -206,24 +218,20 @@ async function scenarioAuthorityMoves() {
 
   // A3 回合错误：现在轮到另一方走子，让「上一手走子方」再走一手 → 必须 400。
   // sideTag=true 表示轮到红方，false 表示轮到黑方（ruleEngine 的 RED_SIDE=true）。
-  const playerOfSide = { red: pa, black: pb };
-  // 当前回合方 = sideTag 所指的那一方；上一手走子方 = 另一方（= mover）
   const isRedTurn = after2.gameState.sideTag === true || after2.gameState.sideTag === 'red';
   const turnSide = isRedTurn ? 'red' : 'black';
   assert.notStrictEqual(turnSide, mover, '局面 sideTag 未翻转，测试基准有误');
   const otherLegal = findLegalMoveForSide(after2.gameState, turnSide);
   assert.ok(otherLegal, `${turnSide} 在当前局面上枚举不到合法着法，测试基准有误`);
-  const wrongTurn = await post(`/rooms/${roomId}/gameState`, {
-    playerId: playerOfSide[turnSide],
+  const wrongTurn = await post(`/rooms/${roomId}/move`, {
     move: { pieceId: legal.pieceId, toCol: legal.toCol, toRow: legal.toRow },
-  });
+  }, tokenOf[mover]);
   ok('A3 非当前回合方走子被拒绝（400）', wrongTurn.status === 400,
     `status=${wrongTurn.status} body=${JSON.stringify(wrongTurn.json)}`);
   // 顺带确认：属于当前回合的那一方可正常走子（排除「服务端一律拒绝」的假阳性）
-  const rightTurn = await post(`/rooms/${roomId}/gameState`, {
-    playerId: playerOfSide[turnSide],
+  const rightTurn = await post(`/rooms/${roomId}/move`, {
     move: { pieceId: otherLegal.pieceId, toCol: otherLegal.toCol, toRow: otherLegal.toRow },
-  });
+  }, tokenOf[turnSide]);
   ok('A3b 当前回合方走子成功（200，排除一律拒绝的假阳性）', rightTurn.status === 200,
     `status=${rightTurn.status} body=${JSON.stringify(rightTurn.json)}`);
   // A3c 两笔请求（一拒一成）后着法历史恰好 +1：被拒的 400 没有落子
@@ -233,107 +241,229 @@ async function scenarioAuthorityMoves() {
     `expected=${after2Moves + 1} actual=${after3Moves}`);
 
   // 收尾：销毁本场景房间，避免占用编号干扰 D 场景的「最小空缺优先」基准
-  await leaveAll(roomId, [pa, pb]);
+  await leaveAll(roomId, [{ id: pa, token: ta }, { id: pb, token: tb }]);
 }
 
 /**
- * B. 初始局面上传收紧（补丁三/四）：两个方向都要测
- *   1. 尚无着法 + 房内玩家 → 允许；
- *   2. 已有着法 / 陌生人 / 伪造终局 → 拒绝，且服务端棋盘与终局状态不被污染。
+ * B. 会话凭证鉴权（补丁七 / 【S-1】）
+ * 改造前 playerId 全由客户端自报，任何知道 roomId + playerId 的人都能冒充他人执行写操作。
+ * 现在所有写操作必须出示该玩家自己的 sessionToken。
  */
-async function scenarioInitialUploadHardening() {
-  console.log('\n[B] 初始局面上传收紧（补丁三/四）');
-  const { roomId, pa, pb } = await setupPlayingRoom('up');
+async function scenarioSessionAuth() {
+  console.log('\n[B] 会话凭证鉴权（补丁七 / S-1）');
+  const { roomId, pa, pb, hostSide, ta, tb } = await setupPlayingRoom('au');
+  const tokenOf = { red: hostSide === 'red' ? ta : tb, black: hostSide === 'red' ? tb : ta };
+  const mover = hostSide;
 
-  // B1 房间内玩家、尚无任何着法 → 允许上传初始局面
-  const initial = ruleEngine.createInitialState(true);
-  const allow = await post(`/rooms/${roomId}/gameState`, { playerId: pa, gameState: initial });
-  ok('B1 尚无着法时房内玩家上传完整局面被允许（200）', allow.status === 200,
-    `status=${allow.status} body=${JSON.stringify(allow.json)}`);
-  const stored = await roomState(roomId);
-  ok('B1b 服务端局面确实等于上传的初始局面', stored.gameState?.qiPan?.[4]?.[6] === 29,
-    `qiPan[4][6]=${JSON.stringify(stored.gameState?.qiPan?.[4]?.[6])}`);
-
-  // 先制造一手真实着法（新协议），使「本局已产生着法」成立
-  const redMove = findLegalMoveForSide(stored.gameState, 'red');
-  assert.ok(redMove, '枚举不到红方合法着法，测试基准有误');
-  const made = await post(`/rooms/${roomId}/gameState`, {
-    playerId: pa, move: { pieceId: redMove.pieceId, toCol: redMove.toCol, toRow: redMove.toRow },
+  // B1 无 token 的写操作 → 403，且状态不变
+  const before = await roomState(roomId);
+  const beforeMoves = before.gameState?.moveHistory?.length ?? 0;
+  const legal = findLegalMoveForSide(before.gameState, mover);
+  assert.ok(legal, '规则引擎在当前局面上枚举不到任何合法着法，测试基准有误');
+  const noToken = await post(`/rooms/${roomId}/move`, {
+    move: { pieceId: legal.pieceId, toCol: legal.toCol, toRow: legal.toRow },
   });
-  assert.strictEqual(made.status, 200, `基准着法失败: ${JSON.stringify(made.json)}`);
-  const afterMove = await roomState(roomId);
-  const movesAfterFirst = afterMove.gameState.moveHistory.length;
-  assert.strictEqual(movesAfterFirst, 1, `基准着法后 moveHistory 应为 1，实为 ${movesAfterFirst}`);
-  const boardAfterFirst = JSON.stringify(afterMove.gameState.qiPan);
+  ok('B1 无 token 的走子被拒绝（403）', noToken.status === 403,
+    `status=${noToken.status} body=${JSON.stringify(noToken.json)}`);
+  const afterNoToken = await roomState(roomId);
+  ok('B1b 无 token 的走子未落子（moveHistory 不变）',
+    (afterNoToken.gameState?.moveHistory?.length ?? 0) === beforeMoves,
+    `expected=${beforeMoves} actual=${afterNoToken.gameState?.moveHistory?.length}`);
 
-  // B2 已有 1 手着法后，同一房内玩家再上传完整局面 → 403，且棋盘/着法历史未被回退
-  const replay = await post(`/rooms/${roomId}/gameState`, { playerId: pa, gameState: initial });
-  ok('B2 已有 1 手着法后再上传完整局面被拒绝（403）', replay.status === 403,
-    `status=${replay.status} body=${JSON.stringify(replay.json)}`);
-  const afterReplay = await roomState(roomId);
-  ok('B2b 被拒的上传没有回退棋盘', JSON.stringify(afterReplay.gameState.qiPan) === boardAfterFirst);
-  ok('B2c 被拒的上传没有回退 moveHistory',
-    afterReplay.gameState.moveHistory.length === movesAfterFirst,
-    `expected=${movesAfterFirst} actual=${afterReplay.gameState.moveHistory.length}`);
+  // B2 伪造 token → 403
+  const forgedToken = await post(`/rooms/${roomId}/move`, {
+    move: { pieceId: legal.pieceId, toCol: legal.toCol, toRow: legal.toRow },
+  }, 'forged-token-not-issued-by-server');
+  ok('B2 伪造 token 的走子被拒绝（403）', forgedToken.status === 403,
+    `status=${forgedToken.status} body=${JSON.stringify(forgedToken.json)}`);
 
-  // B3 已有 1 手着法后，伪造 {gameOver:true, winner:'red'} → 被拒，且房间未终局
-  const forged = { ...ruleEngine.cloneGameState(afterReplay.gameState), gameStatus: 'red_win', gameOver: true, winner: 'red' };
-  const spoof = await post(`/rooms/${roomId}/gameState`, { playerId: pa, gameState: forged, gameOver: true, winner: 'red' });
-  ok('B3 伪造 gameOver/winner 的完整局面上传被拒绝（4xx）', spoof.status >= 400 && spoof.status < 500,
-    `status=${spoof.status} body=${JSON.stringify(spoof.json)}`);
-  const afterSpoof = await roomState(roomId);
-  ok('B3b 伪造终局未生效：phase 仍为 playing', afterSpoof.phase === 'playing',
-    `phase=${afterSpoof.phase}`);
-  ok('B3c 伪造终局未生效：winner 仍为空', afterSpoof.winner === null || afterSpoof.winner === undefined,
-    `winner=${JSON.stringify(afterSpoof.winner)}`);
-  ok('B3d 伪造终局未改写棋盘', JSON.stringify(afterSpoof.gameState.qiPan) === boardAfterFirst);
+  // B3 用对方 token 在对方回合走子 → 200（token 绑定到具体玩家，走子的是 token 对应的人）
+  const s1 = await roomState(roomId);
+  const isRedTurn1 = s1.gameState.sideTag === true || s1.gameState.sideTag === 'red';
+  const turnSide1 = isRedTurn1 ? 'red' : 'black';
+  const otherToken = tokenOf[turnSide1];
+  const otherLegal = findLegalMoveForSide(s1.gameState, turnSide1);
+  assert.ok(otherLegal, '枚举不到对方合法着法');
+  const otherMove = await post(`/rooms/${roomId}/move`, {
+    move: { pieceId: otherLegal.pieceId, toCol: otherLegal.toCol, toRow: otherLegal.toRow },
+  }, otherToken);
+  ok('B3 用对方 token 在对方回合走子成功（200，token 绑定到玩家）', otherMove.status === 200,
+    `status=${otherMove.status} body=${JSON.stringify(otherMove.json)}`);
 
-  // B4 陌生人（不在房间成员列表里）上传完整局面 → 被拒，局面不变
-  const stranger = await post(`/rooms/${roomId}/gameState`, { playerId: 'intruder-not-in-room', gameState: initial });
-  ok('B4 陌生人上传完整局面被拒绝（4xx）', stranger.status >= 400 && stranger.status < 500,
-    `status=${stranger.status} body=${JSON.stringify(stranger.json)}`);
-  const afterStranger = await roomState(roomId);
-  ok('B4b 陌生人的上传没有改写局面', JSON.stringify(afterStranger.gameState.qiPan) === boardAfterFirst);
+  // B3b 用对方 token 在自己回合走子 → 400（回合错误，不是 token 错误）
+  const s2 = await roomState(roomId);
+  const isRedTurn2 = s2.gameState.sideTag === true || s2.gameState.sideTag === 'red';
+  const turnSide2 = isRedTurn2 ? 'red' : 'black';
+  const myToken = tokenOf[turnSide2 === 'red' ? 'black' : 'red'];
+  const myLegal = findLegalMoveForSide(s2.gameState, turnSide2);
+  assert.ok(myLegal, '枚举不到自己合法着法');
+  const wrongTurn = await post(`/rooms/${roomId}/move`, {
+    move: { pieceId: myLegal.pieceId, toCol: myLegal.toCol, toRow: myLegal.toRow },
+  }, myToken);
+  ok('B3b 用对方 token 在自己回合走子被拒绝（400 回合错误）', wrongTurn.status === 400,
+    `status=${wrongTurn.status} body=${JSON.stringify(wrongTurn.json)}`);
 
-  // 收尾：销毁本场景房间，避免占用编号干扰 D 场景的「最小空缺优先」基准
-  await leaveAll(roomId, [pa, pb]);
+  // B4 无 token 的 reconnect → 403（S-1 的核心入口）
+  const noTokenReconnect = await post(`/rooms/${roomId}/reconnect`, {});
+  ok('B4 无 token 的 reconnect 被拒绝（403）', noTokenReconnect.status === 403,
+    `status=${noTokenReconnect.status} body=${JSON.stringify(noTokenReconnect.json)}`);
+
+  // B5 无 token 的 leave → 403（防止陌生人把别人踢出房间）
+  const noTokenLeave = await post(`/rooms/${roomId}/leave`, {});
+  ok('B5 无 token 的 leave 被拒绝（403）', noTokenLeave.status === 403,
+    `status=${noTokenLeave.status} body=${JSON.stringify(noTokenLeave.json)}`);
+  const afterBadLeave = await roomState(roomId);
+  ok('B5b 无 token 的 leave 未改变房间状态（phase 仍为 playing）',
+    afterBadLeave.phase === 'playing', `phase=${afterBadLeave.phase}`);
+
+  // B6 持正确 token 正常放行（排除「一律拒绝」的假阳性）
+  const s3 = await roomState(roomId);
+  const isRedTurn3 = s3.gameState.sideTag === true || s3.gameState.sideTag === 'red';
+  const turnSide3 = isRedTurn3 ? 'red' : 'black';
+  const goodToken = tokenOf[turnSide3];
+  const goodLegal = findLegalMoveForSide(s3.gameState, turnSide3);
+  assert.ok(goodLegal, '枚举不到合法着法');
+  const goodMove = await post(`/rooms/${roomId}/move`, {
+    move: { pieceId: goodLegal.pieceId, toCol: goodLegal.toCol, toRow: goodLegal.toRow },
+  }, goodToken);
+  ok('B6 持正确 token 的走子成功（200）', goodMove.status === 200,
+    `status=${goodMove.status} body=${JSON.stringify(goodMove.json)}`);
+
+  // B7 token 不随房间负载下发
+  const roomView = await get(`/rooms/${roomId}`);
+  const roomStr = JSON.stringify(roomView.json);
+  ok('B7 房间负载不含 sessionToken', !roomStr.includes('sessionToken'),
+    '房间负载中出现了 sessionToken 字段');
+
+  // 收尾
+  await leaveAll(roomId, [{ id: pa, token: ta }, { id: pb, token: tb }]);
 }
 
 /**
- * B5. 补丁四的独立证据：旧协议分支不得由请求体驱动终局。
- *
- * B3 的房间已有 1 手着法，伪造终局会被「已有着法」这道闸先拦下，因此 B3 无法区分
- * 补丁四在不在。这里专门造一个**尚无任何着法**的房间：此时 uploader 校验与着法计数闸
- * 都会放行，若 `if (gameOver && winner)` 块还在（src/routes/lanGame.ts:1112），
- * 它就会读请求体的 `gameOver`/`winner` 把房间置为 ended/red——而上传的局面本身是初始局面、
- * 绝不可能是终局。断言「房间仍未终局」即可直接证明该块已被删除。
+ * S2. 悔棋服务端快照回退（补丁八 / 【S-2】）
+ * 改造前客户端上传 proposedState，服务端在对方同意时直接采纳 → 可伪造任意局面。
+ * 现在服务端用 actMove 自己维护的快照栈回退，客户端只表达意图。
  */
-async function scenarioFirstUploadCannotForgeEnd() {
-  console.log('\n[B5] 首次上传完整局面不得由请求体伪造终局（补丁四）');
-  const { roomId, pa, pb } = await setupPlayingRoom('go');
-  try {
-    const initial = ruleEngine.createInitialState(true);
-    const spoof = await post(`/rooms/${roomId}/gameState`, {
-      playerId: pa,
-      gameState: initial,
-      gameOver: true,
-      winner: 'red',
-    });
-    // 状态本身是合法初始局面：加固实现会忽略多余字段并存下（200）。
-    // 此处只要求服务端正常受理——真正的断言是房间不得因此终局。
-    ok('B5 首次上传携带伪造 gameOver/winner 仍被正常受理（200）',
-      spoof.status === 200, `status=${spoof.status} body=${JSON.stringify(spoof.json)}`);
-    const after = await roomState(roomId);
-    ok('B5b 伪造终局未生效：phase 仍为 playing（旧实现会变 ended）', after.phase === 'playing',
-      `phase=${after.phase} body=${JSON.stringify(after)}`);
-    ok('B5c 伪造终局未生效：winner 仍为空（旧实现会变 red）',
-      after.winner === null || after.winner === undefined,
-      `winner=${JSON.stringify(after.winner)}`);
-    ok('B5d 伪造终局未生效：endReason 未被写成 checkmate',
-      after.endReason !== 'checkmate', `endReason=${JSON.stringify(after.endReason)}`);
-  } finally {
-    await leaveAll(roomId, [pa, pb]);
-  }
+async function scenarioUndoSnapshot() {
+  console.log('\n[S2] 悔棋服务端快照回退（补丁八 / S-2）');
+  const { roomId, pa, pb, hostSide, ta, tb } = await setupPlayingRoom('un');
+  const tokenOf = { red: hostSide === 'red' ? ta : tb, black: hostSide === 'red' ? tb : ta };
+  const mover = hostSide;
+  const responder = mover === 'red' ? 'black' : 'red';
+
+  // 先走两手，使快照栈有足够深度
+  const s0 = await roomState(roomId);
+  const m1 = findLegalMoveForSide(s0.gameState, mover);
+  assert.ok(m1, '枚举不到第一手合法着法');
+  const r1 = await post(`/rooms/${roomId}/move`, {
+    move: { pieceId: m1.pieceId, toCol: m1.toCol, toRow: m1.toRow },
+  }, tokenOf[mover]);
+  assert.strictEqual(r1.status, 200, `第一手失败: ${JSON.stringify(r1.json)}`);
+
+  const s1 = await roomState(roomId);
+  const m2 = findLegalMoveForSide(s1.gameState, responder);
+  assert.ok(m2, '枚举不到第二手合法着法');
+  const r2 = await post(`/rooms/${roomId}/move`, {
+    move: { pieceId: m2.pieceId, toCol: m2.toCol, toRow: m2.toRow },
+  }, tokenOf[responder]);
+  assert.strictEqual(r2.status, 200, `第二手失败: ${JSON.stringify(r2.json)}`);
+
+  const s2 = await roomState(roomId);
+  const boardAfterTwo = JSON.stringify(s2.gameState.qiPan);
+  const movesAfterTwo = s2.gameState.moveHistory.length;
+
+  // S2-1 发起悔棋（不再传 proposedState）
+  const undoReq = await post(`/rooms/${roomId}/undo`, {}, tokenOf[mover]);
+  ok('S2-1 发起悔棋成功（200）', undoReq.status === 200,
+    `status=${undoReq.status} body=${JSON.stringify(undoReq.json)}`);
+
+  // S2-2 对方同意悔棋
+  const undoAgree = await post(`/rooms/${roomId}/undoResponse`, { agreed: true }, tokenOf[responder]);
+  ok('S2-2 同意悔棋成功（200）', undoAgree.status === 200,
+    `status=${undoAgree.status} body=${JSON.stringify(undoAgree.json)}`);
+
+  // S2-3 局面回退到走两手之前（快照栈回退 2 步）
+  const s3 = await roomState(roomId);
+  ok('S2-3 悔棋后 moveHistory 回退 2 步',
+    s3.gameState.moveHistory.length === movesAfterTwo - 2,
+    `expected=${movesAfterTwo - 2} actual=${s3.gameState.moveHistory.length}`);
+  ok('S2-3b 悔棋后棋盘回到走两手前的状态',
+    JSON.stringify(s3.gameState.qiPan) !== boardAfterTwo,
+    '棋盘未回退');
+
+  // S2-4 回退后轮到发起方走子
+  const isRedTurn = s3.gameState.sideTag === true || s3.gameState.sideTag === 'red';
+  const turnAfter = isRedTurn ? 'red' : 'black';
+  ok('S2-4 悔棋后轮到发起方走子', turnAfter === mover,
+    `expected=${mover} actual=${turnAfter}`);
+
+  // S2-5 快照栈不足时悔棋被拒（400）
+  const undoReq2 = await post(`/rooms/${roomId}/undo`, {}, tokenOf[mover]);
+  ok('S2-5 快照栈不足时悔棋被拒（400）', undoReq2.status === 400,
+    `status=${undoReq2.status} body=${JSON.stringify(undoReq2.json)}`);
+  const s4 = await roomState(roomId);
+  ok('S2-5b 被拒的悔棋未改变局面',
+    s4.gameState.moveHistory.length === movesAfterTwo - 2,
+    `expected=${movesAfterTwo - 2} actual=${s4.gameState.moveHistory.length}`);
+
+  // 收尾
+  await leaveAll(roomId, [{ id: pa, token: ta }, { id: pb, token: tb }]);
+}
+
+/**
+ * S8. 旧协议下线（补丁九 / 【S-8】）
+ * 改造前 POST /rooms/:roomId/gameState 接受完整 gameState/gameOver/winner 上传。
+ * 现在该端点改名为 /move，只接受 { move: { pieceId, toCol, toRow } }。
+ */
+async function scenarioLegacyProtocolRemoved() {
+  console.log('\n[S8] 旧协议下线（补丁九 / S-8）');
+  const { roomId, pa, pb, hostSide, ta, tb } = await setupPlayingRoom('lg');
+  const tokenOf = { red: hostSide === 'red' ? ta : tb, black: hostSide === 'red' ? tb : ta };
+  const mover = hostSide;
+
+  const before = await roomState(roomId);
+  const beforeMoves = before.gameState?.moveHistory?.length ?? 0;
+
+  // S8-1 上传完整 gameState → 400
+  const initial = ruleEngine.createInitialState(true);
+  const fullUpload = await post(`/rooms/${roomId}/move`, {
+    gameState: initial,
+  }, tokenOf[mover]);
+  ok('S8-1 上传完整 gameState 被拒绝（400）', fullUpload.status === 400,
+    `status=${fullUpload.status} body=${JSON.stringify(fullUpload.json)}`);
+
+  // S8-2 伪造 gameOver/winner → 400
+  const forged = { ...ruleEngine.cloneGameState(before.gameState), gameOver: true, winner: 'red' };
+  const spoof = await post(`/rooms/${roomId}/move`, {
+    gameState: forged,
+    gameOver: true,
+    winner: 'red',
+  }, tokenOf[mover]);
+  ok('S8-2 伪造 gameOver/winner 被拒绝（400）', spoof.status === 400,
+    `status=${spoof.status} body=${JSON.stringify(spoof.json)}`);
+
+  // S8-3 房间未终局、棋盘未被污染
+  const after = await roomState(roomId);
+  ok('S8-3 伪造终局未生效：phase 仍为 playing', after.phase === 'playing',
+    `phase=${after.phase}`);
+  ok('S8-3b 伪造终局未生效：winner 仍为空',
+    after.winner === null || after.winner === undefined,
+    `winner=${JSON.stringify(after.winner)}`);
+  ok('S8-3c 被拒的上传没有落子（moveHistory 不变）',
+    (after.gameState?.moveHistory?.length ?? 0) === beforeMoves,
+    `expected=${beforeMoves} actual=${after.gameState?.moveHistory?.length}`);
+
+  // S8-4 新协议 {move} 仍可用（排除「一律拒绝」的假阳性）
+  const legal = findLegalMoveForSide(after.gameState, mover);
+  assert.ok(legal, '规则引擎在当前局面上枚举不到任何合法着法');
+  const goodMove = await post(`/rooms/${roomId}/move`, {
+    move: { pieceId: legal.pieceId, toCol: legal.toCol, toRow: legal.toRow },
+  }, tokenOf[mover]);
+  ok('S8-4 新协议 {move} 走子成功（200）', goodMove.status === 200,
+    `status=${goodMove.status} body=${JSON.stringify(goodMove.json)}`);
+
+  // 收尾
+  await leaveAll(roomId, [{ id: pa, token: ta }, { id: pb, token: tb }]);
 }
 
 /**
@@ -396,12 +526,14 @@ async function scenarioMalformedFen() {
 async function scenarioRoomNameMinGap() {
   console.log('\n[D] 房间名最小空缺优先（补丁六）');
   const ids = ['dp-1', 'dp-2', 'dp-3'];
+  const tokens = [];
   const names = [];
   const roomIds = [];
   for (let i = 0; i < 3; i += 1) {
     const created = await post('/rooms', { playerName: `D${i + 1}`, playerId: ids[i] });
     assert.strictEqual(created.status, 200, `建房失败: ${JSON.stringify(created.json)}`);
     roomIds.push(created.json.roomId);
+    tokens.push(created.json.sessionToken);
     names.push(created.json.room.name);
   }
   const num = name => Number(String(name).replace(/^[^0-9]*/, ''));
@@ -417,7 +549,7 @@ async function scenarioRoomNameMinGap() {
     `names=${JSON.stringify(names)}`);
 
   // 释放编号最小的那个房间（其成员全部离场 → 房间销毁）
-  await leaveAll(roomIds[0], [ids[0]]);
+  await leaveAll(roomIds[0], [{ id: ids[0], token: tokens[0] }]);
   const reap = await get(`/rooms/${roomIds[0]}/gameState`);
   ok('D2 空房间确实被销毁（房间号已释放）', reap.status === 404,
     `status=${reap.status} body=${JSON.stringify(reap.json)}`);
@@ -457,8 +589,9 @@ async function main() {
   await sleep(600);
 
   await scenarioAuthorityMoves();
-  await scenarioInitialUploadHardening();
-  await scenarioFirstUploadCannotForgeEnd();
+  await scenarioSessionAuth();
+  await scenarioUndoSnapshot();
+  await scenarioLegacyProtocolRemoved();
   await scenarioMalformedFen();
   await scenarioRoomNameMinGap();
   scenarioNoBanInterception();

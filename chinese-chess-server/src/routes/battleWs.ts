@@ -20,9 +20,14 @@ import {
   registerSocketLivenessProbe,
   isHiddenTolerated,
   hasCompleteSeating,
+  findPlayerByToken,
   HIDDEN_SOCKET_IDLE_TIMEOUT,
 } from './lanGame';
-import type { Room, ActionResult } from './lanGame';
+import type { Room } from './lanGame';
+// 【第 3 批】动作结算（广播 + 4xx 限流回推）与失败 body 构造与 HTTP 通道同源，
+// 见 ./actionOutcome —— §8 表 #1（同一语义两份实现）到此为止。
+import { settleActionOutcome, failBody } from './actionOutcome';
+import type { ActionResult } from './actionOutcome';
 
 /**
  * 在线对局 WebSocket 通道
@@ -50,6 +55,10 @@ interface BattleSocketMeta {
   role: SocketRole;
   // 玩家身份（role === 'player' 时存在）
   playerId?: string;
+  // 【S-1 / §3.1】该连接出示的 sessionToken：握手上校验一次，之后作为动作鉴权凭据
+  // 复用（不必每条消息重查房；房间成员表变化时该 token 会失效，动作层会返回 403）。
+  // 刻意不放进 URL 之外的任何位置：query 会被反向代理/服务器访问日志记录。
+  sessionToken?: string;
   // 观战者身份（role === 'spectator' 时存在）
   spectatorId?: string;
   // 最近一次收到客户端消息（心跳/动作/pong）的时间，用于假死判定
@@ -71,6 +80,15 @@ function sendJson(ws: WebSocket, data: Record<string, unknown>): void {
       // 忽略发送失败（连接可能正在关闭）
     }
   }
+}
+
+// 握手阶段的拒绝帧：error 帧的 body 与 HTTP 失败响应同源（failBody），
+// 客户端只读 message 一处即可，不再按通道分叉（第 3 批）。
+// 注意 message 文案被客户端 battleSocket 的 FATAL_ERROR_MESSAGES 精确匹配，
+// 改文案等于改客户端的致命错误判定，改前先同步该常量。
+function rejectHandshake(ws: WebSocket, status: number, message: string): void {
+  sendJson(ws, { type: 'error', ...failBody(status, message) });
+  ws.close();
 }
 
 // 向房间内所有活跃连接广播最新对局状态
@@ -195,7 +213,7 @@ function handleMessage(ws: WebSocket, raw: unknown): void {
   if (!meta) return;
   // 收到任何客户端消息即视为活跃（假死判定依据）
   meta.lastActivity = Date.now();
-  const { roomId, role, playerId, spectatorId } = meta;
+  const { roomId, role, playerId, spectatorId, sessionToken } = meta;
   touchPlayerWs(roomId, playerId);
   const room = rooms.get(roomId);
   if (!room) return;
@@ -221,69 +239,69 @@ function handleMessage(ws: WebSocket, raw: unknown): void {
         if (existing) existing.lastSeen = Date.now();
       }
     } else {
-      actHeartbeat(roomId, { playerId, hidden: typeof msg.hidden === 'boolean' ? msg.hidden : undefined });
+      actHeartbeat(roomId, { hidden: typeof msg.hidden === 'boolean' ? msg.hidden : undefined }, sessionToken || '');
     }
     return;
   }
 
   // 观战者为只读连接：不允许执行任何对局动作
+  // 【第 3 批】error 帧的 body 形状与 HTTP 的失败响应同源（failBody），
+  // 客户端因此只读 message 一处，不必按通道分叉
   if (role === 'spectator') {
-    sendJson(ws, { type: 'error', reqId, message: '观战者无法执行该操作' });
+    sendJson(ws, { type: 'error', reqId, ...failBody(403, '观战者无法执行该操作') });
     return;
   }
 
-  // 对局动作分发：playerId 一律取连接认证时的身份，防止消息体冒充
+  // 对局动作分发：身份一律取连接建立时校验过的 sessionToken（【S-1 / §3.1】），
+  // 不再采信消息体里的 playerId —— 既防冒充，也让「token 已在 join 时失效」的动作被动作层拒绝。
   let result: ActionResult | null = null;
   switch (type) {
     case 'ready':
-      result = actReady(roomId, { playerId, ready: msg.ready });
+      result = actReady(roomId, { ready: msg.ready }, sessionToken || '');
       break;
     case 'side':
-      result = actSide(roomId, { playerId, side: msg.side });
+      result = actSide(roomId, { side: msg.side }, sessionToken || '');
       break;
     case 'start':
-      result = actStart(roomId, { playerId });
+      result = actStart(roomId, {}, sessionToken || '');
       break;
     case 'move':
-      // 新协议（发着法，服务端权威裁决）与旧协议（完整状态，初始局面上传）双兼
-      result = actMove(roomId, {
-        playerId,
-        move: msg.move,
-        gameState: msg.gameState,
-        gameOver: msg.gameOver,
-        winner: msg.winner,
-      });
+      // 【S-8】只收着法：完整局面上传分支已从 actMove 删除，这里也不再透传
+      // gameState/gameOver/winner（旧客户端靠它上传带让子的初始局面，现由服务端自建）。
+      result = actMove(roomId, { move: msg.move }, sessionToken || '');
       break;
     case 'surrender':
-      result = actSurrender(roomId, { playerId });
+      result = actSurrender(roomId, {}, sessionToken || '');
       break;
     case 'rematch':
-      result = actRematch(roomId, { playerId });
+      result = actRematch(roomId, {}, sessionToken || '');
       break;
     case 'undo':
-      result = actUndo(roomId, { playerId, proposedState: msg.proposedState });
+      // 【S-2】不再接收 proposedState：回退目标由服务端快照栈决定
+      result = actUndo(roomId, {}, sessionToken || '');
       break;
     case 'undoResponse':
-      result = actUndoResponse(roomId, { playerId, agreed: msg.agreed });
+      result = actUndoResponse(roomId, { agreed: msg.agreed }, sessionToken || '');
       break;
     case 'draw':
-      result = actDraw(roomId, { playerId });
+      result = actDraw(roomId, {}, sessionToken || '');
       break;
     case 'drawResponse':
-      result = actDrawResponse(roomId, { playerId, agreed: msg.agreed });
+      result = actDrawResponse(roomId, { agreed: msg.agreed }, sessionToken || '');
       break;
     case 'emoji':
-      result = actEmoji(roomId, { playerId, emoji: msg.emoji, id: msg.id });
+      result = actEmoji(roomId, { emoji: msg.emoji, id: msg.id }, sessionToken || '');
       break;
     default:
-      sendJson(ws, { type: 'error', reqId, message: '未知消息类型' });
+      sendJson(ws, { type: 'error', reqId, ...failBody(400, '未知消息类型') });
       return;
   }
 
-  if (result.status < 400) {
-    // 动作成功：实时广播最新状态给房间内所有连接（含操作者自身）
-    broadcastRoom(room);
-  }
+  // 【第 3 批】成功广播 + 被拒回推都交给 settleActionOutcome：与 HTTP 通道（respondAction）
+  // 同一份限流判据与计数锚点。此前 WS 只在 2xx 广播、HTTP 4xx 也广播，两份实现各写一遍，
+  // 于是主通道上「不是你的回合」「非法走法」「对方的悔棋请求已被处理」毫无反馈，
+  // 画面停在乐观更新后的样子，直到下一次成功动作才被顺带纠正（§8 表 #1）。
+  settleActionOutcome(roomId, result);
   sendJson(ws, { type: 'ack', reqId, status: result.status, body: result.body });
 }
 
@@ -294,12 +312,14 @@ export function attachBattleWebSocket(server: Server): void {
   wss.on('connection', (ws, req) => {
     let roomId = '';
     let playerId = '';
+    let sessionToken = '';
     let spectatorId = '';
     let role: SocketRole = 'player';
     try {
       const url = new URL(req.url || '', 'http://localhost');
       roomId = url.searchParams.get('roomId') || '';
       playerId = url.searchParams.get('playerId') || '';
+      sessionToken = url.searchParams.get('sessionToken') || '';
       spectatorId = url.searchParams.get('spectatorId') || '';
       role = url.searchParams.get('role') === 'spectator' ? 'spectator' : 'player';
     } catch {
@@ -307,35 +327,30 @@ export function attachBattleWebSocket(server: Server): void {
     }
 
     if (!roomId) {
-      sendJson(ws, { type: 'error', message: '缺少 roomId' });
-      ws.close();
+      rejectHandshake(ws, 400, '缺少 roomId');
       return;
     }
 
     const room = rooms.get(roomId);
     if (!room) {
-      sendJson(ws, { type: 'error', message: '房间不存在' });
-      ws.close();
+      rejectHandshake(ws, 404, '房间不存在');
       return;
     }
 
     if (role === 'spectator') {
       // 观战者连接：仅对战中/已结束的房间可旁观（与 HTTP /spectate 保持一致）
       if (!spectatorId) {
-        sendJson(ws, { type: 'error', message: '缺少观战者标识' });
-        ws.close();
+        rejectHandshake(ws, 400, '缺少观战者标识');
         return;
       }
       if (room.phase === 'waiting') {
-        sendJson(ws, { type: 'error', message: '对局尚未开始，暂无法观战' });
-        ws.close();
+        rejectHandshake(ws, 400, '对局尚未开始，暂无法观战');
         return;
       }
 
       // 与 HTTP /spectate 同一准入口径：席位不完整时拒绝，避免观战者进入「空局」
       if (!hasCompleteSeating(room)) {
-        sendJson(ws, { type: 'error', message: '对局已有玩家离开，观战已结束' });
-        ws.close();
+        rejectHandshake(ws, 400, '对局已有玩家离开，观战已结束');
         return;
       }
       // 注册到连接池 + 观众列表（幂等 upsert，重连时续期）
@@ -357,22 +372,33 @@ export function attachBattleWebSocket(server: Server): void {
       broadcastRoom(room);
     } else {
       // 玩家连接
+      // 【S-1 / §3.1】必须出示 sessionToken：改造前这里只校验「playerId 是否在房内」，
+      // 于是任何知道 roomId + playerId 的人都能建立一条"合法"玩家连接，
+      // 复位对方的 connected/lastHeartbeat/hidden，直接抵消断线判负倒计时，
+      // 并在随后的消息通道里以对方身份走棋、认输、同意悔棋。
       if (!playerId) {
-        sendJson(ws, { type: 'error', message: '缺少 playerId' });
-        ws.close();
+        rejectHandshake(ws, 400, '缺少 playerId');
         return;
       }
-      const player = room.players.find(p => p.id === playerId);
+      if (!sessionToken) {
+        rejectHandshake(ws, 400, '缺少会话凭证');
+        return;
+      }
+      const player = findPlayerByToken(room, sessionToken);
       if (!player) {
-        sendJson(ws, { type: 'error', message: '玩家不在房间中' });
-        ws.close();
+        rejectHandshake(ws, 403, '身份校验失败，请重新进入房间');
+        return;
+      }
+      // 防御：token 与 playerId 指向不同成员时直接拒绝，避免出现"凭 A 的 token 报 B 的名"
+      if (player.id !== playerId) {
+        rejectHandshake(ws, 403, '身份校验失败，请重新进入房间');
         return;
       }
 
       // 注册到连接池
       if (!roomSockets.has(roomId)) roomSockets.set(roomId, new Set());
       roomSockets.get(roomId)!.add(ws);
-      socketMeta.set(ws, { roomId, role, playerId, lastActivity: Date.now() });
+      socketMeta.set(ws, { roomId, role, playerId, sessionToken, lastActivity: Date.now() });
 
       // 恢复连接层在线标记：仅表示 socket 上线，不清除断线等待记录 ——
       // 「重连成功」以玩家显式调用 POST /rooms/:id/reconnect（真正回到对局页面）为准，

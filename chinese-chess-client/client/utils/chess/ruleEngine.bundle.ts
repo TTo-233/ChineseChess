@@ -1,5 +1,8 @@
 /**
- * 服务端权威裁决引擎入口（esbuild 打包为 ruleEngine.cjs，由 dist/index.js 加载）
+ * 服务端权威裁决引擎入口（esbuild 打包为 ruleEngine.cjs，由
+ * `chinese-chess-server/src/routes/lanGame.ts:6` 的
+ * `import ruleEngine from '../ruleEngine.cjs'` 加载；【I-1】原注释此处写的是
+ * 已过期的 dist 行号口径，实际调用点在服务端**源码**里）
  *
  * 联机对局走子协议改造（方案 P0「服务端权威裁决」）：客户端只发着法，
  * 服务端以与客户端完全相同的规则引擎（GameEngine + RuleEngine）进行
@@ -10,7 +13,7 @@
  * 【服务端权威校验的落点：这里的 getValidMoves 比客户端多一道王安全过滤】
  *
  * 2026-09 送将事故：4ccdae5 取消了 getValidMoves 的王安全过滤之后，本入口
- * 导出的 getValidMoves 也随之失去过滤，于是 dist/index.js 中那句
+ * 导出的 getValidMoves 也随之失去过滤，于是服务端 `src/routes/lanGame.ts:1273` 中那句
  * `const valid = ruleEngine.getValidMoves(state, pieceId)`（原注释写着"含王安全过滤"）
  * 实际上只校了走法形状——旧客户端或篡改客户端可以照常送将，
  * 把对局推进到「正被将军却无人应招」的非法局面（服务端 Pikafish 从不吃将，
@@ -36,10 +39,11 @@ import {
   makeMove,
   createInitialState,
   cloneGameState,
+  applyHandicap,
   type GameState,
 } from './GameEngine';
 
-export { makeMove, createInitialState, cloneGameState };
+export { makeMove, createInitialState, cloneGameState, applyHandicap };
 export { isMoveBanned } from './RuleEngine';
 
 /**

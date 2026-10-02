@@ -1,5 +1,6 @@
+import crypto from 'node:crypto';
 import express from 'express';
-import type { Response } from 'express';
+import type { Request, Response } from 'express';
 
 // 长将长捉规则引擎（服务端权威裁决，方案 P0）：与客户端共享同一份源码，
 // 由 client/utils/chess/ruleEngine.bundle.ts 经 esbuild 编译为 ../ruleEngine.cjs
@@ -7,15 +8,91 @@ import ruleEngine from '../ruleEngine.cjs';
 
 const router = express.Router();
 
-// 活跃打点中间件：任何带身份（playerId，Body 或 Query）的 HTTP 请求都刷新成员在线时间。
+// ============================================================================
+// 【S-1 / §3.1】身份认证：sessionToken
+//
+// 改造前：playerId 全由客户端自报（createInitialState 之外的所有路由都以 body.playerId
+// 定位成员），任何知道 roomId + playerId 的人都能替对方「重连」清零断线判负倒计时、
+// 替对方「认输/求和/回房间」，甚至替对方走棋。
+//
+// 改造后：加入房间时由服务端签发 sessionToken（32 字节加密随机，base64url 编码），
+// 它才是成员身份的唯一凭据；playerId 退化为**显示用标识**，不再参与任何鉴权。
+// token 通过 `x-session-token` 头或 body.sessionToken 传递（WebSocket 用 URL query）。
+//
+// 三条刻意保留的边界，避免把它做成"看起来更安全"的假象：
+//   1. 观战者不需要 token：观战没有任何写操作，身份只用于把观众从列表里摘掉。
+//   2. GET 类只读路由（房间详情 / 局面 / 房间列表 / active）仍按 playerId 或不校验：
+//      它们不产生副作用，读到的信息在"能猜到房间号"的前提下本来就无法保密。
+//   3. POST /rooms/:id/join 的幂等重入仍按 playerId 匹配——因为这条路径的语义就是
+//      "客户端会话丢失后凭 playerId 找回席位"，此时它手上必然没有可用 token。
+//      残余风险是"拿到别人 playerId 的人可以顶掉对方昵称并把对方标记为在线"，
+//      彻底消除需要客户端在退出房间时显式注销会话（属于下一步工作）。
+// ============================================================================
+
+// token 字节数：32 字节 = 256 bit，远超 128 bit 下限
+const SESSION_TOKEN_BYTES = 32;
+
+// 签发新 token。房间创建与新成员加入时各签发一次。
+function issueSessionToken(): string {
+  return crypto.randomBytes(SESSION_TOKEN_BYTES).toString('base64url');
+}
+
+// 常量时间比较，避免 token 被逐字节爆破（时序侧信道）。
+// 先比长度是因为 timingSafeEqual 要求两个 Buffer 等长，长度本身不是秘密。
+function tokenEquals(a: unknown, b: unknown): boolean {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  if (a.length !== b.length || a.length === 0) return false;
+  return crypto.timingSafeEqual(Buffer.from(a, 'utf8'), Buffer.from(b, 'utf8'));
+}
+
+// 从请求里取 token：头优先，其次 body（客户端早期实现走 body），最后 query（WS 专用）。
+function readSessionToken(req: Request): string {
+  const header = req.headers['x-session-token'];
+  const fromHeader = Array.isArray(header) ? header[0] : header;
+  if (typeof fromHeader === 'string' && fromHeader) return fromHeader;
+  const fromBody = req.body?.sessionToken;
+  if (typeof fromBody === 'string' && fromBody) return fromBody;
+  const fromQuery = req.query.sessionToken;
+  return typeof fromQuery === 'string' ? fromQuery : '';
+}
+
+// 按 token 定位房间成员。
+// 导出供 battleWs.ts 复用（WS 握手同样必须校验 token，见 S-1 / §3.1）
+export function findPlayerByToken(room: Room, token: string): Player | null {
+  if (!token) return null;
+  return room.players.find(p => tokenEquals(p.sessionToken, token)) ?? null;
+}
+
+// 鉴权失败的统一响应形状（第 3 批：全端只此一种失败形状，见 ./actionOutcome 的 failBody）
+function FORBIDDEN(message = '身份校验失败，请重新进入房间'): ActionResult {
+  return actionFailure(403, message, {}, 'forbidden');
+}
+
+// 玩家对象对外下发前剔除 token：任何把 room 整体 json 出去的路由都必须过这一层，
+// 否则 token 会随房间负载泄给同房间的**对方**（房主能 GET 到 members 就算失败）。
+function stripPlayerToken(player: Player): Omit<Player, 'sessionToken'> {
+  const { sessionToken: _secret, ...rest } = player;
+  return rest;
+}
+
+// 房间对象对外下发前剔除成员 token：只浅拷贝一层并替换 players 数组，
+// 其余字段（settings/gameState/clocks 等）都是共享引用，且不含任何凭据。
+function stripRoomTokens(room: Room): Omit<Room, 'players' | 'stateHistory'> & { players: Array<Omit<Player, 'sessionToken'>> } {
+  const { players, stateHistory: _history, ...rest } = room;
+  return { ...rest, players: players.map(stripPlayerToken) };
+}
+
+// 活跃打点中间件：任何带身份的 HTTP 请求都刷新成员在线时间。
 // 等待清扫器据此按「真实活跃」判定——WS 半死不活（如代理静默断连）但 HTTP 轮询/动作
 // 正常的客户端不再被误踢出房间（否则踢人重置会在公示倒数中途清空选边与公示状态）
+// 【S-1】身份口径改为 sessionToken：未持 token 的请求本来会在下游被 403 拒掉，
+// 但它们的 playerId 会让打点虚增成员在线时间，反而削弱「等待阶段清扫失活成员」这条加固。
 router.use((req, _res, next) => {
   const match = req.path.match(/^\/rooms\/([^/]+)/);
-  const playerId = (req.body?.playerId ?? req.query.playerId) as string | undefined;
-  if (match && playerId) {
+  const token = readSessionToken(req);
+  if (match && token) {
     const room = rooms.get(match[1]);
-    const player = room?.players.find(p => p.id === playerId);
+    const player = room ? findPlayerByToken(room, token) : null;
     if (player) player.lastWsAt = Date.now();
   }
   next();
@@ -60,8 +137,13 @@ const ACTIVE_ROOM_TTL = 2 * 60 * 60 * 1000; // 2小时无活动的对局房间
 const GC_INTERVAL = 60 * 1000; // 每分钟检查一次
 // 开局倒计时（毫秒）：执棋公示后由服务端锚定的统一开局时刻，两端以此绝对时间倒数，天然一致
 const START_COUNTDOWN_MS = 3000;
-// 开局时刻容差（毫秒）：上传方在 gameStartAt 前最多提前该时长请求开局仍被接受（抵消网络往返）
+// 开局时刻容差（毫秒）：客户端在 gameStartAt 前最多提前该时长请求开局仍被接受（抵消网络往返）
 const START_TOLERANCE_MS = 500;
+// 【S-2 / §3.2】悔棋快照栈上限：单局对局步数正常在 60~150 手之间，
+// 200 意味着「整局任何时刻都可以悔棋」且内存有硬上界（单份 GameState 约 10~20 KB，
+// 200 份 ≈ 2~4 MB/房间；房间本身受 ACTIVE_ROOM_TTL(2h) 回收，不构成长期占用）。
+// 超出即丢弃最早的一份（此时悔棋只能退到 200 步之内，与"本来也退不了那么远"一致）。
+const STATE_HISTORY_MAX = 200;
 
 // 房间数据存储（内存中）
 interface Player {
@@ -72,11 +154,14 @@ interface Player {
   ready: boolean;
   connected: boolean;
   lastHeartbeat: number; // 最后一次心跳时间
-  lastWsAt: number; // 最后一次活跃时间（WS 连接/消息/pong 或任何带 playerId 的 HTTP 请求）：等待阶段清扫失活成员的依据
+  lastWsAt: number; // 最后一次活跃时间（WS 连接/消息/pong 或任何带 sessionToken 的 HTTP 请求）：等待阶段清扫失活成员的依据
   undoRefusals: number; // 本局悔棋请求被对方连续拒绝的次数（同意清零；≥2 时本局禁止再发起悔棋）
   drawRefusals: number; // 本局求和请求被对方连续拒绝的次数（同意清零；≥2 时本局禁止再发起求和）
   hidden?: boolean; // 客户端上报的页面可见性：true=标签页处于后台（浏览器会节流定时器）
   hiddenSince?: number; // 进入后台的时刻（0=不在后台）：用于限制单次连续后台的保护时长
+  // 【S-1 / §3.1】成员身份的唯一凭据（base64url 编码的 32 字节加密随机数）。
+  // ⚠️ 绝不随任何房间/玩家负载下发：见 stripPlayerToken。凡是 json 整个 room 的地方都要过那层。
+  sessionToken: string;
 }
 
 export interface Room {
@@ -105,8 +190,13 @@ export interface Room {
   lastMoveTime: number | null; // 上一步的时间（用于限时判定）
   disconnectedPlayerId: string | null; // 断线玩家ID
   disconnectTime: number | null; // 断线检测时间
-  pendingUndo: { playerId: string; proposedState: any; requestTime: number } | null; // 待对方同意的悔棋请求
-  undoResult: { playerId: string; agreed: boolean; reason: 'agreed' | 'refused' | 'timeout'; time: number } | null; // 悔棋处理结果（通知请求方）
+  pendingUndo: { playerId: string; requestTime: number } | null; // 待对方同意的悔棋请求
+  // 【S-2 / §3.2】悔棋快照栈：每次**合法走子落盘之前**把当前权威局面压入。
+  // 元素类型沿用 gameState 的 any（规则引擎的 GameState 类型没有跨端导出，见 ruleEngine.bundle.ts）。
+  // 栈顶 = 上一步落子之前的局面，悔棋同意时直接 pop 使用，客户端不再有权提交目标局面。
+  // 生命周期：startPlayingRoom 初始化为 []，随房间一起被 GC 回收，不跨局残留。
+  stateHistory: any[];
+  undoResult: { playerId: string; agreed: boolean; reason: 'agreed' | 'refused' | 'timeout' | 'no_snapshot'; time: number } | null; // 悔棋处理结果（通知请求方）
   pendingDraw: { playerId: string; requestTime: number } | null; // 待响应的求和请求
   drawResult: { playerId: string; agreed: boolean; reason: 'agreed' | 'refused' | 'timeout'; time: number } | null; // 求和处理结果（通知请求方）
   sideReveal: { time: number; random: boolean; handicap?: boolean } | null; // 执棋结果公示信息（双方准备后生成；random=选边相同随机分配；handicap=让子直分公示，可回退）
@@ -117,6 +207,7 @@ export interface Room {
   clockPausedAt: number | null; // 悔棋/求和协商期间的棋钟暂停锚点（恢复时按暂停时长顺延 lastMoveTime）
   returnedToRoom?: Record<string, number>; // 结算后每位玩家「已返回房间」的时刻（playerId → 时间戳）；由 expireReturnedPlayers 按 TTL 兜底清理
   lastRejectionSyncAt?: number; // 被拒动作回推权威状态的限流锚点：同一房间 3 秒计数窗口的起点
+  rejectionSyncCount?: number; // 同一计数窗口内已回推的次数（上限 8）；【S-2】从模块级全局移到这里
   createdAt: number;
   lastActivity: number;
 }
@@ -136,7 +227,13 @@ export const rooms: Map<string, Room> = new Map();
 let roomBroadcaster: (room: Room) => void = () => {};
 export function registerRoomBroadcaster(fn: (room: Room) => void): void {
   roomBroadcaster = fn;
+  // 广播器可能被重新注册（测试里注入替身），公共层必须同步拿到新的那一个
+  registerRoomAccess(id => rooms.get(id), r => roomBroadcaster(r as Room));
 }
+
+// 【第 3 批】把房间查找接到跨通道公共层：模块加载时先接一次（此时 broadcaster 还是空操作，
+// 之后由上面的 registerRoomBroadcaster 覆盖成真正的 WS 广播）。
+registerRoomAccess(id => rooms.get(id), r => roomBroadcaster(r as Room));
 
 // WebSocket 连接存活探针：由 battleWs 模块注入（避免 lanGame ↔ battleWs 循环依赖），
 // 供等待阶段清扫「人不在房间页面」的残留成员（iOS 侧滑/杀进程等未走 /leave 的退出路径）
@@ -152,46 +249,28 @@ const WAITING_SWEEP_GRACE_MS = 30 * 1000;
 // 被拒绝的动作回推权威状态（客户端只按 <400 收 state，被拒绝的动作会导致画面永久停在乐观更新后的样子）
 // 加固：历史上前身是直接注入 dist 的补丁，现已归位到源码（改这里即可，改完在 chinese-chess-server/ 下跑 node build.js）。
 //
-// 被拒绝的动作必须把**权威状态**也回推给双方。
-// 客户端应用服务端状态的唯一入口是 state 帧 / GET /rooms/:id/gameState，
-// 而服务端原本只在 result.status < 400 时才广播（且广播的是当前 room 状态）；
-// 于是「不是你的回合」「非法走法（含送将）」「对方的悔棋请求已被处理」这类拒绝
-// 会让客户端毫无感知：落子的乐观更新留在盘上、悔棋按钮停在「等待对方同意」，
-// 直到下一次成功动作才被顺带纠正。
+// 被拒绝的动作必须把**权威状态**也回推给双方。客户端应用服务端状态的唯一入口是
+// state 帧 / GET /rooms/:id/gameState，而服务端原本只在 result.status < 400 时才广播：
+// 于是「不是你的回合」「非法走法（含送将）」「对方的悔棋请求已被处理」这类拒绝会让客户端毫无感知
+// （落子的乐观更新留在盘上、悔棋按钮停在「等待对方同意」），直到下一次成功动作才被顺带纠正。
 //
-// 这里在非 2xx 时补一次广播（room 未变，所以推过去的正是权威局面）。
-// 限流：同一房间 3 秒内最多 8 次，避免被连续非法请求刷屏；
-// 且只对 4xx 生效——5xx 属于服务端自身异常，不该顺手改写客户端对局画面。
-let syncRejectionCount = 0;
+// 本轮（第 3 批）把这段判定连同 HTTP/WS 两份重复实现一并抽到 ./actionOutcome 的
+// `settleActionOutcome`：限流判据、计数锚点、广播时机只剩一份实现。
 
-// 对局动作的统一返回结构（供 HTTP 与 WebSocket 两种通道复用同一套核心逻辑）
-export interface ActionResult {
-  status: number;
-  body: Record<string, unknown>;
-}
-
-// HTTP 通道统一响应：动作成功时向房间内所有 WebSocket 连接广播最新状态
-function respondAction(res: Response, roomId: string, result: ActionResult): void {
-  var rejected = result.status >= 400;
-  if (result.status < 400) {
-    syncRejectionCount = 0;
-  }
-  var roomForSync = rooms.get(roomId);
-  if (rejected && result.status < 500 && roomForSync) {
-    var nowSync = Date.now();
-    var lastSyncAt = roomForSync.lastRejectionSyncAt || 0;
-    if (nowSync - lastSyncAt >= 3000) {
-      syncRejectionCount = 0;
-    }
-    if (syncRejectionCount < 8) {
-      syncRejectionCount += 1;
-      roomForSync.lastRejectionSyncAt = nowSync;
-      roomBroadcaster(roomForSync);
-    }
-  }
-
-  res.status(result.status).json(result.body);
-}
+// 【第 3 批】跨通道动作结算与失败响应形状已抽出到 ./actionOutcome：
+//   - `ActionResult` / `failBody` / `actionFailure` 是失败 body 的唯一构造入口；
+//   - `settleActionOutcome` 是「动作执行 → 广播 → 4xx 限流回推」的唯一实现，
+//     HTTP 的 `respondAction` 与 WS 的 `handleMessage` 都走它，口径无法再分叉（§8 表 #1）。
+// 本文件仍保留 `rooms` / `roomBroadcaster` 的所有权，并把两者注入公共层（registerRoomAccess）。
+export { ActionResult, failBody, actionFailure, shouldSyncRejection } from './actionOutcome';
+import {
+  ActionResult,
+  actionFailure,
+  failBody,
+  registerRoomAccess,
+  respondAction,
+  type FailureCode,
+} from './actionOutcome';
 
 // 生成房间ID：6位数字（100000-999999），确保与现有房间不重复
 function generateRoomId(): string {
@@ -269,6 +348,28 @@ function expirePendingUndo(room: Room): boolean {
   return changed;
 }
 
+// 【第 3 批 / §8 #5】终局时清理「在途协商」字段的唯一实现。
+//
+// 为什么要单点：终局有六条路径（绝杀/困毙、认输、和棋、断线判负、时钟超时、离场弃局），
+// 每条都要把 clockPausedAt 与 pendingUndo/undoResult/pendingDraw/drawResult 清干净——
+// 漏一条，客户端就会在结算页上渲染出「等待对方同意悔棋/求和」的残留协商 UI
+// （useBattleStateSync 的协商分支只认 pending*/result 的存在，不看 phase）。
+// 历史上 actRematch 与 settleAbandonedPlayingRoom 清全套、actDrawResponse 只清 pendingUndo，
+// 于是「求和同意结束」与「认输结束」表现不同：同一个语义两种画面。
+//
+// 关于「在途提示会不会被清掉」：清空后客户端的协商分支靠
+// `else if (!pendingDraw && pendingDrawRef.current)` 同样会解除「求和中/悔棋中」的等待态
+// （useBattleStateSync 的判据是 pending 或 result 任一存在），
+// 而 result 本来也会被 expirePendingUndo/expirePendingDraw 在 15s 后清掉——
+// 提前清只是把「等 15 秒才消失」变成「立刻消失」，不会把等待态卡死。
+function clearEndedNegotiations(room: Room): void {
+  room.clockPausedAt = null;
+  room.pendingUndo = null;
+  room.undoResult = null;
+  room.pendingDraw = null;
+  room.drawResult = null;
+}
+
 // 清理过期求和请求（返回是否有变更，供实时广播判断）
 function expirePendingDraw(room: Room): boolean {
   let changed = false;
@@ -343,7 +444,8 @@ function detectDisconnect(room: Room): boolean {
       room.winner = disconnectedPlayer.side === 'red' ? 'black' : 'red';
       room.endReason = 'disconnect';
       room.phase = 'ended';
-      room.clockPausedAt = null; // 终局清空暂停锚点，保持载荷干净
+      // 【第 3 批 / §8 #5】终局字段清理统一走 clearEndedNegotiations
+      clearEndedNegotiations(room);
       room.lastActivity = now;
       changed = true;
     }
@@ -368,7 +470,8 @@ function detectClockTimeout(room: Room): boolean {
   room.winner = current === 'red' ? 'black' : 'red';
   room.endReason = 'timeout';
   room.phase = 'ended';
-  room.clockPausedAt = null; // 终局清空暂停锚点，保持载荷干净
+  // 【第 3 批 / §8 #5】终局字段清理统一走 clearEndedNegotiations
+  clearEndedNegotiations(room);
   room.lastActivity = Date.now();
   return true;
 }
@@ -533,7 +636,9 @@ function healStaleEndedRoom(room: Room): boolean {
   if (!room.players.some(p => p.id === room.hostId)) {
     transferHost(room); // 房主易主：让子自动取消
   }
-  actRematch(room.id, {}); // ended → waiting：重置准备/选边/公示，大厅立即可见
+  // 服务端自愈路径（GC 主动收口，不是玩家发起的动作）：用留存玩家自己的 token 走同一份鉴权，
+  // 保证 actRematch 只有被房间成员调用时才生效（【S-1 / §3.1】）
+  actRematch(room.id, {}, room.players[0].sessionToken); // ended → waiting：重置准备/选边/公示，大厅立即可见
   return true;
 }
 
@@ -575,19 +680,47 @@ export function settleAbandonedPlayingRoom(room: Room, leaverId?: string | null)
   room.endReason = 'leave';
   // 离场不是认输：surrenderBy 保持为空，避免结算文案把「离开」说成「认输」
   room.surrenderBy = null;
-  room.clockPausedAt = null;
+  // 【第 3 批 / §8 #5】终局字段清理统一走 clearEndedNegotiations
+  clearEndedNegotiations(room);
   room.disconnectedPlayerId = null;
   room.disconnectTime = null;
-  room.pendingUndo = null;
-  room.undoResult = null;
-  room.pendingDraw = null;
-  room.drawResult = null;
   room.lastActivity = Date.now();
   return true;
 }
 
+// 开局的唯一落地入口（【S-8 / §3.8】）：服务端自己生成权威初始局面并初始化悔棋快照栈。
+//
+// 改造前这一步由客户端「上传初始局面」完成（旧协议分支 POST /gameState 带完整 gameState），
+// 代价是权威局面的**第一来源在客户端**：伪造一个「我方绝杀对方」的 gameState 直接判胜。
+// 现在客户端只负责发着法，初始局面（含让子）完全由服务端用**与客户端同源**的规则引擎构造，
+// 两端不可能对开局位置产生分歧。
+//
+// actStart（客户端倒数结束后主动请求）与 tryAutoStart（服务端统一定时到点）共用本函数，
+// 消除历史上两条开局路径校验口径不一致的问题（S-19）。
+function startPlayingRoom(room: Room): void {
+  room.phase = 'playing';
+  room.matchId += 1; // 对局纪元 +1：客户端据此识别新局，重赛后的旧快照（旧 matchId）一律忽略
+  room.gameStartTime = Date.now();
+  room.gameStartAt = null; // 开局时刻已消费
+  room.lastMoveTime = Date.now();
+  room.lastActivity = Date.now();
+  // 局时时钟初始化（基本用时+加秒制；局时为 0 表示不限时，不启用时钟）
+  room.clocks = room.settings.baseTimeSeconds > 0
+    ? { red: room.settings.baseTimeSeconds * 1000, black: room.settings.baseTimeSeconds * 1000 }
+    : null;
+  // 心跳基线对齐到开局时刻：等待阶段没有心跳流动，若沿用加入时刻的旧基线，
+  // 开局瞬间的心跳超时检测会把双方误判为断线
+  room.players.forEach((p) => { p.lastHeartbeat = Date.now(); });
+  // 权威初始局面：红先（createInitialState 默认 RED_SIDE），再按房间设置应用让子
+  // （移除红方指定棋子）。ruleEngine 是 ruleEngine.bundle.ts 的 esbuild 产物，
+  // 与客户端共享 GameEngine 同一份源码，两端算出的开局位置必然一致。
+  room.gameState = ruleEngine.applyHandicap(ruleEngine.createInitialState(), room.settings.handicap);
+  // 快照栈初始化为空：栈内保存的是「每手走子之前」的局面，开局这一手之前没有更早的局面。
+  room.stateHistory = [];
+}
+
 // 统一定时自动开局：公示锚定的开局时刻（gameStartAt）到点后由服务端权威开局。
-// 不依赖上传方客户端的 /start 成功——上传方请求失败/延迟时，对端客户端会永远卡在
+// 不依赖任一客户端的 /start 成功——请求失败/延迟时，对端客户端会永远卡在
 // 公示阶段（无法走子、无操作按钮）；由每秒 tick 驱动，到点后最多延迟 1 个 tick 生效
 function tryAutoStart(room: Room): boolean {
   if (room.phase !== 'waiting') return false;
@@ -598,18 +731,8 @@ function tryAutoStart(room: Room): boolean {
   const sides = room.players.map(p => p.side);
   if (!sides.includes('red') || !sides.includes('black')) return false;
 
-  room.phase = 'playing';
-  room.matchId += 1; // 对局纪元 +1：客户端据此识别新局（与 actStart 同一套语义）
-  room.gameStartTime = Date.now();
-  room.gameStartAt = null; // 开局时刻已消费（sideReveal 保留，与 actStart 一致，重赛/离开时统一清理）
-  room.lastMoveTime = Date.now();
-  room.lastActivity = Date.now();
-  // 局时时钟初始化（基本用时+加秒制；局时为 0 表示不限时，不启用时钟）
-  room.clocks = room.settings.baseTimeSeconds > 0
-    ? { red: room.settings.baseTimeSeconds * 1000, black: room.settings.baseTimeSeconds * 1000 }
-    : null;
-  // 心跳基线对齐到开局时刻（与 actStart 同理，防止开局瞬间被误判断线）
-  room.players.forEach((p) => { p.lastHeartbeat = Date.now(); });
+  // 【S-8】初始局面由服务端统一构造（与 actStart 同一入口，两条开局路径口径完全一致）
+  startPlayingRoom(room);
   return true;
 }
 
@@ -678,16 +801,16 @@ router.post('/rooms', (req, res) => {
   const { playerName, playerId, turnTimeSeconds, roomName, password, baseTimeSeconds, incrementSeconds, byoyomiSeconds, handicap } = req.body;
 
   if (!playerName) {
-    return res.status(400).json({ error: '玩家名称不能为空' });
+    return res.status(400).json(failBody(400, '玩家名称不能为空'));
   }
 
   const trimmedPassword = typeof password === 'string' ? password.trim() : '';
   const trimmedRoomName = typeof roomName === 'string' ? roomName.trim() : '';
   if (trimmedRoomName.length > 5) {
-    return res.status(400).json({ error: '房间名最长 5 个字符' });
+    return res.status(400).json(failBody(400, '房间名最长 5 个字符'));
   }
   if (trimmedPassword && !/^\d{1,6}$/.test(trimmedPassword)) {
-    return res.status(400).json({ error: '密码需为 6 位以内纯数字' });
+    return res.status(400).json(failBody(400, '密码需为 6 位以内纯数字'));
   }
   // 每轮限时（秒）：非法/缺省视为 0（不限时），上限 3600 秒
   const rawTurnSeconds = Number(turnTimeSeconds);
@@ -696,13 +819,15 @@ router.post('/rooms', (req, res) => {
     : 0;
   const clockSettings = parseClockSettings(baseTimeSeconds, incrementSeconds, byoyomiSeconds);
   if ('error' in clockSettings) {
-    return res.status(400).json({ error: clockSettings.error });
+    return res.status(400).json(failBody(400, clockSettings.error));
   }
   const handicapIds = parseHandicap(handicap);
   if ('error' in handicapIds) {
-    return res.status(400).json({ error: handicapIds.error });
+    return res.status(400).json(failBody(400, handicapIds.error));
   }
   const roomId = generateRoomId();
+  // 【S-1 / §3.1】房主 token 在建房时签发，随响应单独下发（不放进 room 对象里）
+  const hostSessionToken = issueSessionToken();
   const room: Room = {
     id: roomId,
     name: trimmedRoomName || defaultRoomName(),
@@ -720,6 +845,7 @@ router.post('/rooms', (req, res) => {
         lastWsAt: Date.now(),
         undoRefusals: 0,
         drawRefusals: 0,
+        sessionToken: hostSessionToken,
       },
     ],
     gameState: null,
@@ -753,13 +879,16 @@ router.post('/rooms', (req, res) => {
     returnedToRoom: {},
     spectators: [],
     emojiMessages: [],
+    stateHistory: [], // 【S-2】悔棋快照栈，开局时由 startPlayingRoom 重置
     createdAt: Date.now(),
     lastActivity: Date.now(),
   };
 
   rooms.set(roomId, room);
 
-  res.json({ roomId, room });
+  // ⚠️ room 一律剥掉 players[].sessionToken 后再下发：房主/成员能看到对方是谁，
+  // 但绝不能看到对方的 token（否则任何一端都能冒充对方做一切事，等于没有鉴权）。
+  res.json({ roomId, room: stripRoomTokens(room), sessionToken: hostSessionToken });
 });
 
 // 获取房间列表（等待中可加入的房间 + 对战中房间，前端展示对局状态）
@@ -843,39 +972,55 @@ router.post('/rooms/:roomId/join', (req, res) => {
   const { playerName, playerId, password } = req.body;
 
   if (!playerName) {
-    return res.status(400).json({ success: false, message: '玩家名称不能为空' });
+    return res.status(400).json(failBody(400, '玩家名称不能为空'));
   }
 
   const room = rooms.get(roomId);
   if (!room) {
-    return res.status(404).json({ success: false, message: '房间不存在或已关闭' });
+    return res.status(404).json(failBody(404, '房间不存在或已关闭'));
   }
 
   // 幂等加入：同一玩家重复加入直接返回成功（断线重连/刷新场景，无需再校验密码）
+  //
+  // 【S-1 / §3.1】这里**只能**按 playerId 匹配，因为这条路径的语义就是「客户端会话丢失
+  // （清了缓存 / 换设备 / token 未持久化）后凭 playerId 找回席位」——此时它手上必然没有
+  // 任何可用 token，按 token 匹配会把这条唯一的找回路径也堵死。
+  // 因此这里会重新签发 token（旧 token 立即失效），代价是「拿到别人 playerId 的人可以
+  // 顶掉对方昵称、把对方标记为在线、并使对方的旧 token 作废」。
+  // 彻底消除它需要客户端在退出房间时显式注销会话并由服务端清理席位，属于下一步工作；
+  // 在那之前，这个残留风险由 §3.1 的其余加固（所有写操作仍按 token 鉴权）兜住：
+  // 顶掉昵称/标记在线不产生任何对局影响，真正的操作依然需要新 token，而新 token 只发给
+  // 重新发起 join 的那一方（也就是发起顶替的那一方）。
   const existing = room.players.find(p => p.id === playerId);
   if (existing) {
     existing.name = playerName;
     existing.connected = true;
     existing.lastHeartbeat = Date.now();
-    return res.json({ success: true, room, player: existing });
+    existing.sessionToken = issueSessionToken();
+    return res.json({
+      success: true,
+      room: stripRoomTokens(room),
+      player: stripPlayerToken(existing),
+      sessionToken: existing.sessionToken,
+    });
   }
 
   if (room.players.length >= 2) {
-    return res.status(400).json({ success: false, message: '房间已满' });
+    return res.status(400).json(failBody(400, '房间已满'));
   }
 
   if (room.phase !== 'waiting') {
-    return res.status(400).json({ success: false, message: '该房间对局已开始' });
+    return res.status(400).json(failBody(400, '该房间对局已开始'));
   }
 
   // 密码校验（房间设有密码时）
   if (room.password) {
     const inputPassword = typeof password === 'string' ? password.trim() : '';
     if (!inputPassword) {
-      return res.status(401).json({ success: false, message: '该房间需要密码', needPassword: true });
+      return res.status(401).json(failBody(401, '该房间需要密码', { needPassword: true }));
     }
     if (inputPassword !== room.password) {
-      return res.status(401).json({ success: false, message: '房间密码错误', needPassword: true });
+      return res.status(401).json(failBody(401, '房间密码错误', { needPassword: true }));
     }
   }
 
@@ -890,12 +1035,18 @@ router.post('/rooms/:roomId/join', (req, res) => {
     lastWsAt: Date.now(),
     undoRefusals: 0,
     drawRefusals: 0,
+    sessionToken: issueSessionToken(), // 【S-1】加入即签发
   };
 
   room.players.push(player);
   room.lastActivity = Date.now();
 
-  res.json({ success: true, room, player });
+  res.json({
+    success: true,
+    room: stripRoomTokens(room),
+    player: stripPlayerToken(player),
+    sessionToken: player.sessionToken,
+  });
 });
 
 // 获取房间详情（含玩家选边/准备状态与执棋公示信息；不返回密码明文）
@@ -904,7 +1055,7 @@ router.get('/rooms/:roomId', (req, res) => {
   const room = rooms.get(roomId);
 
   if (!room) {
-    return res.status(404).json({ error: '房间不存在' });
+    return res.status(404).json(failBody(404, '房间不存在'));
   }
 
   res.json({
@@ -942,23 +1093,28 @@ router.get('/rooms/:roomId', (req, res) => {
 // 修改房间信息与设置（仅房主、仅等待阶段；对局开始后锁定）
 router.patch('/rooms/:roomId/settings', (req, res) => {
   const { roomId } = req.params;
-  const { playerId, name, password, turnTimeSeconds, baseTimeSeconds, incrementSeconds, byoyomiSeconds, handicap } = req.body;
+  const { name, password, turnTimeSeconds, baseTimeSeconds, incrementSeconds, byoyomiSeconds, handicap } = req.body;
 
   const room = rooms.get(roomId);
   if (!room) {
-    return res.status(404).json({ error: '房间不存在' });
+    return res.status(404).json(failBody(404, '房间不存在'));
   }
   if (room.phase !== 'waiting') {
-    return res.status(400).json({ error: '对局已开始，无法修改房间设置' });
+    return res.status(400).json(failBody(400, '对局已开始，无法修改房间设置'));
   }
-  if (room.players[0]?.id !== playerId) {
-    return res.status(403).json({ error: '仅房主可修改房间设置' });
+  // 【S-1 + S-7】房主判定改用「持有 token 的成员 id === room.hostId」：
+  // 原实现是 `room.players[0]?.id !== playerId`，既信任自报的 playerId，
+  // 又把「数组第一个」等同于房主，与显式 hostId 字段形成双源真相
+  // （/leave 用 filter 重建 players 数组会改变顺序，进而改变"房主是谁"）。
+  const actor = findPlayerByToken(room, readSessionToken(req));
+  if (!actor || actor.id !== room.hostId) {
+    return res.status(403).json(failBody(403, '仅房主可修改房间设置'));
   }
 
   if (name !== undefined) {
     const trimmed = String(name).trim();
     if (!trimmed || trimmed.length > 5) {
-      return res.status(400).json({ error: '房间名需为 1~5 个字符' });
+      return res.status(400).json(failBody(400, '房间名需为 1~5 个字符'));
     }
     room.name = trimmed;
   }
@@ -966,14 +1122,14 @@ router.patch('/rooms/:roomId/settings', (req, res) => {
     // 空串/null 表示清除密码
     const pwd = String(password ?? '').trim();
     if (pwd && !/^\d{1,6}$/.test(pwd)) {
-      return res.status(400).json({ error: '密码需为 6 位以内纯数字' });
+      return res.status(400).json(failBody(400, '密码需为 6 位以内纯数字'));
     }
     room.password = pwd || null;
   }
   if (turnTimeSeconds !== undefined) {
     const secs = Number(turnTimeSeconds);
     if (!Number.isFinite(secs) || secs < 0 || secs > 3600) {
-      return res.status(400).json({ error: '限时需在 0~3600 秒之间（0=不限时）' });
+      return res.status(400).json(failBody(400, '限时需在 0~3600 秒之间（0=不限时）'));
     }
     room.settings.turnTimeLimit = Math.round(secs);
   }
@@ -985,7 +1141,7 @@ router.patch('/rooms/:roomId/settings', (req, res) => {
       byoyomiSeconds !== undefined ? byoyomiSeconds : room.settings.byoyomiSeconds,
     );
     if ('error' in parsed) {
-      return res.status(400).json({ error: parsed.error });
+      return res.status(400).json(failBody(400, parsed.error));
     }
     room.settings.baseTimeSeconds = parsed.baseTimeSeconds;
     room.settings.incrementSeconds = parsed.incrementSeconds;
@@ -994,7 +1150,7 @@ router.patch('/rooms/:roomId/settings', (req, res) => {
   if (handicap !== undefined) {
     const parsed = parseHandicap(handicap);
     if ('error' in parsed) {
-      return res.status(400).json({ error: parsed.error });
+      return res.status(400).json(failBody(400, parsed.error));
     }
     room.settings.handicap = parsed.ids;
   }
@@ -1023,40 +1179,41 @@ router.patch('/rooms/:roomId/settings', (req, res) => {
 
 // 选择执棋方（双方均准备后开启；双方选定并公示前可自由更改）
 // 选边核心逻辑（HTTP 与 WebSocket 共用）
-export function actSide(roomId: string, body: Record<string, unknown>): ActionResult {
-  const { playerId, side } = body as { playerId?: string; side?: string };
+export function actSide(roomId: string, body: Record<string, unknown>, sessionToken: string): ActionResult {
+  const { side } = body as { side?: string };
 
   const room = rooms.get(roomId);
   if (!room) {
-    return { status: 404, body: { success: false, message: '房间不存在' } };
+    return actionFailure(404, '房间不存在');
   }
 
   if (room.phase !== 'waiting') {
-    return { status: 400, body: { success: false, message: '对局已开始' } };
+    return actionFailure(400, '对局已开始');
   }
 
   // 让子房间跳过选边（双方就绪时服务端已直分公示：房主执红先行）
   if (room.settings.handicap.length > 0) {
-    return { status: 400, body: { success: false, message: '让子对局由房主执红先行，无需选边' } };
+    return actionFailure(400, '让子对局由房主执红先行，无需选边');
   }
 
   if (side !== 'red' && side !== 'black') {
-    return { status: 400, body: { success: false, message: '执棋方只能是 red 或 black' } };
+    return actionFailure(400, '执棋方只能是 red 或 black');
   }
 
-  const player = room.players.find(p => p.id === playerId);
+  // 【S-1 / §3.1】按 sessionToken 定位成员
+  const player = findPlayerByToken(room, sessionToken);
   if (!player) {
-    return { status: 404, body: { success: false, message: '玩家不在房间中' } };
+    return FORBIDDEN();
   }
 
   // 选边环节在双方均准备后才开启
   if (room.players.length < 2 || !room.players.every(p => p.ready)) {
-    return { status: 400, body: { success: false, message: '双方均准备后才能选边' } };
+    return actionFailure(400, '双方均准备后才能选边');
   }
 
   // 执棋结果已公示（双方均已选边）后锁定，不可再改
   if (room.sideReveal) {
-    return { status: 400, body: { success: false, message: '执棋结果已公示，不能更改' } };
+    return actionFailure(400, '执棋结果已公示，不能更改');
   }
 
   player.sidePreference = side;
@@ -1084,7 +1241,7 @@ export function actSide(roomId: string, body: Record<string, unknown>): ActionRe
 }
 
 router.post('/rooms/:roomId/side', (req, res) => {
-  respondAction(res, req.params.roomId, actSide(req.params.roomId, req.body));
+  respondAction(res, req.params.roomId, actSide(req.params.roomId, req.body, readSessionToken(req)));
 });
 
 // 分配执棋方：双方意向不同（一红一黑）按意愿分配；意向相同或缺失则随机分配
@@ -1106,29 +1263,29 @@ function assignSides(room: Room): boolean {
 // 玩家准备/取消准备（ready 缺省为 true 以兼容旧客户端；双方均准备后开启选边环节，
 // 选边通过 /side 提交，双方选完自动分配公示；公示前取消准备会清空双方选边意向）
 // 准备核心逻辑（HTTP 与 WebSocket 共用）
-export function actReady(roomId: string, body: Record<string, unknown>): ActionResult {
-  const { playerId } = body as { playerId?: string };
+export function actReady(roomId: string, body: Record<string, unknown>, sessionToken: string): ActionResult {
   const ready = (body as { ready?: boolean }).ready !== false; // 仅显式传 false 视为取消准备
 
   const room = rooms.get(roomId);
   if (!room) {
-    return { status: 404, body: { success: false, message: '房间不存在' } };
+    return actionFailure(404, '房间不存在');
   }
 
   if (room.phase !== 'waiting') {
-    return { status: 400, body: { success: false, message: '对局已开始' } };
+    return actionFailure(400, '对局已开始');
   }
 
-  const player = room.players.find(p => p.id === playerId);
+  // 【S-1 / §3.1】按 sessionToken 定位成员
+  const player = findPlayerByToken(room, sessionToken);
   if (!player) {
-    return { status: 404, body: { success: false, message: '玩家不在房间中' } };
+    return FORBIDDEN();
   }
 
   if (!ready) {
     // 选边已公示（开局倒数中）：不允许取消准备。公示一旦发出即锁定，
     // 避免与统一定时（gameStartAt）产生「一方取消、另一方仍倒数进局」的状态分叉
     if (room.sideReveal) {
-      return { status: 400, body: { success: false, message: '选边已公示，无法取消准备' } };
+      return actionFailure(400, '选边已公示，无法取消准备');
     }
     // 公示前取消准备：双方已提交的选边意向随之失效，回到准备阶段重新确认
     room.players.forEach(p => {
@@ -1159,184 +1316,154 @@ export function actReady(roomId: string, body: Record<string, unknown>): ActionR
 }
 
 router.post('/rooms/:roomId/ready', (req, res) => {
-  respondAction(res, req.params.roomId, actReady(req.params.roomId, req.body));
+  respondAction(res, req.params.roomId, actReady(req.params.roomId, req.body, readSessionToken(req)));
 });
 
 // 开始对局（双方准备后，前端倒计时结束后调用）
 // 开局核心逻辑（HTTP 与 WebSocket 共用）
-export function actStart(roomId: string, body: Record<string, unknown>): ActionResult {
-  const { playerId } = body as { playerId?: string };
-
+export function actStart(roomId: string, _body: Record<string, unknown>, sessionToken: string): ActionResult {
   const room = rooms.get(roomId);
   if (!room) {
-    return { status: 404, body: { success: false, message: '房间不存在' } };
+    return actionFailure(404, '房间不存在');
   }
 
-  // 校验：仅房间内玩家可开局
-  if (!room.players.some(p => p.id === playerId)) {
-    return { status: 403, body: { success: false, message: '仅房间内玩家可开始对局' } };
-  }
-
-  // 幂等：对局已开始（统一定时自动开局生效后上传方的 /start 才到达、或重复提交）→
-  // 视为成功确认并返回当前纪元，调用方按正常开局流程继续，不得视为失败
+  // 幂等：对局已开始（统一定时自动开局生效后客户端的 /start 才到达、或重复提交）→
+  // 视为成功确认并返回当前纪元，调用方按正常开局流程继续，不得视为失败。
+  // 放在鉴权之前：这是幂等确认，不产生任何状态变更，无需身份。
   if (room.phase === 'playing') {
     return { status: 200, body: { success: true, gameStartTime: room.gameStartTime, matchId: room.matchId, alreadyStarted: true } };
   }
 
+  // 【S-1 / §3.1】校验：持有 token 的房间成员才可开局
+  if (!findPlayerByToken(room, sessionToken)) {
+    return FORBIDDEN();
+  }
+
   // 校验：双方就位、均已准备且阵营分配完整，防止提前开局导致无阵营/缺人
   if (room.players.length < 2) {
-    return { status: 400, body: { success: false, message: '玩家未齐，无法开局' } };
+    return actionFailure(400, '玩家未齐，无法开局');
   }
   if (!room.players.every(p => p.ready)) {
-    return { status: 400, body: { success: false, message: '尚有玩家未准备，无法开局' } };
+    return actionFailure(400, '尚有玩家未准备，无法开局');
   }
   const sides = room.players.map(p => p.side);
   if (!sides.includes('red') || !sides.includes('black')) {
-    return { status: 400, body: { success: false, message: '阵营未分配完整，无法开局' } };
+    return actionFailure(400, '阵营未分配完整，无法开局');
   }
   // 校验：公示必须仍然有效（倒计时窗口内被取消后 sideReveal/gameStartAt 已清空，残留的开局请求一律拒绝）
   if (!room.sideReveal || !room.gameStartAt) {
-    return { status: 400, body: { success: false, message: '开局已取消，无法开始对局' } };
+    return actionFailure(400, '开局已取消，无法开始对局');
   }
   // 校验：必须到达服务端锚定的统一开局时刻（留少量容差抵消网络往返）
   if (Date.now() < room.gameStartAt - START_TOLERANCE_MS) {
-    return { status: 400, body: { success: false, message: '开局时刻未到，请稍候' } };
+    return actionFailure(400, '开局时刻未到，请稍候');
   }
 
-  room.phase = 'playing';
-  room.matchId += 1; // 对局纪元 +1：客户端据此识别新局，重赛后的旧快照（旧 matchId）一律忽略
-  room.gameStartTime = Date.now();
-  room.gameStartAt = null; // 开局时刻已消费
-  room.lastMoveTime = Date.now();
-  room.lastActivity = Date.now();
-  // 局时时钟初始化（基本用时+加秒制；局时为 0 表示不限时，不启用时钟）
-  room.clocks = room.settings.baseTimeSeconds > 0
-    ? { red: room.settings.baseTimeSeconds * 1000, black: room.settings.baseTimeSeconds * 1000 }
-    : null;
-  // 心跳基线对齐到开局时刻：等待阶段没有心跳流动，若沿用加入时刻的旧基线，
-  // 开局瞬间的心跳超时检测会把双方误判为断线
-  room.players.forEach((p) => { p.lastHeartbeat = Date.now(); });
+  // 【S-8】初始局面与悔棋快照栈一律由服务端构造（与 tryAutoStart 共用 startPlayingRoom）
+  startPlayingRoom(room);
 
   return { status: 200, body: { success: true, gameStartTime: room.gameStartTime, matchId: room.matchId } };
 }
 
 router.post('/rooms/:roomId/start', (req, res) => {
-  respondAction(res, req.params.roomId, actStart(req.params.roomId, req.body));
+  respondAction(res, req.params.roomId, actStart(req.params.roomId, req.body, readSessionToken(req)));
 });
 
 // 走棋核心逻辑（HTTP 与 WebSocket 共用）
-export function actMove(roomId: string, body: Record<string, unknown>): ActionResult {
+export function actMove(roomId: string, body: Record<string, unknown>, sessionToken: string): ActionResult {
   const room = rooms.get(roomId);
   if (!room) {
-    return { status: 404, body: { error: '房间不存在' } };
+    return actionFailure(404, '房间不存在');
   }
 
-  // ---- 新协议：服务端权威走子裁决（方案 P0，客户端只发着法 {playerId, move}） ----
-  if (body && body.move && typeof body.move === 'object') {
-    const { playerId, move } = body as { playerId?: string; move: { pieceId: number; toCol: number; toRow: number } };
-    if (room.phase !== 'playing' || !room.gameState) {
-      return { status: 400, body: { success: false, message: '对局未在进行中' } };
-    }
-    const player = room.players.find(p => p.id === playerId);
-    if (!player || !player.side) {
-      return { status: 400, body: { success: false, message: '玩家不在房间中或未分配阵营' } };
-    }
-    const mySide = player.side;
-    const state = room.gameState;
-    const stateSideIsRed = state.sideTag === true || state.sideTag === 'red';
-    if (stateSideIsRed !== (mySide === 'red')) {
-      return { status: 400, body: { success: false, message: '不是你的回合' } };
-    }
-    const { pieceId, toCol, toRow } = move;
-    if (!Number.isInteger(pieceId) || !Number.isInteger(toCol) || !Number.isInteger(toRow)) {
-      return { status: 400, body: { success: false, message: '着法格式错误' } };
-    }
-    // 走法合法性校验（含王安全过滤），杜绝客户端伪造着法
-    const valid = ruleEngine.getValidMoves(state, pieceId);
-    if (!valid[toCol] || !valid[toCol][toRow]) {
-      return { status: 400, body: { success: false, message: '非法走法' } };
-    }
-    // 服务端权威裁决：与客户端同一规则引擎执行走子（含长将长捉判定与终局）
-    // 长将长捉超限不再拦截落子、不再按违规次数判负（方案 10 娱乐向改造）：
-    // banMoves 仅用于客户端棋盘标红提示；双方僵持不下由自然限招/互长将互长捉判和收场。
-    // 加固：历史上前身是直接注入 dist 的补丁，现已归位到源码（改这里即可，改完在 chinese-chess-server/ 下跑 node build.js）。
-    const result = ruleEngine.makeMove(state, pieceId, toCol, toRow);
-    if (room.clocks && room.lastMoveTime) {
-      const elapsed = (room.clockPausedAt ?? Date.now()) - room.lastMoveTime;
-      room.clocks[mySide] = Math.max(0, room.clocks[mySide] - elapsed) + room.settings.incrementSeconds * 1000;
-    }
-    room.gameState = result.newState;
-    room.lastMoveTime = Date.now();
-    room.clockPausedAt = null;
-    room.lastActivity = Date.now();
-    room.pendingUndo = null;
-    room.pendingDraw = null;
-    if (result.isGameOver) {
-      room.phase = 'ended';
-      if (result.newState.gameStatus === 'draw') {
-        room.winner = null;
-        room.endReason = 'draw';
-      } else {
-        room.winner = result.newState.gameStatus === 'red_win' ? 'red' : 'black';
-        room.endReason = 'checkmate';
-      }
-    }
-    return { status: 200, body: { success: true } };
+  // 【S-8 / §3.8】旧协议分支（客户端上传完整 gameState / gameOver / winner）已删除。
+  //
+  // 该分支曾是「初始局面上传」的唯一通道，但它让**权威局面的第一来源在客户端**：
+  // 历史上只需 roomId + playerId 就能上传任意 gameState 并直接判胜（S-8）。
+  // 现初始局面由 startPlayingRoom 在服务端用同一份规则引擎构造，客户端再无上传通道，
+  // 因此这里只剩一种合法输入：{ move }。
+  if (!body || !body.move || typeof body.move !== 'object') {
+    return actionFailure(400, '仅接受 { move: { pieceId, toCol, toRow } }，不再支持完整局面上传');
   }
 
-  // ---- 旧协议（初始局面上传/兼容）：客户端上传完整状态，直接存储 ----
-  const { gameState, gameOver, winner } = body as {
-    gameState?: Record<string, unknown>;
-    gameOver?: boolean;
-    winner?: 'red' | 'black' | 'draw' | null;
-  };
-
-  // 局时扣时（加秒制/读秒制）：走棋方 = 新局面 sideTag 的另一方；从其时钟扣除本步耗时。
-  // 加秒制（菲舍尔）：扣时后补回加秒；读秒制：仅扣时（基本用时耗尽进入读秒后，走棋即自动获得下一完整读秒时段，无需补偿）。
-  // 读秒制下本步耗时若溢出基本用时，溢出部分视为消耗了本步的读秒时段，钟面归 0 即可
-  // 以 moveHistory 增长判定「真实走棋」，初始局面上传/失败重传（步数不变）不扣时
-  const prevMoveCount = Array.isArray((room.gameState as { moveHistory?: unknown[] } | null)?.moveHistory)
-    ? (room.gameState as { moveHistory: unknown[] }).moveHistory.length
-    : 0;
-  const nextMoveCount = Array.isArray((gameState as { moveHistory?: unknown[] } | undefined)?.moveHistory)
-    ? (gameState as { moveHistory: unknown[] }).moveHistory.length
-    : 0;
-  // 初始局面上传收紧：仅房内玩家、且仅在本局尚未产生任何着法时可上传（防匿名改写棋盘/伪造胜负）。
-  // 理由：该分支是「旧协议完整局面上传」，唯一合法用途是建立初始局面；
-  // 若不加这道校验，任何人仅凭房间号就能越过规则引擎直接改写对局棋盘并伪造胜负。
-  // 约束「本局尚无着法」而非「阶段为 waiting」：waiting 阶段 room.gameState 本就为 null，
-  // 而在线对局在选边公示结束前就可能已把 phase 置为 playing，此时客户端上传的正是第一个局面，
-  // 若改判 phase 会把唯一合法上传路径一起拒掉、导致对局永远没有棋盘。
+  const { move } = body as { move: { pieceId: number; toCol: number; toRow: number } };
+  if (room.phase !== 'playing' || !room.gameState) {
+    return actionFailure(400, '对局未在进行中');
+  }
+  // 【S-1 / §3.1】按 sessionToken 定位成员
+  const player = findPlayerByToken(room, sessionToken);
+  if (!player || !player.side) {
+    return player ? actionFailure(400, '尚未分配阵营') : FORBIDDEN();
+  }
+  const mySide = player.side;
+  const state = room.gameState;
+  const stateSideIsRed = state.sideTag === true || state.sideTag === 'red';
+  if (stateSideIsRed !== (mySide === 'red')) {
+    return actionFailure(400, '不是你的回合');
+  }
+  const { pieceId, toCol, toRow } = move;
+  if (!Number.isInteger(pieceId) || !Number.isInteger(toCol) || !Number.isInteger(toRow)) {
+    return actionFailure(400, '着法格式错误');
+  }
+  // 落点越界必须在索引 qiPan 之前挡掉（onlineMoveGuard 只校验起点归属，落点越界会
+  // 让 getValidMoves/引擎内部读 undefined）——与客户端 utils/chess/onlineMoveGuard.ts 同口径
+  if (toCol < 0 || toCol > 8 || toRow < 0 || toRow > 9) {
+    return actionFailure(400, '落点超出棋盘范围');
+  }
+  // 走法合法性校验（含王安全过滤），杜绝客户端伪造着法
+  const valid = ruleEngine.getValidMoves(state, pieceId);
+  if (!valid[toCol] || !valid[toCol][toRow]) {
+    return actionFailure(400, '非法走法');
+  }
+  // 服务端权威裁决：与客户端同一规则引擎执行走子（含长将长捉判定与终局）
+  // 长将长捉超限不再拦截落子、不再按违规次数判负（方案 10 娱乐向改造）：
+  // banMoves 仅用于客户端棋盘标红提示；双方僵持不下由自然限招/互长将互长捉判和收场。
   // 加固：历史上前身是直接注入 dist 的补丁，现已归位到源码（改这里即可，改完在 chinese-chess-server/ 下跑 node build.js）。
-  var uploader = room.players && room.players.find(function (p) { return p.id === (body.playerId as string); });
-  if (!uploader) {
-    return { status: 403, body: { success: false, error: 'forbidden', message: '仅房间内玩家可上传初始局面' } };
+  const result = ruleEngine.makeMove(state, pieceId, toCol, toRow);
+
+  // 【S-2 / §3.2】走子前把当前局面压栈：悔棋时服务端回到自己的快照，
+  // 不再采纳客户端上传的 proposedState（那是权威局面可被任意改写的根因）。
+  // 存的是引用而非深拷贝：makeMove 返回全新状态、不改旧对象；旧状态此后只被读取
+  // （走子判定/悔棋回退），不写入，因此无需深拷贝即可安全共享（cloneGameState 会连带
+  // 深拷贝 ruleState，开 200 手的代价是每手多一次全量重放）。
+  room.stateHistory.push(state);
+  // 内存封顶：超出后丢弃最老的一份（对手此时已无法悔到那么久以前——
+  // 悔棋一次只回退 1~2 手，且 undoRefusals 用尽后本局不能再发起）
+  if (room.stateHistory.length > STATE_HISTORY_MAX) {
+    room.stateHistory.splice(0, room.stateHistory.length - STATE_HISTORY_MAX);
   }
-  if (prevMoveCount !== 0 || nextMoveCount !== 0) {
-    return { status: 403, body: { success: false, error: 'forbidden', message: '本局已产生着法，不接受完整局面上传' } };
-  }
-  if (room.clocks && nextMoveCount > prevMoveCount && room.lastMoveTime) {
-    const nextSideTag = (gameState as { sideTag?: unknown }).sideTag;
-    // sideTag 为引擎布尔值（RED_SIDE=true）；兼容字符串形式
-    const mover: 'red' | 'black' = (nextSideTag === true || nextSideTag === 'red') ? 'black' : 'red';
+
+  if (room.clocks && room.lastMoveTime) {
     // 协商暂停期间抵达的走棋：耗时冻结在暂停时刻，请求方不为协商耗时买单
     const elapsed = (room.clockPausedAt ?? Date.now()) - room.lastMoveTime;
-    room.clocks[mover] = Math.max(0, room.clocks[mover] - elapsed) + room.settings.incrementSeconds * 1000;
-    // 注：读秒制时 incrementSeconds 恒为 0（互斥校验保证），上式天然退化为纯扣时，无需分支
+    // 加秒制（菲舍尔）：扣时后补回加秒；读秒制 incrementSeconds 恒为 0（parseClockSettings 互斥保证），天然退化为纯扣时
+    room.clocks[mySide] = Math.max(0, room.clocks[mySide] - elapsed) + room.settings.incrementSeconds * 1000;
   }
-
-  room.gameState = gameState as Room['gameState'];
+  room.gameState = result.newState;
   room.lastMoveTime = Date.now();
-  room.clockPausedAt = null; // 走棋开启新计时段，棋钟随协商失效自然恢复（无需顺延）
   room.lastActivity = Date.now();
-  // 新的走棋使待处理的悔棋/求和请求失效
-  room.pendingUndo = null;
-  room.pendingDraw = null;
+  if (result.isGameOver) {
+    room.phase = 'ended';
+    if (result.newState.gameStatus === 'draw') {
+      room.winner = null;
+      room.endReason = 'draw';
+    } else {
+      room.winner = result.newState.gameStatus === 'red_win' ? 'red' : 'black';
+      room.endReason = 'checkmate';
+    }
+    // 【第 3 批 / §8 #5】终局字段清理统一走 clearEndedNegotiations
+    clearEndedNegotiations(room);
+  } else {
+    // 未终局：新的一手让在途的悔棋/求和协商失效（对方已落子，暂停锚点不再有效）
+    room.clockPausedAt = null;
+    room.pendingUndo = null;
+    room.pendingDraw = null;
+  }
   return { status: 200, body: { success: true } };
 }
 
-router.post('/rooms/:roomId/gameState', (req, res) => {
-  respondAction(res, req.params.roomId, actMove(req.params.roomId, req.body));
+router.post('/rooms/:roomId/move', (req, res) => {
+  respondAction(res, req.params.roomId, actMove(req.params.roomId, req.body, readSessionToken(req)));
 });
 
 // 获取游戏状态（HTTP 轮询通道：大厅/观战/兜底仍使用；对局中客户端主要由 WebSocket 推送）
@@ -1345,7 +1472,7 @@ router.get('/rooms/:roomId/gameState', (req, res) => {
   const room = rooms.get(roomId);
 
   if (!room) {
-    return res.status(404).json({ error: '房间不存在' });
+    return res.status(404).json(failBody(404, '房间不存在'));
   }
 
   // 惰性清理与断线检测（与 gameTickTimer 幂等，双保险）
@@ -1365,18 +1492,18 @@ router.post('/rooms/:roomId/spectate', (req, res) => {
   const room = rooms.get(roomId);
 
   if (!room) {
-    return res.status(404).json({ success: false, message: '房间不存在' });
+    return res.status(404).json(failBody(404, '房间不存在'));
   }
   if (!spectatorId) {
-    return res.status(400).json({ success: false, message: '缺少观战者标识' });
+    return res.status(400).json(failBody(400, '缺少观战者标识'));
   }
   if (room.phase === 'waiting') {
-    return res.status(400).json({ success: false, message: '对局尚未开始，暂无法观战' });
+    return res.status(400).json(failBody(400, '对局尚未开始，暂无法观战'));
   }
   // 席位不完整（一方已离场）时不再放行：否则观战者会进入一个只有单边棋子的「空局」，
   // 名称角标只能落到「红方/黑方」占位文本上。提示按「对局已终止」表述，避免观战者误判为网络问题。
   if (!hasCompleteSeating(room)) {
-    return res.status(400).json({ success: false, message: '对局已有玩家离开，观战已结束' });
+    return res.status(400).json(failBody(400, '对局已有玩家离开，观战已结束'));
   }
 
   pruneSpectators(room);
@@ -1411,7 +1538,7 @@ router.post('/rooms/:roomId/spectate/heartbeat', (req, res) => {
   const room = rooms.get(roomId);
 
   if (!room) {
-    return res.status(404).json({ success: false, message: '房间不存在' });
+    return res.status(404).json(failBody(404, '房间不存在'));
   }
   pruneSpectators(room);
   const existing = room.spectators.find(s => s.id === spectatorId);
@@ -1428,37 +1555,37 @@ router.post('/rooms/:roomId/spectate/leave', (req, res) => {
   const room = rooms.get(roomId);
 
   if (!room) {
-    return res.status(404).json({ success: false, message: '房间不存在' });
+    return res.status(404).json(failBody(404, '房间不存在'));
   }
   room.spectators = room.spectators.filter(s => s.id !== spectatorId);
   res.json({ success: true, spectatorCount: room.spectators.length });
 });
 
 // 认输核心逻辑（HTTP 与 WebSocket 共用）
-export function actSurrender(roomId: string, body: Record<string, unknown>): ActionResult {
-  const { playerId } = body as { playerId?: string };
-
+export function actSurrender(roomId: string, _body: Record<string, unknown>, sessionToken: string): ActionResult {
   const room = rooms.get(roomId);
   if (!room) {
-    return { status: 404, body: { success: false, message: '房间不存在' } };
+    return actionFailure(404, '房间不存在');
   }
 
   if (room.phase !== 'playing') {
-    return { status: 400, body: { success: false, message: '对局未在进行中' } };
+    return actionFailure(400, '对局未在进行中');
   }
 
-  const player = room.players.find(p => p.id === playerId);
+  // 【S-1 / §3.1】按 sessionToken 定位成员
+  const player = findPlayerByToken(room, sessionToken);
   if (!player) {
-    return { status: 404, body: { success: false, message: '玩家不在房间中' } };
+    return FORBIDDEN();
   }
 
   // 认输方为输家，对方为赢家
   const winnerSide = player.side === 'red' ? 'black' : 'red';
   room.winner = winnerSide as 'red' | 'black';
-  room.surrenderBy = playerId as string;
+  room.surrenderBy = player.id;
   room.endReason = 'resign';
   room.phase = 'ended';
-  room.clockPausedAt = null; // 终局清空暂停锚点，保持载荷干净
+  // 【第 3 批 / §8 #5】终局字段清理统一走 clearEndedNegotiations
+  clearEndedNegotiations(room);
   room.lastActivity = Date.now();
 
   const duration = room.gameStartTime ? Date.now() - room.gameStartTime : 0;
@@ -1466,19 +1593,26 @@ export function actSurrender(roomId: string, body: Record<string, unknown>): Act
 
   return {
     status: 200,
-    body: { success: true, winner: winnerSide, surrenderBy: playerId, duration, moveCount },
+    body: { success: true, winner: winnerSide, surrenderBy: player.id, duration, moveCount },
   };
 }
 
 router.post('/rooms/:roomId/surrender', (req, res) => {
-  respondAction(res, req.params.roomId, actSurrender(req.params.roomId, req.body));
+  respondAction(res, req.params.roomId, actSurrender(req.params.roomId, req.body, readSessionToken(req)));
 });
 
 // 重新对局核心逻辑（重置房间状态；HTTP 与 WebSocket 共用）
-export function actRematch(roomId: string, _body: Record<string, unknown>): ActionResult {
+//
+// 【S-1 / §3.1】需要持有房间成员的 sessionToken：重置会把双方一起拽回准备阶段，
+// 是状态变更动作，不能再是「知道房间号就能调用」。
+export function actRematch(roomId: string, _body: Record<string, unknown>, sessionToken: string): ActionResult {
   const room = rooms.get(roomId);
   if (!room) {
-    return { status: 404, body: { success: false, message: '房间不存在' } };
+    return actionFailure(404, '房间不存在');
+  }
+
+  if (!findPlayerByToken(room, sessionToken)) {
+    return FORBIDDEN();
   }
 
   // 幂等：仅在结算阶段执行重置。房间已回到等待/对局中（对方已先发起重赛、或本端
@@ -1496,19 +1630,17 @@ export function actRematch(roomId: string, _body: Record<string, unknown>): Acti
   room.clocks = null; // 时钟随下一局开局重新初始化
   // matchId 保持不变：客户端据此识别「上一局旧快照」（matchId 不增即旧局），替代跨时钟时间戳比较
   room.lastMoveTime = null;
-  room.clockPausedAt = null; // 重开一局清空暂停锚点
+  // 【第 3 批 / §8 #5】暂停锚点与协商字段的清理由 clearEndedNegotiations 统一负责
+  clearEndedNegotiations(room);
   room.winner = null;
   room.surrenderBy = null;
   room.endReason = null;
   room.disconnectedPlayerId = null;
   room.disconnectTime = null;
-  room.pendingUndo = null;
-  room.undoResult = null;
-  room.pendingDraw = null;
-  room.drawResult = null;
   room.sideReveal = null;
   room.emojiMessages = [];
   room.returnedToRoom = {};
+  room.stateHistory = []; // 【S-2】上一局的快照栈不再有用途，随重置一并丢弃（否则内存按局累积）
   room.players.forEach(p => {
     p.ready = false;
     p.side = null;
@@ -1524,7 +1656,7 @@ export function actRematch(roomId: string, _body: Record<string, unknown>): Acti
 }
 
 router.post('/rooms/:roomId/rematch', (req, res) => {
-  respondAction(res, req.params.roomId, actRematch(req.params.roomId, req.body));
+  respondAction(res, req.params.roomId, actRematch(req.params.roomId, req.body, readSessionToken(req)));
 });
 
 // 请求悔棋核心逻辑（HTTP 与 WebSocket 共用）
@@ -1539,15 +1671,15 @@ export /**
  * returnedToRoom 记录每位玩家已返回的时刻，客户端据此判断「对手是否已回房间」，
  * 并作为 10s 兜底倒计时的时间基准（由 expireReturnedPlayers 定期清理）。
  */
-function actReturnToRoom(roomId: string, body: Record<string, unknown>): ActionResult {
-  const { playerId } = body as { playerId?: string };
+function actReturnToRoom(roomId: string, _body: Record<string, unknown>, sessionToken: string): ActionResult {
   const room = rooms.get(roomId);
   if (!room) {
-    return { status: 404, body: { success: false, message: '房间不存在' } };
+    return actionFailure(404, '房间不存在');
   }
-  const player = room.players.find(p => p.id === playerId);
+  // 【S-1 / §3.1】按 sessionToken 定位成员
+  const player = findPlayerByToken(room, sessionToken);
   if (!player) {
-    return { status: 404, body: { success: false, message: '玩家不在房间中' } };
+    return FORBIDDEN();
   }
   if (room.phase !== 'ended') {
     // 房间已不在结算阶段（重复点击，或对手已重置）：幂等返回当前状态
@@ -1555,9 +1687,10 @@ function actReturnToRoom(roomId: string, body: Record<string, unknown>): ActionR
   }
   if (!room.returnedToRoom) room.returnedToRoom = {};
   // 房间回到等待中：返回者可立即自行准备/选边；对手端不自动跟随（见上方注释）
-  actRematch(roomId, {});
+  // actRematch 会做鉴权，这里传同一个 token（已在上方验证过是房间成员）
+  actRematch(roomId, {}, sessionToken);
   // 必须在 actRematch 之后写：actRematch 会清空 returnedToRoom
-  room.returnedToRoom[playerId!] = Date.now();
+  room.returnedToRoom[player.id] = Date.now();
   return { status: 200, body: { success: true, phase: room.phase } };
 }
 /**
@@ -1570,7 +1703,8 @@ function actReturnToRoom(roomId: string, body: Record<string, unknown>): ActionR
  * 轮询/WS 传达的余量：若服务端与客户端的 10s 几乎同时到点，记录会先被清掉，对手端就永远
  * 看不到「对手已返回房间」提示（实测双方倒计时同步时该提示一闪即逝）。取 30s。
  */
-var RETURNED_GRACE_MS = 30 * 1e3;
+// 【C-90 / §7.1 风格统一】原为 var（历史补丁遗留），本文件其余常量一律用 const
+const RETURNED_GRACE_MS = 30 * 1e3;
 function expireReturnedPlayers(room: Room, now: number): boolean {
   if (!room.returnedToRoom) return false;
   const ids = Object.keys(room.returnedToRoom);
@@ -1587,39 +1721,49 @@ function expireReturnedPlayers(room: Room, now: number): boolean {
   return changed;
 }
 router.post('/rooms/:roomId/returnToRoom', (req, res) => {
-  respondAction(res, req.params.roomId, actReturnToRoom(req.params.roomId, req.body));
+  respondAction(res, req.params.roomId, actReturnToRoom(req.params.roomId, req.body, readSessionToken(req)));
 });
-export function actUndo(roomId: string, body: Record<string, unknown>): ActionResult {
-  const { playerId, proposedState } = body as { playerId?: string; proposedState?: Room['gameState'] };
 
+/**
+ * 发起悔棋核心逻辑（HTTP 与 WebSocket 共用）。
+ *
+ * 【S-2 / §3.2】**不再接收 proposedState**：改造前客户端算好「回退两步」的局面一并上传，
+ * 服务端在对方同意时直接 `room.gameState = room.pendingUndo.proposedState` 采纳，
+ * 零合法性校验 —— 等于把权威局面交给客户端任意改写（可回退到「对手少子、自己多子」的伪造局面，
+ * 也可据此凭空造出一个「已绝杀」的局面）。现在服务端用 actMove 自己维护的快照栈回退，
+ * 客户端只表达意图（「我要悔棋」），不参与决定回到哪个局面。
+ */
+export function actUndo(roomId: string, _body: Record<string, unknown>, sessionToken: string): ActionResult {
   const room = rooms.get(roomId);
   if (!room) {
-    return { status: 404, body: { success: false, message: '房间不存在' } };
+    return actionFailure(404, '房间不存在');
   }
 
   if (room.phase !== 'playing') {
-    return { status: 400, body: { success: false, message: '对局未在进行中' } };
+    return actionFailure(400, '对局未在进行中');
   }
 
-  const player = room.players.find(p => p.id === playerId);
+  // 【S-1 / §3.1】按 sessionToken 定位成员
+  const player = findPlayerByToken(room, sessionToken);
   if (!player) {
-    return { status: 404, body: { success: false, message: '玩家不在房间中' } };
-  }
-
-  if (!proposedState) {
-    return { status: 400, body: { success: false, message: '缺少悔棋目标局面' } };
+    return FORBIDDEN();
   }
 
   if (room.pendingUndo) {
-    return { status: 400, body: { success: false, message: '已有待处理的悔棋请求' } };
+    return actionFailure(400, '已有待处理的悔棋请求');
   }
 
   // 悔棋请求连续被对方拒绝 2 次后，本局禁止再发起悔棋
   if (player.undoRefusals >= MAX_NEGOTIATION_REFUSALS) {
-    return { status: 400, body: { success: false, message: '对方已连续拒绝 2 次，本局不能再发起悔棋' } };
+    return actionFailure(400, '对方已连续拒绝 2 次，本局不能再发起悔棋');
   }
 
-  room.pendingUndo = { playerId: playerId as string, proposedState, requestTime: Date.now() };
+  // 【S-2】必须有可回退的快照：栈空说明本局还没走过子（或快照已被封顶丢弃）
+  if (!room.stateHistory || room.stateHistory.length === 0) {
+    return actionFailure(400, '没有可回退的着法');
+  }
+
+  room.pendingUndo = { playerId: player.id, requestTime: Date.now() };
   room.undoResult = null;
   pauseClock(room); // 悔棋协商期间暂停棋钟
   room.lastActivity = Date.now();
@@ -1631,30 +1775,30 @@ export function actUndo(roomId: string, body: Record<string, unknown>): ActionRe
 }
 
 router.post('/rooms/:roomId/undo', (req, res) => {
-  respondAction(res, req.params.roomId, actUndo(req.params.roomId, req.body));
+  respondAction(res, req.params.roomId, actUndo(req.params.roomId, req.body, readSessionToken(req)));
 });
 
 // 同意/拒绝悔棋核心逻辑（仅对方玩家可响应；HTTP 与 WebSocket 共用）
-export function actUndoResponse(roomId: string, body: Record<string, unknown>): ActionResult {
-  const { playerId, agreed } = body as { playerId?: string; agreed?: boolean };
+export function actUndoResponse(roomId: string, body: Record<string, unknown>, sessionToken: string): ActionResult {
+  const { agreed } = body as { agreed?: boolean };
 
   const room = rooms.get(roomId);
   if (!room) {
-    return { status: 404, body: { success: false, message: '房间不存在' } };
+    return actionFailure(404, '房间不存在');
+  }
+
+  // 【S-1 / §3.1】按 sessionToken 定位成员（鉴权先于任何业务判断，避免用错误码泄露协商状态）
+  const responder = findPlayerByToken(room, sessionToken);
+  if (!responder) {
+    return FORBIDDEN('仅房间内玩家可响应悔棋请求');
   }
 
   if (!room.pendingUndo) {
-    return { status: 400, body: { success: false, message: '没有待处理的悔棋请求' } };
+    return actionFailure(400, '没有待处理的悔棋请求');
   }
 
-  if (room.pendingUndo.playerId === playerId) {
-    return { status: 400, body: { success: false, message: '不能响应自己的悔棋请求' } };
-  }
-
-  // 鉴权：仅房间内对方玩家可响应，防止观众或任意 ID 冒充同意
-  const undoResponder = room.players.find(p => p.id === playerId);
-  if (!undoResponder) {
-    return { status: 403, body: { success: false, message: '仅房间内玩家可响应悔棋请求' } };
+  if (room.pendingUndo.playerId === responder.id) {
+    return actionFailure(400, '不能响应自己的悔棋请求');
   }
 
   const requesterId = room.pendingUndo.playerId;
@@ -1665,9 +1809,33 @@ export function actUndoResponse(roomId: string, body: Record<string, unknown>): 
     undoRequester.undoRefusals = agreed ? 0 : undoRequester.undoRefusals + 1;
   }
   if (agreed) {
-    // 应用悔棋后的局面，双方客户端通过 WebSocket/轮询同步
-    room.gameState = room.pendingUndo.proposedState;
+    // 【S-2 / §3.2】回退到服务端自己的快照，不再采纳客户端上传的 proposedState。
+    // 快照栈语义：stateHistory[k] = 走完 k 手后的局面（actMove 在执行前 push，
+    // 故第 1 手前压入的是 0 手开局局面）。悔棋按「退 2 手」处理（自己的 + 对方应的那手），
+    // 与客户端旧实现 undoMove(undoMove(state)) 的口径一致，也保证回退后仍轮到发起方。
+    const UNDO_DEPTH = 2;
+    if (!room.stateHistory || room.stateHistory.length < UNDO_DEPTH) {
+      // 快照不足（例如栈已被封顶丢弃到头）：拒绝回退并把协商按"不可执行"处理，
+      // 不改动任何局面；此处理论上不可达（actUndo 已按同一判据拒绝），保留为防御。
+      room.undoResult = {
+        playerId: requesterId,
+        agreed: false,
+        reason: 'no_snapshot',
+        time: Date.now(),
+      };
+      room.pendingUndo = null;
+      room.lastActivity = Date.now();
+      return actionFailure(409, '已无可回退的着法');
+    }
+    const keep = room.stateHistory.length - UNDO_DEPTH;
+    room.gameState = room.stateHistory[keep];
+    room.stateHistory.length = keep; // 回退出的快照一并出栈，否则下一手会在错误位置压栈
     room.lastMoveTime = Date.now();
+    // 终局可能被回退掉（原本已判绝杀/困毙的局面不再成立）
+    room.phase = 'playing';
+    room.winner = null;
+    room.endReason = null;
+    room.surrenderBy = null;
   }
 
   room.undoResult = {
@@ -1683,37 +1851,36 @@ export function actUndoResponse(roomId: string, body: Record<string, unknown>): 
 }
 
 router.post('/rooms/:roomId/undoResponse', (req, res) => {
-  respondAction(res, req.params.roomId, actUndoResponse(req.params.roomId, req.body));
+  respondAction(res, req.params.roomId, actUndoResponse(req.params.roomId, req.body, readSessionToken(req)));
 });
 
 // 请求求和核心逻辑（HTTP 与 WebSocket 共用）
-export function actDraw(roomId: string, body: Record<string, unknown>): ActionResult {
-  const { playerId } = body as { playerId?: string };
-
+export function actDraw(roomId: string, _body: Record<string, unknown>, sessionToken: string): ActionResult {
   const room = rooms.get(roomId);
   if (!room) {
-    return { status: 404, body: { success: false, message: '房间不存在' } };
+    return actionFailure(404, '房间不存在');
   }
 
   if (room.phase !== 'playing') {
-    return { status: 400, body: { success: false, message: '对局未在进行中' } };
+    return actionFailure(400, '对局未在进行中');
   }
 
-  const player = room.players.find(p => p.id === playerId);
+  // 【S-1 / §3.1】按 sessionToken 定位成员
+  const player = findPlayerByToken(room, sessionToken);
   if (!player) {
-    return { status: 404, body: { success: false, message: '玩家不在房间中' } };
+    return FORBIDDEN();
   }
 
   if (room.pendingDraw) {
-    return { status: 400, body: { success: false, message: '已有待处理的求和请求' } };
+    return actionFailure(400, '已有待处理的求和请求');
   }
 
   // 求和请求连续被对方拒绝 2 次后，本局禁止再发起求和
   if (player.drawRefusals >= MAX_NEGOTIATION_REFUSALS) {
-    return { status: 400, body: { success: false, message: '对方已连续拒绝 2 次，本局不能再发起求和' } };
+    return actionFailure(400, '对方已连续拒绝 2 次，本局不能再发起求和');
   }
 
-  room.pendingDraw = { playerId: playerId as string, requestTime: Date.now() };
+  room.pendingDraw = { playerId: player.id, requestTime: Date.now() };
   room.drawResult = null;
   pauseClock(room); // 求和协商期间暂停棋钟
   room.lastActivity = Date.now();
@@ -1725,30 +1892,30 @@ export function actDraw(roomId: string, body: Record<string, unknown>): ActionRe
 }
 
 router.post('/rooms/:roomId/draw', (req, res) => {
-  respondAction(res, req.params.roomId, actDraw(req.params.roomId, req.body));
+  respondAction(res, req.params.roomId, actDraw(req.params.roomId, req.body, readSessionToken(req)));
 });
 
 // 同意/拒绝求和核心逻辑（仅对方玩家可响应；同意则对局以和棋结束；HTTP 与 WebSocket 共用）
-export function actDrawResponse(roomId: string, body: Record<string, unknown>): ActionResult {
-  const { playerId, agreed } = body as { playerId?: string; agreed?: boolean };
+export function actDrawResponse(roomId: string, body: Record<string, unknown>, sessionToken: string): ActionResult {
+  const { agreed } = body as { agreed?: boolean };
 
   const room = rooms.get(roomId);
   if (!room) {
-    return { status: 404, body: { success: false, message: '房间不存在' } };
+    return actionFailure(404, '房间不存在');
+  }
+
+  // 【S-1 / §3.1】鉴权先于业务判断
+  const responder = findPlayerByToken(room, sessionToken);
+  if (!responder) {
+    return FORBIDDEN('仅房间内玩家可响应求和请求');
   }
 
   if (!room.pendingDraw) {
-    return { status: 400, body: { success: false, message: '没有待处理的求和请求' } };
+    return actionFailure(400, '没有待处理的求和请求');
   }
 
-  if (room.pendingDraw.playerId === playerId) {
-    return { status: 400, body: { success: false, message: '不能响应自己的求和请求' } };
-  }
-
-  // 鉴权：仅房间内对方玩家可响应，防止观众或任意 ID 冒充同意
-  const drawResponder = room.players.find(p => p.id === playerId);
-  if (!drawResponder) {
-    return { status: 403, body: { success: false, message: '仅房间内玩家可响应求和请求' } };
+  if (room.pendingDraw.playerId === responder.id) {
+    return actionFailure(400, '不能响应自己的求和请求');
   }
 
   const requesterId = room.pendingDraw.playerId;
@@ -1764,14 +1931,24 @@ export function actDrawResponse(roomId: string, body: Record<string, unknown>): 
     room.surrenderBy = null;
     room.endReason = 'draw';
     room.phase = 'ended';
+    // 【S-10 / 第 3 批 / §8 #5】求和终局与认输/判负对齐：暂停锚点与在途协商字段
+    // 一并清空（原先这里只清 pendingUndo，残留 undoResult/drawResult →
+    // 结算页上仍渲染出上一次「对方拒绝了悔棋请求」的横幅，与认输路径表现不一致）
+    clearEndedNegotiations(room);
   }
 
-  room.drawResult = {
-    playerId: requesterId,
-    agreed: !!agreed,
-    reason: agreed ? 'agreed' : 'refused',
-    time: Date.now(),
-  };
+  if (!agreed) {
+    // 被拒时保留本次结果供 UI 提示（15s 内由 expirePendingDraw 自动过期）
+    room.drawResult = {
+      playerId: requesterId,
+      agreed: false,
+      reason: 'refused',
+      time: Date.now(),
+    };
+  } else {
+    // 同意即终局：结算横幅由载荷的 endReason/phase 呈现，协商字段按上面统一清空
+    room.drawResult = null;
+  }
   room.pendingDraw = null;
   room.lastActivity = Date.now();
 
@@ -1779,26 +1956,26 @@ export function actDrawResponse(roomId: string, body: Record<string, unknown>): 
 }
 
 router.post('/rooms/:roomId/drawResponse', (req, res) => {
-  respondAction(res, req.params.roomId, actDrawResponse(req.params.roomId, req.body));
+  respondAction(res, req.params.roomId, actDrawResponse(req.params.roomId, req.body, readSessionToken(req)));
 });
 
 // 发送 emoji 表情核心逻辑（对局内互动；HTTP 与 WebSocket 共用）
-export function actEmoji(roomId: string, body: Record<string, unknown>): ActionResult {
-  const { playerId, emoji, id } = body as { playerId?: string; emoji?: string; id?: string };
+export function actEmoji(roomId: string, body: Record<string, unknown>, sessionToken: string): ActionResult {
+  const { emoji, id } = body as { emoji?: string; id?: string };
 
   const room = rooms.get(roomId);
   if (!room) {
-    return { status: 404, body: { success: false, message: '房间不存在' } };
+    return actionFailure(404, '房间不存在');
   }
 
   // 鉴权：仅房间内玩家可发送表情
-  const player = room.players.find(p => p.id === playerId);
+  const player = findPlayerByToken(room, sessionToken);
   if (!player) {
-    return { status: 403, body: { success: false, message: '仅房间内玩家可发送表情' } };
+    return FORBIDDEN('仅房间内玩家可发送表情');
   }
 
   if (!emoji || typeof emoji !== 'string') {
-    return { status: 400, body: { success: false, message: '表情内容不能为空' } };
+    return actionFailure(400, '表情内容不能为空');
   }
 
   pruneEmojis(room);
@@ -1807,30 +1984,33 @@ export function actEmoji(roomId: string, body: Record<string, unknown>): ActionR
   // 客户端生成唯一 id 用于去重（乐观展示 + 回显不重复）；缺省时服务端兜底生成
   const msgId = (typeof id === 'string' && id.trim())
     ? id.trim().slice(0, 64)
-    : `${playerId}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    : `${player.id}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
 
   if (!room.emojiMessages.some(m => m.id === msgId)) {
-    room.emojiMessages.push({ id: msgId, playerId: playerId as string, emoji: emojiText, time: Date.now() });
+    room.emojiMessages.push({ id: msgId, playerId: player.id, emoji: emojiText, time: Date.now() });
   }
   room.lastActivity = Date.now();
 
-  return { status: 200, body: { success: true, emojiMessage: { id: msgId, playerId, emoji: emojiText } } };
+  return { status: 200, body: { success: true, emojiMessage: { id: msgId, playerId: player.id, emoji: emojiText } } };
 }
 
 router.post('/rooms/:roomId/emoji', (req, res) => {
-  respondAction(res, req.params.roomId, actEmoji(req.params.roomId, req.body));
+  respondAction(res, req.params.roomId, actEmoji(req.params.roomId, req.body, readSessionToken(req)));
 });
 
 // 心跳核心逻辑（HTTP 与 WebSocket 共用）：刷新心跳并在断线恢复时清除断线状态
-export function actHeartbeat(roomId: string, body: Record<string, unknown>): ActionResult {
-  const { playerId, hidden } = body as { playerId?: string; hidden?: boolean };
+export function actHeartbeat(roomId: string, body: Record<string, unknown>, sessionToken: string): ActionResult {
+  const { hidden } = body as { hidden?: boolean };
 
   const room = rooms.get(roomId);
   if (!room) {
-    return { status: 404, body: { error: '房间不存在' } };
+    return actionFailure(404, '房间不存在');
   }
 
-  const player = room.players.find(p => p.id === playerId);
+  // 【S-1 / §3.1】心跳必须凭 token 定位成员：否则任何知道 playerId 的人都能
+  // 持续替对方上报心跳，维持 connected=true 规避断线判负（§3.9 的隐藏标记滥用同理）。
+  // 心跳不返回 403 是为了不惊动非法调用方，这里静默丢弃即可（room.lastActivity 仍刷新）。
+  const player = findPlayerByToken(room, sessionToken);
   if (player) {
     const now = Date.now();
     player.lastHeartbeat = now;
@@ -1847,7 +2027,7 @@ export function actHeartbeat(roomId: string, body: Record<string, unknown>): Act
       player.connected = true;
     }
     // 心跳恢复即视为回到对局：撤销断线等待，避免「已上线却仍按旧计时判负」
-    if (room.disconnectedPlayerId === playerId) {
+    if (room.disconnectedPlayerId === player.id) {
       room.disconnectedPlayerId = null;
       room.disconnectTime = null;
     }
@@ -1857,7 +2037,7 @@ export function actHeartbeat(roomId: string, body: Record<string, unknown>): Act
 }
 
 router.post('/rooms/:roomId/heartbeat', (req, res) => {
-  respondAction(res, req.params.roomId, actHeartbeat(req.params.roomId, req.body));
+  respondAction(res, req.params.roomId, actHeartbeat(req.params.roomId, req.body, readSessionToken(req)));
 });
 
 // 重新连接（断线后真正回到对局页面时由客户端显式调用）——
@@ -1865,16 +2045,20 @@ router.post('/rooms/:roomId/heartbeat', (req, res) => {
 // 不代表玩家已回到房间；玩家实际进入对局页并调用本接口才算重连成功
 router.post('/rooms/:roomId/reconnect', (req, res) => {
   const { roomId } = req.params;
-  const { playerId } = req.body;
+  const sessionToken = readSessionToken(req);
 
   const room = rooms.get(roomId);
   if (!room) {
-    return res.status(404).json({ success: false, message: '房间不存在' });
+    return res.status(404).json(failBody(404, '房间不存在'));
   }
 
-  const player = room.players.find(p => p.id === playerId);
+  // 【S-1 / §3.1】这是本次改造的核心入口：改造前只校验「playerId 是否在房内」，
+  // 于是任何知道 roomId + playerId 的人都能替对方「重连」，把对方的断线判负倒计时清零。
+  // 现在必须出示该玩家自己的 sessionToken——它只存在客户端本地与服务端内存里，
+  // 房间负载、观战接口、WebSocket 握手都不下发（见 stripPlayerToken / 观战者无 token）。
+  const player = findPlayerByToken(room, sessionToken);
   if (!player) {
-    return res.status(404).json({ success: false, message: '玩家不在房间中' });
+    return res.status(403).json(failBody(403, '身份校验失败，请重新加入房间', {}, 'forbidden'));
   }
 
   // 恢复连接
@@ -1885,7 +2069,7 @@ router.post('/rooms/:roomId/reconnect', (req, res) => {
   player.hiddenSince = 0;
 
   // 清除断线状态（若有）
-  if (room.disconnectedPlayerId === playerId) {
+  if (room.disconnectedPlayerId === player.id) {
     room.disconnectedPlayerId = null;
     room.disconnectTime = null;
   }
@@ -1906,12 +2090,20 @@ router.post('/rooms/:roomId/reconnect', (req, res) => {
 // 离开房间
 router.post('/rooms/:roomId/leave', (req, res) => {
   const { roomId } = req.params;
-  const { playerId } = req.body;
+  const sessionToken = readSessionToken(req);
 
   const room = rooms.get(roomId);
   if (!room) {
-    return res.status(404).json({ error: '房间不存在' });
+    return res.status(404).json(failBody(404, '房间不存在'));
   }
+
+  // 【S-1 / §3.1】离场同样必须凭 token：否则陌生人可用 playerId 把别人踢出房间，
+  // 并触发 settleAbandonedPlayingRoom 直接判对方负。
+  const player = findPlayerByToken(room, sessionToken);
+  if (!player) {
+    return res.status(403).json(failBody(403, '身份校验失败，请重新加入房间', {}, 'forbidden'));
+  }
+  const playerId = player.id;
 
   const wasHost = room.hostId === playerId;
   // 对局中离场：先裁定本局，再摘除成员。
@@ -1946,7 +2138,7 @@ router.post('/rooms/:roomId/leave', (req, res) => {
       // 但若是本次离场刚刚触发的结算（settled），必须停在 ended：
       // 立刻 rematch 会把 winner/endReason 冲掉，胜方将永远看不到「对手离开了对局」这一结果。
       // 该局不完整，是否再战由留下的人通过结算浮层自行决定。
-      actRematch(roomId, {});
+      actRematch(roomId, {}, sessionToken);
     }
   }
   // 离场是一次权威状态变更：必须广播，让留下的玩家立刻收到终局，而不是等 2s 轮询才发现

@@ -59,7 +59,14 @@ const getCurrentParams = (rawParams: Record<string, string | string[]>): Record<
 const serializeParams = (params: Record<string, unknown>): string => {
   try {
     const jsonStr = JSON.stringify(params);
-    return Base64.encode(jsonStr);
+    // 【C-24 / §6.1】Base64.encode 产出的是标准字母表，会把 JSON 里的 '/' 转成 '/'、
+    // '+' 转成 '+'、结尾还会补 '='。这些字符没有做 URL 安全处理：'/' 会把一个参数值
+    // 切成两段路径，'+' 在部分反序列化器里被当空格解码，'=' 会截断 query。
+    // 结果是「进对局页参数全丢」（读不到 payload 就退化成空参）。
+    // encodeURI 是 js-base64 自带的 URL 安全变体：把 '+'→'-'、'/'→'_'，并去掉 '=' 填充。
+    // 解码侧用 Base64.decode 即可 —— 它的实现先尝试 URL 安全字母表再回退标准字母表，
+    // 因此对历史已生成的标准 base64 链接仍然兼容。
+    return Base64.encodeURI(jsonStr);
   } catch (error) {
     console.error(LOG_PREFIX, 'serialize failed:', error instanceof Error ? error.message : 'Unknown error');
     return '';

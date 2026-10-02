@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 
 import { RED_SIDE } from '@/utils/chess/types';
+import { serverNow } from '@/utils/serverClock';
 
 /**
  * 在线对局「局时」时钟的本地插值。
@@ -130,7 +131,8 @@ export function useBattleClock(options: UseBattleClockOptions): UseBattleClockAp
         setClockText(prev => (prev === EMPTY_CLOCK_TEXT ? prev : EMPTY_CLOCK_TEXT));
         return;
       }
-      const correctedNow = Date.now() + serverTimeOffsetRef.current;
+      // 第 3 批：走 @/utils/serverClock 的 serverNow，不再手写 Date.now() + offset（§8 表 #7）
+      const correctedNow = serverNow(serverTimeOffsetRef);
       const next = computeClockText(snap, correctedNow, byoyomiRef.current * 1000, mySide);
       // 值没变就复用上一次的对象：1 秒定时器不应无条件触发重渲染
       setClockText(prev =>
