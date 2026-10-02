@@ -383,8 +383,8 @@ const result = await build({
 | 1 | 快照 `index.ts` 的三段加固（404 JSON / 500 JSON / 进程守卫）要不要保留？ | **保留**。它们是纯增益，唯一与"以 dist 行为为准"冲突的地方，且只影响未定义路径与异常路径。 |
 | 2 | 是否为了整文件字节一致，把那 9 个包钉回 dist 出包时的版本？ | **不钉长期，只做一次性证明**。express 4.22.3 / qs 6.16.0 等是安全更新，留在 lockfile 更好。 |
 | 3 | `verify:rules` 是更名（`verify:server-parity`）还是保留旧名换实现？ | **更名**，语义已完全不同，保留旧名会让后来者误解；同步改 4 处文档引用。 |
-| 4 | 12 个冗余依赖是否本轮一起清掉？ | **不在本轮清**。先完成源码落地与验收，清理单独立项，避免一次提交里混入两件互不相干的风险。 |
-| 5 | Coze 平台是否仍会构建这个工程（决定 `coze-coding-dev-sdk` 去留）？ | 若不构建则一并移出；若构建则保留。 |
+| 4 | 12 个冗余依赖是否本轮一起清掉？ | **不在本轮清**（实施时按计划单独立项，随后已补做：见 10.6）。先完成源码落地与验收，清理单独立项，避免一次提交里混入两件互不相干的风险。 |
+| 5 | Coze 平台是否仍会构建这个工程（决定 `coze-coding-dev-sdk` 去留）？ | 若不构建则一并移出；若构建则保留。**实施结论：服务端目录无 `.coze`/`.cozeproj` 平台工程描述，已移出**（见 10.6）。 |
 
 ---
 
@@ -533,7 +533,32 @@ legalComments 取 esbuild 默认（`eof`）。
   的 32 项断言承接（其中 B1–B11 是初始局面上传收紧的对抗用例、B5 是补丁四的独立证据、
   C 组是畸形 FEN、D3 是房名最小空缺，且对 dist 做过变异测试验证"改回旧实现即失败"）。
 - 12 个冗余依赖（`@supabase/supabase-js`、`drizzle-orm`、`drizzle-zod`、`pg`、`drizzle-kit`、
-  `multer`、`dayjs`、`zod`、`dotenv`、`coze-coding-dev-sdk` 等）按决策④延后清理。
+  `multer`、`dayjs`、`zod`、`dotenv`、`coze-coding-dev-sdk` 等）已按决策④单独立项清理完毕，见 10.6。
+
+### 10.6 冗余依赖清理（补做的独立小任务）
+
+`chinese-chess-server/package.json` 移除 12 个零引用依赖：
+deps 9 个 —— `@supabase/supabase-js`、`coze-coding-dev-sdk`、`dayjs`、`dotenv`、`drizzle-orm`、
+`drizzle-zod`、`multer`、`pg`、`zod`；devDeps 3 个 —— `@types/multer`、`@types/pg`、`drizzle-kit`。
+
+判定依据（可复现）：`dist/index.js` 的 esbuild 模块 marker（pnpm 布局
+`// node_modules/.pnpm/<pkg>@<ver>/node_modules/...`）枚举出 **70 个包**，只有 `express@4.22.3`、
+`cors@2.8.6`、`ws@8.21.3` 与各自的传递依赖；其余 9 个运行时依赖在 bundle 里 0 命中，
+在 `src/`、`scripts/`、`build.js`、`ruleEngine.cjs`、`ai/*.cjs` 里也 0 引用
+（客户端 `client/utils/index.ts` 确实用 `dayjs`，属于客户端自己的依赖，未变动）。
+
+清理后验证（与清理前逐项一致）：
+- `node build.js --check` → **11 区域 IDENTICAL，依赖图仍为 158 模块 / 70 包、版本漂移 0**；
+  `node build.js` 重建产物仍为 1,391,234 B / md5 `f88c23a56573b607f1ddc46d22a88a8b`
+  —— 依赖本就没被 bundle，产物零变化。
+- `verify-rule-engine-parity.mjs`、`verify-lan-disconnect.cjs` 25/25、`verify-server-hardening.cjs` 32/32、
+  `verify-server-diff.cjs`（69 步 / 失败 0 / 白名单仍只有 A1×4）、`tsc --noEmit` 全部通过。
+- 客户端 `pnpm -w validate` 通过、jest 6 套件 / 91 用例全通过。
+- `pnpm install` 移除 73 个包（12 直接 + 61 传递），`node_modules` 中上述 12 个包全部消失；
+  `pnpm-lock.yaml` 78,200 B → 39,632 B。
+- 保留：运行时 `express`/`cors`/`ws`；构建与类型 `esbuild`/`tsx`/`typescript`/`@types/{node,express,cors,ws}`。
+- `coze-coding-dev-sdk` 判为可移出：服务端目录没有 `.coze`/`.cozeproj` 平台工程描述，`scripts/` 也已无
+  Coze 相关配置；若日后要回 Coze 平台构建，`pnpm add coze-coding-dev-sdk@^0.7.28` 即可恢复。
 
 ---
 
