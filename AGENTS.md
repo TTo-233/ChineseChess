@@ -28,7 +28,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\pack.ps1 all     # 或 cli
    $t = [System.IO.File]::ReadAllText($p, [System.Text.Encoding]::UTF8)
    [System.IO.File]::WriteAllText($p, $t, (New-Object System.Text.UTF8Encoding($true)))
    ```
-2. **服务端出包前会强制校验 dist 补丁**。`chinese-chess-server/dist/index.js` 是手工打补丁的构建产物（见 `chinese-chess-server/scripts/patch-dist.mjs`，现承载 **5 条**补丁）。补丁缺失时 `pack.ps1 server` 会阻塞并提示先执行 `node chinese-chess-server/scripts/patch-dist.mjs`。
+2. **服务端出包前会强制校验 dist 与源码一致**。`chinese-chess-server/dist/index.js` 由 `chinese-chess-server/src/` 经 `node build.js`（esbuild 0.27.2）生成；历史遗留的 6 条加固（长将长捉不拦截、畸形 FEN 行宽校验、初始局面上传收紧、被拒动作回推权威状态、房间名最小空缺优先）现在全部在源码里。`dist` 与源码不一致时 `pack.ps1 server` / `pack.sh server` 会阻塞出包，并提示先在 `chinese-chess-server/` 下执行 `node build.js`。
 
 ### 已解决：中文文件名在 zip 里乱码
 
@@ -58,7 +58,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\pack.ps1 all     # 或 cli
 ```powershell
 # 在 chinese-chess-client/ 下
 pnpm -w dev:all      # 服务端 9091 + Expo web 5000
-pnpm -w validate     # lint + verify:rules + verify:rule-engine-parity
+pnpm -w validate     # lint + verify:server-parity + verify:rule-engine-parity
 ```
 
 `pnpm -w dev:all` 依赖 PATH 上有 `pnpm.cmd`；若没有，可分别直启：

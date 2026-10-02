@@ -1,0 +1,9 @@
+# 行尾策略：文本文件统一 LF。
+# 理由：build.js --check 与 verify-rule-engine-parity.mjs 依赖 dist/index.js、
+# ruleEngine.cjs、ai/*.cjs 的字节精确性。若 core.autocrlf=true 把检出内容转成 CRLF，
+# 全新克隆上这两道闸门会直接失败（字节数/md5 都不匹配），且 dist 会被 postinstall 重建。
+* text=auto eol=lf
+
+# Windows 批处理脚本保留 CRLF（cmd.exe 对 LF 结尾的标签/goto 处理不可靠）
+*.bat text eol=crlf
+*.cmd text eol=crlf

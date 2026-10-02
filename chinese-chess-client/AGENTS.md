@@ -60,38 +60,52 @@ Uniwind 官方文档：https://docs.uniwind.dev/llms.txt
 pnpm -w lint:client
 ```
 
-服务端仓库是**已构建的部署产物**（只有 `dist/index.js`、`ruleEngine.cjs`、`ai/`，没有 `src/`、没有 `tsconfig.json`），
-所以不存在可执行的服务端 lint；执行 `pnpm build` / `pnpm dev` / `pnpm serve` / `pnpm lint` 会打印一段说明
-（`scripts/unavailable.mjs`），告诉你为什么不可用以及该去哪里做。服务端改动请直接重新构建部署包，
-或在有 `src/` 的源码环境中校验。
+服务端仓库现在带**完整源码**（`chinese-chess-server/src/`，TypeScript）与构建脚本 `build.js`（esbuild 0.27.2）：
+`chinese-chess-server/dist/index.js` 由 `src/` 构建生成，**不要再手工改产物**。
+
+```bash
+# 在 chinese-chess-server/ 下
+node build.js           # 用 src/ 重新生成 dist/index.js
+node build.js --check   # 校验已提交的 dist 与重新构建的结果是否一致（不一致 exit 1）
+
+# 服务端自身的脚本（也在 chinese-chess-server/ 下）
+pnpm build     # = node build.js
+pnpm dev       # = tsx watch src/index.ts
+pnpm serve     # = tsx src/index.ts
+pnpm lint      # = tsc --noEmit
+```
 
 **不要**使用 `pnpm -w lint:server`——该脚本已删除，因为它指向的 `chinese-chess-client/server/` 目录并不存在。
 
-### ⚠️ 服务端 dist 是手工改动过的构建产物（改它必须重跑补丁脚本）
+### ⚠️ 服务端 dist 由 src/ 构建生成（改逻辑改 src/，不要改 dist/）
 
-`chinese-chess-server/dist/index.js` 里**手工删除过一段运行时逻辑**：
-服务端对「长将长捉禁着」的二次拦截与「连续 3 次违规判负」。
-该改动无法回到源码（本部署包没有 `src/`、没有 sourcemap），所以被固化成幂等补丁脚本
-`chinese-chess-server/scripts/patch-dist.mjs`：
+`chinese-chess-server/dist/index.js` 是 esbuild 产物，可读源码在 `chinese-chess-server/src/`：
 
-```bash
-node chinese-chess-server/scripts/patch-dist.mjs            # 打补丁（已打则 no-op）
-node chinese-chess-server/scripts/patch-dist.mjs --check    # 只校验，缺失则 exit 1
-node chinese-chess-server/scripts/patch-dist.mjs --restore-marker  # 仅补回丢失的标记（逻辑本就正确时）
+```
+src/index.ts
+src/routes/{lanGame,ai,battleWs}.ts
+src/services/{pikafish,openingBook}.ts
 ```
 
-**每次重新构建 / 换版本 / 覆盖 `dist/index.js` 之后，立刻重跑第一个命令。**
-否则已删除的拦截会复活，症状是「客户端能走的着法被服务端以 400『禁着，请变招』拒绝」。
+历史上前身是「没有源码、只能手工往 dist 里打补丁」的部署产物，6 条加固由 `scripts/patch-dist.mjs`
+注入到产物里；**现在这 6 条加固都已归位到源码，`patch-dist.mjs` 已删除**：
 
-闸门挂在以下环节，任一环节丢补丁都会立刻以非零退出失败（CI 调用任一即可阻塞流水线）：
+1. 长将长捉超限不拦截落子、不按违规次数判负
+2. 畸形 FEN 行宽校验（进入 Pikafish WASM 前拦截）
+3. 初始局面上传收紧（仅房内玩家、且仅在本局尚无着法时可上传）
+4. 请求体驱动的终局副作用（与第 3 条同源，成对生效）
+5. 被拒绝的动作也回推权威状态（避免客户端停在乐观更新）
+6. 房间名最小空缺优先（自动房名复用被释放的编号）
+
+**改完源码必须重新构建：在 `chinese-chess-server/` 下执行 `node build.js`。**
+闸门挂在以下环节，`dist` 与 `src/` 不一致时会立刻以非零退出失败（CI 调用任一即可阻塞流水线）：
 
 | 环节 | 命令 | 行为 |
 | --- | --- | --- |
-| 启动服务端 | `pnpm start`（`scripts/start.mjs`） | 启动前自动 `--check`，丢失则**拒绝启动** |
-| 打包服务端 | `pack.ps1 server` / `pack.sh server` | 出包前校验，失败则**阻塞出包**（不生成 zip） |
-| 安装服务端依赖 | 服务端目录下 `pnpm install` | `postinstall` 自动 `--check`，失败即安装失败 |
-| 客户端静态校验 | `pnpm -w validate` | 先 `lint`，再 `--check` 服务端补丁 |
-| 单独校验 | `pnpm -w verify:rules` / 服务端 `pnpm verify` | 只做 `--check` |
+| 打包服务端 | `pack.ps1 server` / `pack.sh server` | 出包前 `build.js --check`，失败则**阻塞出包**（不生成 zip） |
+| 安装服务端依赖 | 服务端目录下 `pnpm install` | `postinstall` 自动 `node build.js`（重新生成 dist） |
+| 客户端静态校验 | `pnpm -w validate` | 先 `lint`，再 `verify-server-parity`（= `build.js --check`） |
+| 单独校验 | `pnpm -w verify:server-parity` / 服务端 `pnpm verify` | 只做 `--check` |
 
 但 `node dist/index.js`、`start.bat` 等直启方式不做校验，需自行确认。
 规则引擎本体（`ruleEngine.cjs`）由 `client/utils/chess/ruleEngine.bundle.ts` 打包而来，
@@ -128,7 +142,7 @@ pwsh -File pack.ps1 [client|server|all]   # Windows（等价于 .\pack.ps1）
   每个端当天的这一个包。这条是硬性要求：旧包如果留在根目录，极易被误当成最新包分发出去
   （本项目就发生过一次：源码改了一整天，根目录的 zip 还停在前一天，所有修复都不在里面）。
   打完包请确认根目录 `chinese-chess-*.zip` 各只剩一个。
-- 服务端出包前强制 `patch-dist.mjs --check`，校验失败**阻塞出包**（不生成 zip）。
+- 服务端出包前强制 `node build.js --check`（校验 `dist` 与 `src/` 是否一致），校验失败**阻塞出包**（不生成 zip）。
 - `pack.ps1` 必须存为 **UTF-8 with BOM**：本机是 Windows PowerShell 5.1，无 BOM 时它按 GB2312
   （codepage 936）解码，中文提示会变成乱码。用现代 pwsh (7+) 则无此问题。
 

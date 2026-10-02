@@ -2,7 +2,7 @@
  * 在线 AI（服务端皮卡鱼 Pikafish）调用客户端。
  *
  * 服务端接口：
- *   文件：server/src/routes/ai.ts
+ *   文件：chinese-chess-server/src/routes/ai.ts
  *   接口：POST /api/v1/ai/move
  *   Body：{ fen: string, difficulty: 'easy' | 'medium' | 'hard' | 'hint', priority?: number,
  *           clientId?: string, startFen?: string, moves?: string[] }

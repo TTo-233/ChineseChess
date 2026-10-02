@@ -1,7 +1,7 @@
 中国象棋服务端 - Windows 部署说明（Cloudflare Tunnel / 固定域名方案）
 ====================================
 本包为【自包含部署包】：无需安装依赖、无需 pnpm install，只需 Node.js 即可运行。
-打包时间：2026-09-21 10:05:23
+打包时间：2026-10-02 13:16:46
 
 【关于皮卡鱼】无需任何单独设置。
   皮卡鱼引擎、开局库、Worker 均已打包在本包 ai\ 目录，随 node dist\index.js 自动加载
@@ -12,26 +12,37 @@
   - 安装后在 cmd 执行  node -v  能看到版本号即成功。
 
 二、目录结构（解压后）
-  dist\index.js         服务端程序（自包含，已内置 express 等依赖）
+  dist\index.js         服务端程序（运行期自包含，已内置 express 等依赖）
+  src\                  服务端 TypeScript 源码（index.ts / routes\ / services\）
+  build.js, tsconfig.json   esbuild 构建脚本与 TS 配置（node build.js 重新生成 dist）
   ai\                   皮卡鱼引擎 + 开局库 + Worker（必须与 dist 同级，勿删改/移动）
   start.bat             手动启动脚本（前台运行，便于调试）
   run-server.bat        后台守护脚本（崩溃自动重启 + 写日志，供开机自启调用）
   install-autostart.bat   一键注册“开机自动启动”（需管理员，强烈推荐）
   uninstall-autostart.bat 移除开机自启任务
   scripts\verify-lan-disconnect.cjs  断线恢复回归自检脚本（可选，见下方第九节最后一条）
+  scripts\verify-server-hardening.cjs  6 条加固回归自检脚本（可选，端口 VERIFY_PORT=9101）
   DEPLOY.md              本说明（原 部署说明.txt）
 
 三、启动服务（本机手动 / 调试）
   方式1：双击 start.bat。
   方式2：在本目录打开 cmd，执行  node dist\index.js 。
-  方式3（推荐）：执行  pnpm start  （等价于方式2，并额外做补丁校验，见下方红字警告）。
+  方式3（推荐）：执行  pnpm start  （等价于方式2）。
   默认端口 9091；如需修改：先执行  set PORT=8080  再  node dist\index.js 。
   本机自测：浏览器访问  http://localhost:9091/api/v1/health  返回 {"status":"ok"} 即本地正常。
 
-  ============================ 红字警告 ============================
-  【dist\index.js 是手工改动过的构建产物】
-  本目录是自包含部署包：没有 src\、没有 tsconfig.json、没有 sourcemap。
-  下面这些规则的实现都直接写在该文件里，由 scripts\patch-dist.mjs 注入（幂等补丁）：
+  ======================== 重要：源码与构建 ========================
+  【dist\index.js 由 src\ 编译生成，不要再手工改产物】
+  本目录同时带可读源码与构建脚本：
+    src\index.ts、src\routes\{lanGame,ai,battleWs}.ts、src\services\{pikafish,openingBook}.ts
+    build.js（esbuild 构建 + 一致性校验）、tsconfig.json
+  重新构建（需要依赖，本包不含 node_modules，先 pnpm install）：
+    在本目录执行    node build.js
+  校验产物与源码是否一致：
+    在本目录执行    node build.js --check
+
+  下列 6 条加固都写在 src\ 里（本包历史上前身是没有源码的 dist 手工补丁，
+  现已在源码层面归位；改 src 后必须重新 node build.js）：
     1) 长将长捉超限不拦截落子、不按违规次数判负
        丢失表现：客户端能走的着法被服务端以 400「禁着，请变招」拒绝。
     2) 畸形 FEN 行宽校验
@@ -44,19 +55,13 @@
     6) 房间名最小空缺优先（自动房间名复用被释放的编号）
        丢失表现：销毁「房间7」后新建会得到「房间9」，空号只增不减。
 
-  每次重新构建 / 换版本 / 从其它机器拷贝 dist\index.js 覆盖之后，
-  必须立刻执行：   node scripts\patch-dist.mjs
-  该脚本会一次性补齐缺失的补丁（已存在的为 no-op 跳过）。
+  dist 与 src 不一致时，以下环节会以非零退出失败（不会再出现“补丁丢了却照样出包”）：
+    打包服务端 pack.ps1 server / pack.sh server  出包前 --check，失败则阻塞出包（不生成 zip）
+    安装依赖   本目录下 pnpm install            postinstall 自动 node build.js
+    单独校验   pnpm verify（后端）/ pnpm -w validate（前端）   只做 --check
 
-  只补第 1 条的标记（标记被单独剥离时用）：
-                   node scripts\patch-dist.mjs --restore-marker
-
-  这道闸门已挂在以下环节，任一条补丁丢失都会立刻以非零退出失败：
-    启动服务   pnpm start                    启动前自动 --check，补丁丢失则拒绝启动
-    打包服务端 pack.ps1 server / pack.sh server  出包前校验，失败则阻塞出包（不生成 zip）
-    安装依赖   本目录下 pnpm install         postinstall 自动 --check，失败即安装失败
-    单独校验   pnpm verify                   只做 --check
-  用 node dist\index.js 或 start.bat 直接启动则不做校验，需自行确认。
+  直接双击 start.bat 或执行 node dist\index.js 不做一致性校验；
+  改动源码后请自行执行 node build.js 重新生成 dist\index.js。
   ===================================================================
 
 四、开机自启与崩溃自愈（强烈推荐配置）
@@ -129,3 +134,7 @@
   - 断线恢复自检（可选）：在本目录执行  node scripts\verify-lan-disconnect.cjs
     会用虚拟时钟回归“后台节流不误判 / 保护窗口到期恢复判负 / 回前台撤销断线等待 /
     结束后房间不为后台玩家销毁”四项（默认端口 9099，可用 set VERIFY_PORT=xxxx 覆盖）。
+  - 加固自检（可选）：在本目录执行  node scripts\verify-server-hardening.cjs
+    会回归 6 条加固（服务端权威走子、初始局面上传收紧、畸形 FEN 行宽、房间名最小空缺等，
+    共 32 项断言；默认端口 9101，可用 set VERIFY_PORT=xxxx 覆盖）。两个自检脚本都直接
+    用本目录的 dist\index.js 起进程，跑完自动退出，不会影响正在运行的服务。

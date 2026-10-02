@@ -90,12 +90,17 @@ function New-ServerZip {
   $out = "chinese-chess-server_$Date.zip"
   if (Test-Path $out) { Remove-Item $out }
   Remove-OldZip 'chinese-chess-server'
-  # ⚠️ 服务端 dist/index.js 是手工打过补丁的构建产物（见 chinese-chess-server/scripts/patch-dist.mjs）。
-  #    打包前强制校验，补丁丢失（重新构建/换版覆盖）时直接阻塞出包，避免把
-  #    「已废弃的禁着拦截 + 连续 3 次判负」逻辑打进部署包。
-  & node chinese-chess-server/scripts/patch-dist.mjs --check
-  if ($LASTEXITCODE -ne 0) {
-    throw "服务端补丁校验失败，已阻塞打包。请先执行：node chinese-chess-server/scripts/patch-dist.mjs"
+  # 服务端 dist/index.js 现在由 chinese-chess-server/src/ 经 `node build.js` 生成（esbuild）。
+  #    打包前强制校验「已提交的 dist/index.js 与重新构建的结果一致」，这样：
+  #      - dist 被手工改过 / 被旧产物覆盖过 → 直接阻塞出包；
+  #      - 6 条加固（长将长捉不拦截、畸形 FEN 行宽、初始局面上传收紧、被拒动作回推权威状态、
+  #        房间名最小空缺优先）都在 src/ 里，不可能像以前那样「补丁丢了却照样出包」。
+  Push-Location chinese-chess-server
+  & node build.js --check
+  $checkExit = $LASTEXITCODE
+  Pop-Location
+  if ($checkExit -ne 0) {
+    throw "服务端 dist 与 src/ 不一致，已阻塞打包。请在 chinese-chess-server 下执行：node build.js"
   }
   # 注意：服务端 dist/index.js 是唯一可运行主体，ai\ 为引擎与开局库，必须保留
   $tarArgs = @('-a', '-c', '-f', $out) + $ExcludeCommon + @(

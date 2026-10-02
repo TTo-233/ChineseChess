@@ -6,7 +6,7 @@
  * 这是 POSIX shell 的语法。在 Windows 上 cmd 不认 `VAR=value cmd` 这种前置赋值，
  * 会直接报 `'NODE_ENV' is not recognized as an internal or external command`。
  * 同一个脚本还有第二个问题：`${PORT:-5000}` 会把未设置时的端口定成 5000，
- * 而 dist/index.js:28892 的真实默认是 `var port = process.env.PORT || 9091;`，
+ * 而 dist/index.js 的真实默认是 `var port = process.env.PORT || 9091;`，
  * DEPLOY.md 与 start.bat 也都写的是 9091 —— 于是 `pnpm start` 和文档说的端口不一致。
  *
  * 这里用 Node 设置环境变量再加载 dist，两个问题一起解决：
@@ -15,26 +15,11 @@
  */
 
 import process from 'node:process';
-import { spawnSync } from 'node:child_process';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 
-const HERE = path.dirname(fileURLToPath(import.meta.url));
-
-// 启动前强制校验：dist/index.js 是不是还是打过「长将长捉不拦截」补丁的版本。
-// 补丁丢失通常意味着 dist 被重新打包/换版覆盖，此时旧的服务端禁着拦截与
-// 「连续 3 次判负」会一起复活，症状是客户端能走的着法被服务端以 400 拒绝。
-// 与其带着不一致的规则上线，不如直接拒绝启动并提示修复命令。
-// 详见 scripts/patch-dist.mjs 的文件头注释。
-const check = spawnSync(
-  process.execPath,
-  [path.join(HERE, 'patch-dist.mjs'), '--check'],
-  { stdio: 'inherit' },
-);
-if (check.status !== 0) {
-  console.error('❌ 服务端启动中止：dist/index.js 未打「长将长捉不拦截」补丁。\n');
-  process.exit(1);
-}
+// 历史提醒：这里曾经在启动前 spawn `patch-dist.mjs --check`，因为 dist/index.js 是**没有源码**的
+// 手工构建产物，补丁丢失会导致「长将长捉拦截」「连续 3 次判负」等旧行为复活。
+// 现在源码已还原到 src/（6 条加固都在源码里），dist 由 `node build.js` 从 src/ 生成，
+// 因此启动期不再需要任何补丁校验 —— 一致性由 `node build.js --check` 在开发/打包期守住。
 
 process.env.NODE_ENV ||= 'production';
 

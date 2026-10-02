@@ -3,13 +3,13 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "node scripts/unavailable.mjs build",
-    "dev": "node scripts/unavailable.mjs dev",
-    "serve": "node scripts/unavailable.mjs serve",
-    "lint": "node scripts/unavailable.mjs lint",
+    "build": "node build.js",
+    "dev": "tsx watch src/index.ts",
+    "serve": "tsx src/index.ts",
+    "lint": "tsc --noEmit",
     "preinstall": "npx only-allow pnpm",
-    "postinstall": "node scripts/patch-dist.mjs --check",
-    "verify": "node scripts/patch-dist.mjs --check",
+    "postinstall": "node build.js",
+    "verify": "node build.js --check",
     "start": "node scripts/start.mjs"
   },
   "dependencies": {
@@ -30,6 +30,7 @@
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.6",
     "@types/multer": "^2.0.0",
+    "@types/node": "^22.20.4",
     "@types/pg": "^8.16.0",
     "@types/ws": "^8.18.1",
     "drizzle-kit": "^0.31.8",

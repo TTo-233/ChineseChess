@@ -543,7 +543,7 @@ export default function LanBattleScreen() {
     try {
       const base = await getOnlineServerUrl();
       /**
-       * 服务端文件：server/src/routes/lanGame.ts
+       * 服务端文件：chinese-chess-server/src/routes/lanGame.ts
        * 接口：POST /api/v1/lan/rooms/:roomId/reconnect
        * Body 参数：playerId: string
        */
@@ -1086,7 +1086,7 @@ export default function LanBattleScreen() {
     try {
       const base = await getOnlineServerUrl();
       /**
-       * 服务端文件：server/src/routes/lanGame.ts
+       * 服务端文件：chinese-chess-server/src/routes/lanGame.ts
        * 接口：POST /api/v1/lan/rooms/:roomId/start
        * Body 参数：playerId: string
        */
@@ -1109,7 +1109,7 @@ export default function LanBattleScreen() {
       // 让子房间：初始局面移除红方让出的棋子（服务端透传设置，双方以房间设置为准）
       const initialState = applyHandicap(createInitialState(), roomHandicapRef.current);
       /**
-       * 服务端文件：server/src/routes/lanGame.ts
+       * 服务端文件：chinese-chess-server/src/routes/lanGame.ts
        * 接口：POST /api/v1/lan/rooms/:roomId/gameState
        * Body 参数：playerId: string, gameState: GameState（已应用让子）
        */
@@ -1118,8 +1118,8 @@ export default function LanBattleScreen() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ playerId, gameState: initialState }),
       });
-      // 上传后必须**读回校验**，不能假定成功。服务端该接口由补丁收紧为
-      // 「仅房内玩家 + 本局尚无着法」才接受（403 见 patch-dist.mjs 的「初始局面上传收紧」）：
+      // 上传后必须**读回校验**，不能假定成功。服务端该接口被收紧为
+      // 「仅房内玩家 + 本局尚无着法」才接受（403，见 chinese-chess-server/src/routes/lanGame.ts）：
       //   - 本端尚未被登记进房间 → 403，此时服务端棋盘仍为空，必须留出重试机会；
       //   - 房间已有一份（他人上传的）棋盘 → 服务端已可开局，无需再传，也不必重试。
       // 旧实现只看 fetch 是否抛异常，因此 403 被当成成功、且 uploadedRef 在请求前就置了位，
@@ -1224,7 +1224,7 @@ export default function LanBattleScreen() {
     try {
       const base = await getOnlineServerUrl();
       /**
-       * 服务端文件：server/src/routes/lanGame.ts
+       * 服务端文件：chinese-chess-server/src/routes/lanGame.ts
        * 接口：POST /api/v1/lan/rooms/:roomId/side
        * Body 参数：playerId: string, side: 'red' | 'black'
        */
@@ -1277,7 +1277,7 @@ export default function LanBattleScreen() {
     try {
       const base = await getOnlineServerUrl();
       /**
-       * 服务端文件：server/src/routes/lanGame.ts
+       * 服务端文件：chinese-chess-server/src/routes/lanGame.ts
        * 接口：PATCH /api/v1/lan/rooms/:roomId/settings
        * Body 参数：playerId: string, name: string, password: string,
        *   turnTimeSeconds: number, baseTimeSeconds: number, incrementSeconds: number,
@@ -1348,7 +1348,7 @@ export default function LanBattleScreen() {
       for (let attempt = 0; attempt < 2; attempt++) {
         try {
           /**
-           * 服务端文件：server/src/routes/lanGame.ts
+           * 服务端文件：chinese-chess-server/src/routes/lanGame.ts
            * 接口：POST /api/v1/lan/rooms/:roomId/ready
            * Body 参数：playerId: string, ready: boolean（false 表示取消准备）
            */
@@ -2027,7 +2027,7 @@ export default function LanBattleScreen() {
     try {
       const base = await getOnlineServerUrl();
       /**
-       * 服务端文件：server/src/routes/lanGame.ts
+       * 服务端文件：chinese-chess-server/src/routes/lanGame.ts
        * 接口：POST /api/v1/lan/rooms/:roomId/returnToRoom
        * Body 参数：playerId: string
        */
@@ -2099,7 +2099,7 @@ export default function LanBattleScreen() {
     try {
       const base = await getOnlineServerUrl();
       /**
-       * 服务端文件：server/src/routes/lanGame.ts
+       * 服务端文件：chinese-chess-server/src/routes/lanGame.ts
        * 接口：POST /api/v1/lan/rooms/:roomId/leave
        * Body 参数：playerId: string
        */

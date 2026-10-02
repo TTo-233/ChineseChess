@@ -166,7 +166,7 @@ export default function LanGameScreen() {
     try {
       const base = await getOnlineServerUrl();
       /**
-       * 服务端文件：server/src/routes/lanGame.ts
+       * 服务端文件：chinese-chess-server/src/routes/lanGame.ts
        * 接口：GET /api/v1/lan/rooms/active
        * Query 参数：playerId: string
        */
@@ -293,7 +293,7 @@ export default function LanGameScreen() {
     try {
       const base = await getOnlineServerUrl();
       /**
-       * 服务端文件：server/src/routes/lanGame.ts
+       * 服务端文件：chinese-chess-server/src/routes/lanGame.ts
        * 接口：POST /api/v1/lan/rooms
        * Body 参数：playerName: string, playerId: string,
        *   turnTimeSeconds: number, baseTimeSeconds: number, incrementSeconds: number,
