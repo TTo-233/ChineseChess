@@ -5,6 +5,7 @@
 
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import type { GameState } from './chess/GameEngine';
+import { BOARD_COLS, BOARD_ROWS } from './chess/types';
 
 const SAVE_KEY = 'chess_game_save';
 
@@ -39,6 +40,12 @@ export function resolveFirstMover(save: GameSave): 'player' | 'ai' {
 /**
  * 校验存档结构完整性：防止历史版本/损坏的存档在加载后引发崩溃。
  * 仅校验运行时必需的最小字段集。
+ *
+ * ⚠️ 坐标必须**同时**通过范围与「alive ⇔ 在盘」两道检查（2026-10 红屏教训）：
+ * 引擎里 -1 既表示「该子不存在」也表示「被吃掉了」，任何拿 col/row 去索引定长查表
+ * （ZOBRIST_TABLE / 位置加成表 / qiPan）的代码都可能读到 `table[-1][-1]` →
+ * `TypeError: Cannot read properties of undefined (reading '-1')`。
+ * 仅做 typeof 校验时，一个 alive=true 却带 -1 坐标的坏子会被原样交给搜索而当场崩掉页面。
  */
 function isValidGameSave(save: unknown): save is GameSave {
   if (!save || typeof save !== 'object') return false;
@@ -50,6 +57,8 @@ function isValidGameSave(save: unknown): save is GameSave {
     if (!p || typeof p !== 'object') return false;
     if (typeof p.id !== 'number' || typeof p.col !== 'number' || typeof p.row !== 'number') return false;
     if (typeof p.alive !== 'boolean') return false;
+    // 活子的坐标必须真的在棋盘内（缺席子/被吃子允许 -1）
+    if (p.alive && (p.col < 0 || p.col >= BOARD_COLS || p.row < 0 || p.row >= BOARD_ROWS)) return false;
   }
   if (typeof gs.sideTag !== 'boolean') return false;
   if (!Array.isArray(gs.moveHistory)) return false;

@@ -8,6 +8,7 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { BUILTIN_ENDGAMES, type EndgameLevel } from './chess/endgames';
 import type { GameState } from './chess/GameEngine';
+import { BOARD_COLS, BOARD_ROWS } from './chess/types';
 
 const PROGRESS_KEY = 'endgame_progress';
 const SAVE_KEY = 'endgame_battle_save';
@@ -155,10 +156,13 @@ export async function loadEndgameBattle(): Promise<EndgameBattleSave | null> {
     if (data.levelIndex >= 0 && !BUILTIN_ENDGAMES[data.levelIndex]) return null;
     if (!data.gameState) return null;
     // 局面结构校验：防止损坏存档加载后崩溃（棋子数组必须为 32 项且含必要字段）
+    // 活子的坐标还必须在棋盘内 —— -1 坐标的「活子」会被搜索引擎拿去索引定长查表，
+    // 直接抛 `TypeError: Cannot read properties of undefined (reading '-1')`（2026-10 红屏教训）。
     const pieces = data.gameState.pieces;
     if (!Array.isArray(pieces) || pieces.length !== 32 ||
         !pieces.every(p => p && typeof p.id === 'number' && typeof p.col === 'number' &&
-                           typeof p.row === 'number' && typeof p.alive === 'boolean')) {
+                           typeof p.row === 'number' && typeof p.alive === 'boolean' &&
+                           (!p.alive || (p.col >= 0 && p.col < BOARD_COLS && p.row >= 0 && p.row < BOARD_ROWS)))) {
       console.warn('残局存档局面结构校验失败，已清除损坏存档');
       await AsyncStorage.removeItem(SAVE_KEY);
       return null;

@@ -112,6 +112,11 @@ export function getSelectableMoves(state: GameState, pieceId: number): boolean[]
   const piece = state.pieces[pieceId];
   if (!piece.alive) return empty();
 
+  // 悬空活子（alive=true 但 col/row 越界）不在盘上，无落点可给：
+  // 下面 points[piece.col][piece.row] = false 会把 -1 当下标写进 points 的负下标，
+  // 而 getPathPoints 内部也会用 -1 去读 qiPan（calcXiang 等守卫不全，产出的走点是垃圾）。
+  if (piece.col < 0 || piece.col >= BOARD_COLS || piece.row < 0 || piece.row >= BOARD_ROWS) return empty();
+
   // 只有走棋方的棋子才能移动
   const pieceSide = pieceId <= 15 ? BLACK_SIDE : RED_SIDE;
   if (pieceSide !== state.sideTag) return empty();

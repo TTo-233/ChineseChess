@@ -902,6 +902,7 @@ function getSelectableMoves(state, pieceId) {
   if (pieceId < 0 || pieceId > 31) return empty();
   const piece = state.pieces[pieceId];
   if (!piece.alive) return empty();
+  if (piece.col < 0 || piece.col >= BOARD_COLS || piece.row < 0 || piece.row >= BOARD_ROWS) return empty();
   const pieceSide = pieceId <= 15 ? BLACK_SIDE : RED_SIDE;
   if (pieceSide !== state.sideTag) return empty();
   const points = getPathPoints(pieceId, state.qiPan, toPiecePositions(state.pieces));

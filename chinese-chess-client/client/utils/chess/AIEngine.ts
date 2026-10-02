@@ -18,7 +18,7 @@
 
 import { type GameState, type PieceState } from './GameEngine';
 import { fillPathPoints, createPathPointsBuffer, getPathPoints } from './MoveCheck';
-import { RED_SIDE, BLACK_SIDE, type SideTag, type MoveRecord } from './types';
+import { RED_SIDE, BLACK_SIDE, BOARD_COLS, BOARD_ROWS, type SideTag, type MoveRecord } from './types';
 import { isMoveBanned } from './RuleEngine';
 
 // ======================== 棋子价值 ========================
@@ -266,9 +266,31 @@ function enterSearchSlice(session: SearchSession): void {
 // ======================== 局面评估 ========================
 
 /**
+ * 判断一枚棋子的坐标是否落在棋盘内（[0,BOARD_COLS) × [0,BOARD_ROWS)）。
+ *
+ * 引擎内部用 -1 同时表达两种语义：「该子不存在」（缺席子、已走完让子摆位）
+ * 与「该子被吃掉了」。任何用 col/row 去索引定长查表（ZOBRIST_TABLE、位置加成表、
+ * pathPoints、qiPan）的地方都必须先过这道闸：坐标一旦越界，`table[-1]` 是 undefined，
+ * 再取 `[-1]` 会抛
+ * `TypeError: Cannot read properties of undefined (reading '-1')`
+ * —— 这正是 2026-10 线上红屏（runHintSearch → searchWithTimeBudget）的报错原文。
+ *
+ * 越界只可能来自「外部数据（存档 / 服务端快照）带进来的非法局面」或引擎自身 bug，
+ * 不是正常对局能产生的状态；因此这里一律按「该子不在盘上」处理（不崩溃、不生成走法）。
+ */
+function isOnBoard(col: number, row: number): boolean {
+  return Number.isInteger(col) && Number.isInteger(row) &&
+    col >= 0 && col < BOARD_COLS && row >= 0 && row < BOARD_ROWS;
+}
+
+/**
  * 获取棋子的位置加成
+ *
+ * 坐标越界一律返回 0（视作「无位置加成」），而不是让 -1 下标穿透到查表里抛
+ * `Cannot read properties of undefined (reading '-1')`。
  */
 function getPositionBonus(pieceId: number, col: number, row: number): number {
+  if (!isOnBoard(col, row)) return 0;
   // 兵/卒 (黑方11-15, 红方27-31)
   if (pieceId >= 11 && pieceId <= 15) {
     // 黑方卒
@@ -471,7 +493,9 @@ export function computeZobristHash(state: GameState): number {
   let hash = 0;
   for (let i = 0; i < 32; i++) {
     const piece = state.pieces[i];
-    if (piece.alive) {
+    // 坐标越界的「活子」（悬空子）不是合法盘面的一部分，不参与哈希：
+    // 直接索引会读到 ZOBRIST_TABLE[i][-1]（undefined）再取 [-1] 而抛 TypeError。
+    if (piece.alive && isOnBoard(piece.col, piece.row)) {
       hash ^= ZOBRIST_TABLE[i][piece.col][piece.row];
     }
   }
@@ -555,7 +579,10 @@ function areGeneralsFacing(qiPan: number[][]): boolean {
 function isSideInCheck(state: GameState, side: SideTag): boolean {
   const generalId = side === RED_SIDE ? 16 : 0;
   const general = state.pieces[generalId];
-  if (!general.alive) return true;
+  // 将/帅缺席（!alive）或坐标越界（悬空）时都按「无合法将位」处理：
+  // 缺席口径与 GameEngine.isJiangJun / MoveCheck.afterMoveStillJiangJun 的 R-2 守卫一致；
+  // 不加这道闸的话，-1 会被拿去索引 pathPoints[x][y] → undefined[-1] 抛 TypeError。
+  if (!general.alive || !isOnBoard(general.col, general.row)) return true;
   return isGeneralAttacked(state.qiPan, general.col, general.row, side);
 }
 
@@ -639,8 +666,12 @@ function generatePseudoMoves(state: GameState): Move[] {
   const end = side === RED_SIDE ? 31 : 15;
 
   for (let i = start; i <= end; i++) {
-    if (!state.pieces[i].alive) continue;
     const piece = state.pieces[i];
+    if (!piece.alive) continue;
+    // 悬空活子（alive=true 但 col/row 为 -1 或越界）不在盘上，不生成走法：
+    // fillPathPoints 只查 .alive，会用 -1 去算走点（士/仕尤其会误产出 (0,0)），
+    // 那步「走法」随后在 applyMove 的 ZOBRIST_TABLE[id][-1][-1] 上抛 TypeError。
+    if (!isOnBoard(piece.col, piece.row)) continue;
     const pathPoints = scratchPathPoints;
     fillPathPoints(i, state.qiPan, positions, pathPoints);
 
@@ -1339,6 +1370,23 @@ export async function searchWithTimeBudget(
             if (score < beta) beta = score;
           }
         }
+      } else {
+        // 【根因修复】非法根走法（走完后己方被将 = 送将）同样必须撤销本次落子。
+        //
+        // 修复前 unapplyMove 只写在 `if (!isSideInCheck(...))` 的内部，送将着法（每个中局
+        // 都有若干个）走到这里就直接跳出分支，落子永久留在搜索用的局面副本上：
+        //   · 走子方停在落点，它的起点格已被清空且永不复原 → 棋盘与 pieces 不自洽；
+        //   · 被吃子被置 `alive=false, col/row=-1`，但它原来的格子在 qiPan 上**仍是它**
+        //     （applyMove 只清走子方的起点格，从不清被吃子的原格）→ 棋盘上多出一枚
+        //     「已死亡却仍登记在盘上、坐标为 -1」的僵尸子。
+        // 泄漏随后被后续根走法走到那格时捕获成「alive=true + col/row=-1 的悬空活子」，
+        // 再被 evaluate/getPositionBonus（PAWN_POSITION_BONUS[-1][col]）或 applyMove 的
+        // ZOBRIST_TABLE[id][-1][row] 以 -1 下标读表 →
+        // TypeError: Cannot read properties of undefined (reading '-1')（线上红屏）。
+        //
+        // 附带影响（比崩溃更隐蔽）：被污染的棋盘让 AI 后续根走法在错误局面上评估，棋力下降。
+        // minimax/quiescence 的非法着法分支一直都有 unapplyMove，根节点这里此前是唯一的缺口。
+        unapplyMove(state, undo);
       }
     }
 
