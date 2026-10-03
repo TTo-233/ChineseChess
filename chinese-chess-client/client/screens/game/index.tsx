@@ -244,7 +244,8 @@ export default function GameScreen() {
   }, [gameState.pieces]);
 
   // 加载存档；并在进入对局时预加载常用音效、预热音频模式
-  // （预加载消除首步音效按需加载的延迟与音频会话建立时序问题，修复概率性漏音）
+  // （预加载会为每条音轨做一次静音预热，消除首步音效的按需加载延迟与
+  //   音轨首次入混的竞态；成因与对策详见 utils/SoundManager 头注释）
   useEffect(() => {
     preloadSounds();
     preloadGameEndSounds();
@@ -483,11 +484,11 @@ export default function GameScreen() {
 
         // 播放音效：将军时播放男声将军语音（替代走子音，避免与吃子/走子音混音重叠）
         //
-        // 【P3】不再 await：音效播放失败/冷启动恢复的最坏路径有 ~520ms 的 sleep 与
-        // unload/reload（见 SoundManager.replayWithRecovery），而这里原本是"播完音效
-        // 才 setGameState"——于是每一次走子都要先等音频链路走完，界面才更新，
-        // 玩家在真机上看到的就是"落子后有一拍延迟"。音效与状态更新无因果依赖，
-        // fire-and-forget 即可；playSound 内部已按音效名串行化，不会互相打断。
+        // 【P3】不再 await：音效与状态更新无因果依赖，fire-and-forget 即可。
+        // playSound 内部按音效名串行化，不会互相打断，也不阻塞界面更新。
+        // 真机曾出现的「首个走子/吃子音无声」是「这条音轨这一遍没有被混音器消费」
+        // 的播放期竞态，已在 SoundManager 内用「静音预热 + 播放头进度自检重发」处理
+        // （详见该文件头注释），与是否 await 无关。
         if (isCheck && !isGameOver) {
           void playJiangJunSound();
         } else if (captured !== -1) {
@@ -686,10 +687,9 @@ export default function GameScreen() {
 
     // 播放音效：将军时播放男声将军语音（替代走子音，避免与吃子/走子音混音重叠）
     //
-    // 【P3】不再 await：见 AI 分支同处说明。音效与状态落地无因果依赖，
-    // 而 SoundManager.replayWithRecovery 的最坏恢复路径含 ~520ms 的 sleep 与
-    // unload/reload，await 它等于让每一次落子都先等音频链路走完才更新界面。
-    // playSound 内部按音效名串行化，fire-and-forget 不会导致音效互相打断。
+    // 【P3】不再 await：见 AI 分支同处说明。音效与状态落地无因果依赖。
+    // playSound 内部按音效名串行化并做静音预热/播放头进度自检，
+    // fire-and-forget 不会导致音效互相打断。
     if (isCheck && !isGameOver) {
       void playJiangJunSound();
     } else if (captured !== -1) {
