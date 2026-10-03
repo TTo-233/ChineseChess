@@ -30,6 +30,7 @@ import { gridSpacingX, gridSpacingY } from '@/utils/chess/boardStyles';
 import MoveEffectOverlay, { type MoveEffect } from '@/components/MoveEffectOverlay';
 import Svg, { Circle, Line } from 'react-native-svg';
 import { FONT } from '@/utils/typography';
+import { noteBoardInteraction, endBoardInteraction } from '@/utils/chess/AIEngine';
 
 interface ChessBoardProps {
   gameState: GameState;
@@ -130,7 +131,13 @@ const PieceItem = memo(function PieceItem({
   return (
     <Animated.View
       pointerEvents="auto"
-      onStartShouldSetResponder={() => true}
+      // 【P2】点棋子是本页面最常见的触摸，必须在**按下**这一刻就通知 AIEngine 中止后台预计算。
+      // 放在这里而不是只依赖外层 overlay 的 onStartShouldSetResponder，是为了不依赖
+      // 「响应者冒泡时父层的 onStartShouldSetResponder 也会被调用」这一实现细节。
+      onStartShouldSetResponder={() => {
+        noteBoardInteraction();
+        return true;
+      }}
       onResponderRelease={handleRelease}
       style={[
         styles.pieceContainer,
@@ -319,6 +326,11 @@ export default function ChessBoard({
   useEffect(() => {
     setPieceAnims(prevAnims => {
       const newAnims = new Map(prevAnims);
+      // 【P4】changed：本次 effect 是否真的改了 newAnims。没有改动就原样返回 prevAnims
+      // —— Map 虽然内容没变却是新对象，React 会照样判定 state 变了并触发一次全量重渲染。
+      // 原来这里必然多渲染一遍整个棋盘（90 个交叉点 + 32 个棋子 + 特效层），
+      // 在真机上就是"落子后那一拍卡顿"的固定成本。
+      let changed = false;
 
       gameState.pieces.forEach(piece => {
         if (!piece.alive) return;
@@ -332,6 +344,7 @@ export default function ChessBoard({
             y: new Animated.Value(y),
           });
           prevPositions.current.set(piece.id, { x, y });
+          changed = true;
         } else if (!isInitialLoad.current && prev && (prev.x !== x || prev.y !== y)) {
           const anim = newAnims.get(piece.id)!;
           Animated.parallel([
@@ -361,10 +374,12 @@ export default function ChessBoard({
         if (!aliveIds.has(id)) {
           newAnims.delete(id);
           prevPositions.current.delete(id);
+          changed = true;
         }
       });
 
-      return newAnims;
+      // 仅在内容真正变化时换引用（React 对同一引用直接跳过重渲染）
+      return changed ? newAnims : prevAnims;
     });
 
     if (isInitialLoad.current) {
@@ -376,11 +391,20 @@ export default function ChessBoard({
   const handlePieceTouch = useCallback((pieceId: number) => {
     if (aiThinkingRef.current) return;
     onPiecePressRef.current(pieceId);
+    // 【P2】棋子层的触摸也要收尾。棋子层不是 overlay，没有 onResponderTerminate 兜底，
+    // 不显式调用的话 touchInteractionActive 会一直保持 true。
+    endBoardInteraction();
   }, []);
 
   // 处理棋盘触摸（空白处或棋子位置均可，作为 PieceItem 的兜底）
   const handleTouch = useCallback((event: GestureResponderEvent) => {
-    if (aiThinkingRef.current) return;
+    // 【P2】AI 思考中同样要收尾：此时不做任何处理，但必须结束"交互进行中"标记，
+    // 否则 noteBoardInteraction 置起的 touchInteractionActive 会一直挂着，
+    // 后台提示预计算将永久无法启动。
+    if (aiThinkingRef.current) {
+      endBoardInteraction();
+      return;
+    }
 
     const { locationX, locationY } = event.nativeEvent;
     const origX = locationX / scale;
@@ -409,7 +433,10 @@ export default function ChessBoard({
       }
     }
 
-    if (closestCol === -1 || closestRow === -1) return;
+    if (closestCol === -1 || closestRow === -1) {
+      endBoardInteraction();
+      return;
+    }
 
     // 检查该位置是否有存活棋子
     const piece = gameState.pieces.find(
@@ -421,9 +448,20 @@ export default function ChessBoard({
     } else {
       onEmptyPressRef.current(closestCol, closestRow);
     }
+    // 【P2】本次交互结束，开启静默宽限期：这段时间内不重启后台预计算
+    endBoardInteraction();
   }, [scale, isFlipped, pieceSize, gameState.pieces, boardStyle, styleGridX, styleGridY]);
 
+  const onMoveRef = useRef(onMove);
+  onMoveRef.current = onMove;
+  const onBoardLayoutRef = useRef(onBoardLayout);
+  onBoardLayoutRef.current = onBoardLayout;
+
   // 渲染合法移动提示点
+  //
+  // 【P4】落点点击用 ref 而不是闭包：原来 `onPress={() => onMove && onMove(col,row)}`
+  // 把 onMove 变成了 memo 的依赖，父级每次重建 onMove 回调都会让这一整层落点重新
+  // 渲染（选中棋子时最多 8 个）。改用 ref 后 onMove 的引用变化不再穿透进来。
   const validMoveElements = useMemo(() => {
     if (!validMoves) return null;
 
@@ -435,7 +473,7 @@ export default function ChessBoard({
           indicators.push(
             <TouchableOpacity
               key={`valid-${col}-${row}`}
-              onPress={() => onMove && onMove(col, row)}
+              onPress={() => onMoveRef.current?.(col, row)}
               activeOpacity={0.7}
               style={[
                 styles.validMoveIndicator,
@@ -453,7 +491,7 @@ export default function ChessBoard({
       }
     }
     return indicators;
-  }, [validMoves, getPos, onMove, unitScale]);
+  }, [validMoves, getPos, unitScale]);
 
   // 渲染上一步标记
   const lastMoveMarker = useMemo(() => {
@@ -724,10 +762,10 @@ export default function ChessBoard({
           },
         ]}
         onLayout={
-          onBoardLayout
+          onBoardLayoutRef.current
             ? (e) => {
                 const { width, height } = e.nativeEvent.layout;
-                onBoardLayout({ width, height });
+                onBoardLayoutRef.current?.({ width, height });
               }
             : undefined
         }
@@ -760,8 +798,17 @@ export default function ChessBoard({
         // 空白处无人认领时由本层兜底，onResponderRelease 才会触发 handleTouch
         // （否则点击空白处没有任何视图成为 responder，取消选中逻辑永远不会执行）。
         // 拖动时父级 ScrollView 可通过默认的终止请求接管响应，不影响页面滚动。
-        onStartShouldSetResponder={() => true}
+        //
+        // 【P2】onStartShouldSetResponder 是**触摸按下的那一刻**同步触发的，比 onResponderRelease
+        // 早（后者要等抬手）。后台提示预计算必须在这里就被通知并中止：等到抬手才通知，
+        // 这次点击本身就已经被搜索占用的线程延迟过了。
+        onStartShouldSetResponder={(e) => {
+          noteBoardInteraction();
+          return true;
+        }}
         onResponderRelease={handleTouch}
+        // 抬手/取消后开启静默宽限期，期间不重启预计算（见 AIEngine.HINT_TOUCH_GRACE_MS）
+        onResponderTerminate={() => endBoardInteraction()}
       >
         {/* 上一步标记 */}
         {lastMoveMarker}

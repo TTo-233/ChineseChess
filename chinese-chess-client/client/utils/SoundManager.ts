@@ -2,42 +2,57 @@
  * 音效管理器
  *
  * ---------------------------------------------------------------------------
- * 2026-09 走棋音偶发丢失问题：根因分析与修复（依据 expo-av 16.0.8 原生源码
- * 逐行核查得出，非主观推断）：
+ * 真机「第一步无声、第二步起正常」问题的客观定位（基于 expo-av 16.0.8 原生源码
+ * 逐行核查 + 设备复现反馈，非主观推断）：
  *
- * 旧实现 playSound = setPositionAsync(0) + playAsync() 两次独立原生调用，
- * 且 catch{} 静默吞掉一切错误。真机上存在多条可观测的瞬态失败路径：
+ * 复现事实（用户实机反馈）：
+ *   1. 任意音效的「第一次播放」都听不到；
+ *   2. 从第二次播放开始全部正常。
  *
- * Android（AVManager.java / PlayerData.java / SimpleExoPlayerData.java）：
- * 1. 每次 setStatus 结束都会执行 abandonAudioFocusIfUnused()——某音效首次播放时
- *    mShouldPlay=false，setPositionAsync 走暂停分支后无任何播放器占用音频焦点，
- *    焦点被放弃；紧随的 playAsync 必须重新向系统申请焦点。
- * 2. playAsync → acquireAudioFocus()：只要 AudioManager.requestAudioFocus(
- *    GAIN_TRANSIENT_MAY_DUCK) 未返回 GRANTED 即抛 AudioFocusNotAcquiredException，
- *    Promise 拒绝 → 被 catch{} 静默吞掉 → 无声跳过（对应"首步"概率性失败）。
- * 3. mAcquiredAudioFocus=false 期间 getVolumeForDuckAndFocus() 恒返回 0——
- *    焦点恰在播放瞬间丢失时，声音以 0 音量"播放"（听感等于没播）。
+ * 已用静态证据排除的假设：
+ *   A. 素材损坏 —— 9 个音频文件逐字节解析：7 个 mp3 均为 MPEG-1 Layer III、
+ *      可完整走到 EOF 且零残留字节（Xing 头声明字节数与文件大小逐一相等），
+ *      2 个 wav 为合法 16bit PCM 44.1kHz。素材完好。
+ *      （注：早前一次自研解析器曾误报「只有 1 帧 + 数千字节垃圾」，
+ *        原因是把 layer_bits==1 当成了 Layer I 而非 Layer III，已推翻。）
+ *   B. 打包丢素材 —— zip 内 9 个音效字节数与磁盘一致，SoundManager 亦非旧版。
+ *   C. 别的库抢焦点 —— 全客户端仅 SoundManager 使用 expo-av，无第二个音频消费者。
+ *   D. select/goerror/alarm 三个音效 —— 全项目零调用点，从未播放，
+ *      故「选中音听不到」不构成证据；真正的信号只有 go/eat 的首步失效。
  *
- * iOS（EXAVPlayerData.m / EXAV.m）：
- * 1. playAsync → promoteAudioSessionIfNecessary → [AVAudioSession setActive:YES]，
- *    会话激活瞬态失败即以 E_AV_PLAY 拒绝 Promise → 同样被吞掉。
- * 2. setPositionAsync 不携带 seek 容差（AV.js PlaybackMixin），
- *    位置已为 0 时 mustSeek=false、否则使用无限容差，回零不精确。
+ * 真正的机制（Android，AVManager.java / PlayerData.java / SimpleExoPlayerData.java）：
  *
- * 修复策略（保留 Sound 对象缓存复用 + 预加载的整体架构）：
- * 1. 改用 replayAsync()：单次原生调用原子完成"回零+播放"
- *    （Android 合并为一次 setStatus，无两次调用间的焦点状态空窗；
- *    iOS 走专用 replayWithStatus 路径，正确处理 AVQueuePlayer 条目轮换；
- *    Web 端 replaySound 同样映射为一次 setStatusForMedia）。
- * 2. 失败重试一次（120ms 退避，覆盖音频焦点/会话的瞬态拒绝）。
- * 3. 仍失败则卸载重建 Sound 对象后最后尝试一次（恢复原生播放器异常状态）；
- *    重建前校验会话代号，避免与退出对局时的 unloadAllSounds 竞争。
- * 4. 同名音效播放串行化，杜绝并发原生调用交错。
- * 5. 所有失败路径 console.warn 输出（不再静默），便于 adb logcat / Xcode 排查。
+ *  1. 预加载用 shouldPlay:false 建 Sound。load() → applyNewStatus() 时
+ *     shouldPlayerPlay() 为 false，于是先走 setPlayWhenReady(false)，
+ *     再执行 updateVolumeMuteAndDuck()——而此刻 mAcquiredAudioFocus 还是 false，
+ *     getVolumeForDuckAndFocus() 因此返回 **0f**，播放器被显式置为「静音待播」。
+ *
+ *  2. setStatusWithListener() 每次结束都无条件调用 abandonAudioFocusIfUnused()；
+ *     没有播放器在播 → 焦点被放弃。
+ *
+ *  3. 于是「第一次 replayAsync()」成了整个进程里唯一一次必须真正向系统
+ *     requestAudioFocus() 的播放；后续每次播放都会在
+ *     AVManager.java:348-350 的 `if (mAcquiredAudioFocus) return;` 处短路，
+ *     不再发起任何系统请求——这正是「第 2 步起就正常」的原因。
+ *
+ *  4. 若这一次冷启动申请被拒（或过慢），acquireAudioFocus() 抛
+ *     AudioFocusNotAcquiredException：applyNewStatus 已经把音量置 0 且
+ *     setPlayWhenReady(true) 尚未执行，播放器停在「已加载、未播放、音量 0」，
+ *     setStatus 以 E_AV_SETSTATUS 拒绝 → replayAsync 拒绝 → 该次播放静默丢失。
+ *
+ * 对应的修复：
+ *  1. 预加载阶段做一次「静音预热」：让每个音效在用户听不见的时机先真正播一次
+ *     （volume:0）。把「进程内第一次音频焦点申请」和「ExoPlayer 首次解码/READY」
+ *     全部挪到预加载期完成——此时代理失焦点无感知，失败也无损失。
+ *     进入对局后首次播放不再承担冷启动代价。
+ *  2. replayAsync() 返回值里带 volume；若发现仍为 0，立即 setVolumeAsync 重新
+ *     拉回（正常路径零额外原生调用，只在真出问题时兜底）。
+ *  3. 保留原有三级恢复：120ms 重试 → 400ms 再试 → 卸载重建后最后尝试。
+ *  4. 同名音效播放串行化、会话代号防过期请求、失败一律 console.warn 不静默。
  * ---------------------------------------------------------------------------
  */
 
-import { Audio } from 'expo-av';
+import { Audio, type AVPlaybackStatus } from 'expo-av';
 
 const SOUND_FILES: Record<string, any> = {
   select: require('@/assets/sounds/select.mp3'),
@@ -54,6 +69,14 @@ const SOUND_FILES: Record<string, any> = {
 
 // 常用音效（进入对局时预加载）
 const ESSENTIAL_SOUNDS = ['select', 'go', 'eat', 'Man_jiangjun'];
+
+// 播放音量上限。createAsync / setStatusAsync 都显式传它，
+// 避免原生侧残留旧音量（预加载期的 updateVolumeMuteAndDuck 会把音量压到 0）。
+const SOUND_VOLUME = 1.0;
+
+// 静音预热的最大尝试次数。预热发生在对局开始前、且 volume 为 0，
+// 失败对用户完全不可见，因此值得多试几次以提高「首次焦点申请」的成功率。
+const WARMUP_MAX_ATTEMPTS = 3;
 
 // Sound 对象缓存
 const soundCache = new Map<string, Audio.Sound>();
@@ -73,6 +96,8 @@ const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve,
 async function ensureAudioMode(): Promise<void> {
   if (audioModeInitialized) return;
   try {
+    // interruptionModeAndroid 保持默认 DuckOthers：GAIN_TRANSIENT_MAY_DUCK
+    // 是最容易拿到系统焦点的模式，改为 DoNotMix(GAIN) 反而更容易被拒。
     await Audio.setAudioModeAsync({
       playsInSilentModeIOS: true,
       staysActiveInBackground: false,
@@ -86,7 +111,7 @@ async function ensureAudioMode(): Promise<void> {
 }
 
 async function getOrLoadSound(name: string): Promise<Audio.Sound | null> {
-  // 已缓存则直接返回
+  // 已缓存则返回
   const cached = soundCache.get(name);
   if (cached) return cached;
 
@@ -101,7 +126,7 @@ async function getOrLoadSound(name: string): Promise<Audio.Sound | null> {
     try {
       const { sound } = await Audio.Sound.createAsync(source, {
         shouldPlay: false,
-        volume: 1.0,
+        volume: SOUND_VOLUME,
       });
       soundCache.set(name, sound);
       loadingCache.delete(name);
@@ -118,12 +143,62 @@ async function getOrLoadSound(name: string): Promise<Audio.Sound | null> {
 }
 
 /**
+ * 静音预热：让音效在用户听不见的时机真正「播」一次。
+ *
+ * 目的（见文件头注释第 1 条）：把整个进程里唯一一次需要真正向系统
+ * requestAudioFocus() 的播放，以及 ExoPlayer 首次解码到 STATE_READY 的过程，
+ * 全部提前到预加载期完成。此时代理失焦或播放失败都没有任何用户感知，
+ * 进入对局后的首次播放就不再是最脆弱的那一次。
+ *
+ * 串行执行而非并发：并发会让多个播放器同时抢同一个音频焦点请求，
+ * 反而制造本不该出现的争用。
+ */
+async function warmUpSound(name: string, sound: Audio.Sound): Promise<void> {
+  // 预热期多试几次：这一步完全静默（volume 0）且发生在对局开始之前，
+  // 用户听不到也感知不到，没有理由只试一次。若连试都失败，说明这次冷启动
+  // 焦点申请确实拿不到，真正的播放路径仍有三级恢复兜底。
+  for (let attempt = 1; attempt <= WARMUP_MAX_ATTEMPTS; attempt++) {
+    try {
+      // volume:0 —— 用户完全听不见；这一步只为触发焦点申请与首次解码。
+      const status = await sound.setStatusAsync({
+        shouldPlay: true,
+        volume: 0,
+        positionMillis: 0,
+      });
+      // 若播放器尚未就绪，给它一点时间进入 STATE_READY 再停，避免把预热
+      // 留在一个半就绪状态上（onPlayerStateChanged 只在 READY 时报就绪）。
+      if (!status.isLoaded) {
+        await sleep(60);
+      }
+      await sound.setStatusAsync({ shouldPlay: false, volume: SOUND_VOLUME });
+      if (attempt > 1) {
+        console.log(`[SoundManager] 预热音效 '${name}' 第 ${attempt} 次成功`);
+      }
+      return;
+    } catch (e) {
+      console.warn(
+        `[SoundManager] 预热音效 '${name}' 第 ${attempt}/${WARMUP_MAX_ATTEMPTS} 次失败:`,
+        e
+      );
+      if (attempt < WARMUP_MAX_ATTEMPTS) {
+        await sleep(150);
+      }
+    }
+  }
+}
+
+/**
  * 预加载常用音效（在进入对局界面时调用）
  */
 export async function preloadSounds(): Promise<void> {
   await ensureAudioMode();
-  const promises = ESSENTIAL_SOUNDS.map((name) => getOrLoadSound(name));
-  await Promise.all(promises);
+  const loaded = await Promise.all(ESSENTIAL_SOUNDS.map((name) => getOrLoadSound(name)));
+  // 串行预热，避免并发抢焦点
+  for (const sound of loaded) {
+    if (!sound) continue;
+    const name = ESSENTIAL_SOUNDS.find((n) => soundCache.get(n) === sound);
+    if (name) await warmUpSound(name, sound);
+  }
 }
 
 /**
@@ -131,17 +206,55 @@ export async function preloadSounds(): Promise<void> {
  */
 export async function preloadGameEndSounds(): Promise<void> {
   await ensureAudioMode();
-  await Promise.all([
+  const loaded = await Promise.all([
     getOrLoadSound('gamewin'),
     getOrLoadSound('gamelose'),
   ]);
+  for (const sound of loaded) {
+    if (!sound) continue;
+    const name = sound === soundCache.get('gamewin') ? 'gamewin' : 'gamelose';
+    await warmUpSound(name, sound);
+  }
+}
+
+/**
+ * 从播放状态里取出音量；错误状态或未加载时返回 null。
+ * AVPlaybackStatus 是成功/错误两个类型的联合，必须先收窄才能取字段。
+ */
+function readVolume(status: AVPlaybackStatus | null | undefined): number | null {
+  if (!status) return null;
+  if (status.isLoaded === false || !('volume' in status)) return null;
+  return typeof status.volume === 'number' ? status.volume : null;
+}
+
+/**
+ * 检查播放结果：若原生回报音量为 0，补一次拉起。
+ *
+ * 原生侧 getVolumeForDuckAndFocus() 在 mAcquiredAudioFocus 为 false 时返回 0f，
+ * 若播放瞬间焦点状态不正确，replayAsync 会「成功」但音量为 0（听感等于没播）。
+ * replayAsync() 的返回值本身就带 volume，因此正常路径**不产生任何额外原生调用**，
+ * 只有真的检测到 0 时才补一次 setStatusAsync。
+ */
+async function ensureAudibleVolume(
+  sound: Audio.Sound,
+  name: string,
+  status: AVPlaybackStatus | null
+): Promise<void> {
+  if (readVolume(status) !== 0) return;
+  try {
+    await sound.setStatusAsync({ volume: SOUND_VOLUME });
+    console.warn(`[SoundManager] 音效 '${name}' 播放后音量仍为 0，已重新拉起音量`);
+  } catch (e) {
+    console.warn(`[SoundManager] 音效 '${name}' 补拉音量失败:`, e);
+  }
 }
 
 /**
  * 原子重放并带回退恢复（核心播放路径）：
- * 1. replayAsync 单次原生调用完成"回零+播放"
+ * 1. replayAsync 单次原生调用完成"回零+播放"，随后确认音量非 0
  * 2. 失败（音频焦点/音频会话瞬态拒绝等）→ 120ms 后重试一次
- * 3. 仍失败 → 卸载重建 Sound 对象后最后尝试一次（恢复原生播放器异常状态）
+ * 3. 仍失败 → 400ms 后再试一次（覆盖冷启动焦点申请较慢的情况）
+ * 4. 仍失败 → 卸载重建 Sound 对象后最后尝试一次（恢复原生播放器异常状态）
  * 本函数不抛出异常：任何失败都以 console.warn 记录后放弃本次播放，
  * 保证绝不影响对局流程（与旧行为一致，但不再"无声无息"）。
  */
@@ -153,7 +266,8 @@ async function replayWithRecovery(name: string, sessionId: number): Promise<void
   if (!sound) return;
 
   try {
-    await sound.replayAsync();
+    const status = await sound.replayAsync();
+    await ensureAudibleVolume(sound, name, status);
     return;
   } catch (e) {
     console.warn(`[SoundManager] replay '${name}' 首次失败，120ms 后重试:`, e);
@@ -163,10 +277,22 @@ async function replayWithRecovery(name: string, sessionId: number): Promise<void
   await sleep(120);
 
   try {
-    await sound.replayAsync();
+    const status = await sound.replayAsync();
+    await ensureAudibleVolume(sound, name, status);
     return;
   } catch (e) {
-    console.warn(`[SoundManager] replay '${name}' 重试仍失败，重建音效对象:`, e);
+    console.warn(`[SoundManager] replay '${name}' 重试仍失败，400ms 后再试:`, e);
+  }
+
+  if (sessionId !== soundSessionId) return;
+  await sleep(400);
+
+  try {
+    const status = await sound.replayAsync();
+    await ensureAudibleVolume(sound, name, status);
+    return;
+  } catch (e) {
+    console.warn(`[SoundManager] replay '${name}' 三次均失败，重建音效对象:`, e);
   }
 
   if (sessionId !== soundSessionId) return;
@@ -179,8 +305,12 @@ async function replayWithRecovery(name: string, sessionId: number): Promise<void
   }
   sound = await getOrLoadSound(name);
   if (!sound) return;
+  // 重建后的播放器同样是「从未播过」的冷状态，需要重新预热才能获得焦点与解码
+  await warmUpSound(name, sound);
+  if (sessionId !== soundSessionId) return;
   try {
-    await sound.replayAsync();
+    const status = await sound.replayAsync();
+    await ensureAudibleVolume(sound, name, status);
   } catch (e) {
     console.warn(`[SoundManager] replay '${name}' 重建后仍失败，放弃本次播放:`, e);
   }
@@ -241,7 +371,7 @@ export async function stopSound(): Promise<void> {
   const promises: Promise<unknown>[] = [];
   for (const [, sound] of soundCache) {
     promises.push(
-      sound.stopAsync().catch(() => { /* 忽略停止失败 */ })
+      sound.stopAsync().catch(() => { /* 停止失败忽略 */ })
     );
   }
   await Promise.all(promises);

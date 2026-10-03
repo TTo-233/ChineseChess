@@ -144,7 +144,17 @@ const CANNON_POSITION_BONUS: number[][] = [
  * 不放在模块级，避免并发搜索互相污染（见上方说明）。
  */
 interface SearchSession {
-  /** 搜索截止时间戳（毫秒） */
+  /**
+   * 搜索截止时间戳（毫秒）—— **纯搜索时间**的截止点。
+   *
+   * 注意：这里刻意**不把让出主线程的墙钟耗时算进预算**。
+   * 分片让出（await yieldToEventLoop）在 RN 上是真宏任务，一帧的成本按 60fps 帧预算算约 16ms；
+   * 若把这段空转计入 deadline，同一预算下真机搜索到的节点数会比桌面少一大截，
+   * 表现为"棋力下降"。本会话因此只累计**真正在搜索的片段时间**：
+   * 每片开始时重置 sliceStart/yieldBegin，让出后把 (yieldBegin → 恢复时刻) 这段
+   * 纯等待累加到 yieldSpent，于是 deadline 的推进速度与「不分片」完全一致 ——
+   * 节点序列不变、结果逐位相同，棋力严格不变，让出成本不再侵蚀预算。
+   */
   deadline: number;
   /** 是否已被中止（超时 / 外部 abortSearch / 被更新的搜索取代） */
   aborted: boolean;
@@ -158,6 +168,15 @@ interface SearchSession {
   pureBest: boolean;
   /** 本分片开始时间戳 */
   sliceStart: number;
+  /** 本分片挂起、开始让出等待的时间戳（用于把让出开销从预算里剔除） */
+  yieldBegin: number;
+  /**
+   * 已让出主线程期间流逝的墙钟毫秒数（让出开销的累计值）。
+   * 与 searchSpent 相加即得总墙钟，因此可以把两者分离：
+   * 分片长度判断用 sliceStart（墙钟，保证单次阻塞 ≈ SEND_SLICE_MS），
+   * 预算判断用 searchSpent（纯搜索，不含让出，保证棋力不降）。
+   */
+  yieldSpent: number;
   /** 已让出主线程次数（诊断用：确认分片粒度按预期生效） */
   yields: number;
 }
@@ -189,24 +208,85 @@ type SearchCheck = 'ok' | 'abort' | 'send';
 
 /** 每跑满约这么多毫秒就让出一次主线程（一个 60fps 帧的预算） */
 const SEND_SLICE_MS = 12;
-/** 周期性子检查间隔（节点数）。与原先 checkTime 一致：每 512 节点查一次时间 */
-const TIME_POLL_NODES = 512;
+/**
+ * 周期性子检查间隔（节点数）：检查"本分片是否跑满"与"是否已超预算"。
+ * 64 节点 ≈ 十几微秒的粒度，能把单次连续阻塞牢牢压在 12ms 附近
+ * （原先 512 节点会让分片尾部多溢出几毫秒，真机上叠加首帧/GC 更容易顶到 16.7ms 掉帧线）。
+ * 注：**中止（abort）本身不在这里轮询**——checkSearch 每次调用第一行就查 session.aborted，
+ * 即逐节点生效；本间隔只影响分片边界与截止时间的检查粒度。
+ */
+const TIME_POLL_NODES = 64;
 /** 时间检查的节点掩码 */
 const TIME_POLL_MASK = TIME_POLL_NODES - 1;
 
 /**
- * 让出主线程、把控制权交回事件循环（触摸/动画/音频消息得以处理），且不引入计时器延迟。
+ * 让出主线程、把控制权交回事件循环（触摸/动画/音频消息得以处理）。
  *
- * 优先用 setImmediate：它只是"本轮到期的其他回调处理完后执行"，等待开销约 0.01ms；
- * 而 setTimeout(fn, 0) 会被主机的按时长取整（Node/Windows 实测每次约 15.4ms），
- * 以 12ms 分片搜索时每片就要多付一次计时器延迟，一台手机一局棋要付上千次，
- * 会把"响应性优化"变成数倍的搜索时长膨胀。
- * 生态兼容：setImmediate 在所有已适配平台（Hermes / JSC / Node / 浏览器 polyfill）都有，
- * 仅在不存在的运行环境里退回 setTimeout(0)。
+ * 【为什么在 React Native 上必须用 setTimeout 而不是 setImmediate】
+ * 让出只有在"回到**宏任务队列**"时才有意义：触摸事件、定时器、动画回调都排在宏任务
+ * 队列里，只有让出到那里，它们才有机会插进来。
+ *
+ * 但 RN 0.81 的 setImmediate 不是宏任务。bridgeless（newArchEnabled，见
+ * client/app.config.ts）下 RN 把 setImmediate polyfill 成 queueMicrotask：
+ *   Libraries/Core/setUpTimers.js:22  polyfillGlobal('setImmediate', () => require('./Timers/immediateShim').setImmediate)
+ *   Libraries/Core/Timers/immediateShim.js:44-51  global.queueMicrotask(() => callback.apply(undefined, args))
+ * 微任务在**当前任务结束前**就会被全部排干（宿主 RuntimeScheduler::performMicrotaskCheckpoint
+ * 里 `while (retries < kRetriesBound) { if (runtime.drainMicrotasks()) break; }`），
+ * 永远轮不到宏任务队列。于是搜索的每一次"让出"只是同一个微任务队列里的下一个微任务：
+ * 微任务队列永远不空 → 触摸事件在整个搜索期间根本排不进来。
+ * 这正是实机上"AI 走子后点棋子要等 1-3 秒才响应"的机制（250ms 启动延迟 + 2500ms 预算）。
+ *
+ * 而 setTimeout(0) 在 RN 上是真定时器：TimerManager.cpp:126 `platformTimerRegistry_->createTimer(timerID, delay)`
+ * 落到平台事件循环，回调作为独立任务回到 JS 任务队列 —— 触摸可以在两次让出之间插进来。
+ *
+ * Node 上反过来：setImmediate 本身就是真宏任务（比 setTimeout 快两个数量级），
+ * 所以按运行时分流，两边都取各自最快的那一种。
+ *
+ * 【为什么在设备上退化到"让满一帧"而不是 setTimeout(0)】
+ * Android 对 0ms 定时器有节流钳制，最小间隔约 4ms；一帧预算是 16.7ms。
+ * 两者都只是"排进宏任务队列"，但真正决定手感的不是钳制后的间隔，而是
+ * 触摸事件要等多久才被消费。让出到 rAF（渲染帧）意味着**每一分片都保证对齐一次真实帧**，
+ * 触摸最迟在下一帧被处理，既不丢帧也不饿手；setTimeout(0) 的 ~4ms 轮询则会在两次
+ * 帧之间反复空转，把本来留给渲染的时间吃掉（实测 Node 上同样策略空转占墙钟 23.3%）。
+ * 因此：设备端走 requestAnimationFrame（宏任务，且对齐帧），Node 端走 setImmediate。
  */
+const isNodeRuntime =
+  typeof (globalThis as { process?: { versions?: { node?: string } } }).process?.versions?.node === 'string';
+
+/**
+ * 设备端优先用 requestAnimationFrame 让出：它是真正的宏任务（渲染帧回调），
+ * 比 setTimeout(0) 更"对齐"——每个分片都落在真实帧边界上，触摸最迟下一帧被消费，
+ * 也不会像 0ms 定时器那样在两次帧之间反复空转。没有 rAF 时（极老环境/测试）退回定时器。
+ * Node 端没有 rAF，走 setImmediate（真宏任务且最快）。
+ */
+const requestFrame =
+  typeof (globalThis as { requestAnimationFrame?: unknown }).requestAnimationFrame === 'function'
+    ? (globalThis as unknown as { requestAnimationFrame: (cb: () => void) => number }).requestAnimationFrame
+    : null;
+
+/**
+ * rAF 让出的兜底计时器：万一帧回调被暂停/节流（窗口不可见、系统回收帧），
+ * 让出不能永远挂着——那会让搜索挂死、AI 永远不出招。这里让"定时器"和"帧"
+ * 谁先到算谁，帧正常时定时器会在同一轮宏任务里被清掉，不产生额外开销。
+ */
+const YIELD_FALLBACK_MS = 32;
+
 let yieldToEventLoop = (): Promise<void> => {
-  if (typeof (globalThis as { setImmediate?: unknown }).setImmediate === 'function') {
+  if (isNodeRuntime && typeof (globalThis as { setImmediate?: unknown }).setImmediate === 'function') {
     yieldToEventLoop = () => new Promise<void>(resolve => setImmediate(resolve));
+  } else if (requestFrame) {
+    yieldToEventLoop = () =>
+      new Promise<void>(resolve => {
+        let settled = false;
+        const done = () => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          resolve();
+        };
+        const timer = setTimeout(done, YIELD_FALLBACK_MS);
+        requestFrame(done);
+      });
   } else {
     yieldToEventLoop = () => new Promise<void>(resolve => setTimeout(resolve, 0));
   }
@@ -225,42 +305,65 @@ export const __searchStats = { nodeCount: 0, yields: 0 };
 function createSession(timeBudget: number, pureBest: boolean): SearchSession {
   __searchStats.nodeCount = 0;
   __searchStats.yields = 0;
+  const now = Date.now();
   return {
-    deadline: Date.now() + timeBudget,
+    deadline: now + timeBudget,
     aborted: false,
     nodeCount: 0,
     pureBest,
-    sliceStart: Date.now(),
+    sliceStart: now,
     yields: 0,
+    yieldBegin: now,
+    yieldSpent: 0,
   };
 }
 
 /**
- * 周期性检查（每 512 个节点一次，避免每节点 Date.now 开销）：
+ * 会话已消耗的"纯搜索时间"：墙钟减去让出主线程的等待时间。
+ * 调用点都在分片内（此时没有让出在途），所以这个减法恰好等于
+ * 「已完成分片时长之和 + 当前分片已跑时长」，与不分片时的耗时口径一致。
+ */
+function searchSpent(session: SearchSession): number {
+  return Date.now() - session.yieldSpent;
+}
+
+/**
+ * 周期性检查（每 TIME_POLL_NODES 个节点一次，避免每节点 Date.now 开销）：
  *  - 'abort'：已中止 / 超时 → 调用方立即返回中立分，结果被上层丢弃
  *  - 'send' ：本分片跑满 → 调用方 `yield SearchYieldSignal` 挂起本节点，
  *             由驱动循环让出主线程后从挂起点原地恢复
  *  - 'ok'   ：继续搜索
+ *
+ * 预算判断用 searchSpent（不含让出耗时），分片判断用 sliceStart（墙钟）：
+ * 前者保证让出开销不侵蚀棋力预算，后者保证单次阻塞仍然 ≈ SEND_SLICE_MS。
  */
 function checkSearch(session: SearchSession): SearchCheck {
   if (session.aborted) return 'abort';
   if ((++session.nodeCount & TIME_POLL_MASK) !== 0) return 'ok';
   __searchStats.nodeCount = session.nodeCount;
 
-  const now = Date.now();
-  if (now > session.deadline) {
+  if (searchSpent(session) > session.deadline) {
     session.aborted = true;
     return 'abort';
   }
+  const now = Date.now();
   if (now - session.sliceStart >= SEND_SLICE_MS) {
     return 'send';
   }
   return 'ok';
 }
 
-/** 开启一个新的分片（每次真正让出主线程、恢复搜索前调用） */
+/**
+ * 开启一个新的分片（每次真正让出主线程、恢复搜索前调用）。
+ * 把「本片结束 → 让出等待结束」这段纯等待的墙钟耗时记入 yieldSpent，从预算里扣除。
+ *
+ * 时间轴：sliceStart ──(分片搜索)──> yieldBegin ──(让出等待)──> now
+ *                    ^计入预算          ^不计入预算（这才是让出的代价）
+ */
 function enterSearchSlice(session: SearchSession): void {
-  session.sliceStart = Date.now();
+  const now = Date.now();
+  session.yieldSpent += now - session.yieldBegin;
+  session.sliceStart = now;
 }
 
 // ======================== 局面评估 ========================
@@ -1217,7 +1320,7 @@ export async function searchWithTimeBudget(
 
   // 迭代加深
   for (let depth = 1; depth <= maxDepth; depth++) {
-    if (Date.now() > session.deadline) break;
+    if (searchSpent(session) > session.deadline) break;
 
     let currentBest: AIMoveResult | null = null;
     let currentBestScore = isMaximizing ? -Infinity : Infinity;
@@ -1308,7 +1411,13 @@ export async function searchWithTimeBudget(
         // 分片跑满时它 yield 出 SearchYieldSignal 挂起（栈帧、局部变量、棋盘全部原样保留），
         // 这里 await 让出主线程一次，再 next() **从挂起的下一句继续**——
         // 不重放、不重算、不重试，因此遍历顺序、剪枝与节点数与不分片时完全一致。
-        // 会话 deadline 是硬截止时间：让出与调度开销不返还预算、不顺延。
+        //
+        // 两套时间各司其职（都不可省）：
+        //  - sliceStart / yieldBegin 用**墙钟**：保证单次连续阻塞 ≈ SEND_SLICE_MS，
+        //    触摸才不会被顶住超过一帧；
+        //  - searchSpent() 用**纯搜索时间**推进 deadline：让出等待（RN 上约一帧）
+        //    不算进预算，否则同样的 timeBudget 在真机上会比桌面少搜大量节点 = 棋力下降。
+        //    扣掉让出后，搜索的"有效算力/预算"比值与不分片版本完全一致。
         let score = 0;
         const gen = minimax(state, depth - 1, alpha, beta, !isMaximizing, 1, 0, session);
         try {
@@ -1318,6 +1427,8 @@ export async function searchWithTimeBudget(
               score = step.value;
               break;
             }
+            // 让出前先盖时间戳：此刻起到 await 恢复之间是纯等待，不计入预算
+            session.yieldBegin = Date.now();
             await yieldToEventLoop();
             enterSearchSlice(session);
             session.yields++;
@@ -1555,12 +1666,86 @@ function ponderMatches(entry: PonderEntry, state: GameState): boolean {
 }
 
 /**
+ * 【P2：让提示预计算只在"闲时"跑，绝不与玩家交互抢主线程】
+ *
+ * 原本 precomputeHint 在每次落子后 250ms 就硬启动一个 hard/2500ms 的搜索。
+ * 修完 P0（让出回到宏任务）之后触摸不再被饿死，但搜索期间仍会占满 JS 线程
+ * （实测 99.2% 占空比），棋盘拿不到干净的一帧，观感上仍是"点了没反应"。
+ * 所以再加一层：预计算推迟到**没有任何触摸/交互在途**时才启动。
+ *
+ * 触摸提示窗口 HINT_TOUCH_GRACE_MS：玩家刚碰过棋盘后的一小段时间内不启动预计算，
+ * 免得"点一下棋子 → 预计算立刻抢占 → 这一下又变卡"。
+ *
+ * 注意：闲时窗口只由"有没有人碰过棋盘"决定，不依赖任何平台 API，
+ * 因此在 Node/Jest 下与真机表现完全一致，搜索行为不受运行环境影响。
+ */
+const HINT_TOUCH_GRACE_MS = 1200;
+
+/**
+ * 最后一次交互（触摸）的时间戳。
+ *
+ * 初值是**模块加载时刻**而不是 0：用户报的现象之一是"第一次进入棋盘后立即点棋子"。
+ * 进棋盘那一刻预计算还没跑，但页面刚挂载时往往正在做首帧布局、图片解码、
+ * 走子动画起步——玩家正要上手点第一下。此时直接启动 hard/2500ms 会抢在前面。
+ * 用加载时刻做初值，等于给"刚进入"也套上同一段静默期。
+ */
+let lastTouchAt = Date.now();
+/** 是否正处于触摸交互的活跃期（用于跨 await 边界兜底，见 hintInteractiveGuard） */
+let touchInteractionActive = false;
+
+/**
+ * 由 UI 层在棋盘收到触摸时调用：记录交互活跃期，阻止预计算抢占；
+ * 并中止**已经在跑**的预计算（玩家的意图优先于后台算力）。
+ */
+export function noteBoardInteraction(): void {
+  lastTouchAt = Date.now();
+  touchInteractionActive = true;
+  // 玩家开始操作了 → 立刻中止后台预计算，把主线程让回来
+  if (ponderEntry && !ponderEntry.done) {
+    abortSearch();
+  }
+}
+
+/** 由 UI 层在触摸结束后调用：开一个宽限期，期间不重启预计算 */
+export function endBoardInteraction(): void {
+  touchInteractionActive = false;
+  lastTouchAt = Date.now();
+}
+
+/** 当前是否处于"不要启动预计算"的窗口（触摸活跃期或宽限期内） */
+function isHintBusyWindow(): boolean {
+  return touchInteractionActive || Date.now() - lastTouchAt < HINT_TOUCH_GRACE_MS;
+}
+
+/** 跨 await 边界兜底：这段时间里玩家碰过棋盘，就放弃本次预计算 */
+function hintInteractiveGuard(entry: PonderEntry): boolean {
+  return ponderEntry !== entry || isHintBusyWindow();
+}
+
+/**
+ * 让出到"闲时"：若玩家正在交互/刚交互过，等待到宽限期结束；
+ * 等待本身同样用宏任务让出，绝不阻塞事件循环。
+ */
+async function waitForIdleHintWindow(entry: PonderEntry): Promise<boolean> {
+  while (isHintBusyWindow()) {
+    if (ponderEntry !== entry) return false; // 局面已变 → 放弃
+    await new Promise<void>(resolve => setTimeout(resolve, 120));
+  }
+  return ponderEntry === entry;
+}
+
+/**
  * 提示搜索（纯最佳模式）：hard 深度与时间预算、完全确定性。
  *
  * 让出方式与 AI 对弈搜索完全相同：固定 12ms 分片（SEND_SLICE_MS），
  * 每片跑满就把搜索挂起、让出主线程，然后从挂起点继续（不会重放已算过的子树）。
  * 因此最长连续阻塞约等于一个分片（十几毫秒），而不是「一整棵根走法子树」
  * ——旧实现只在根走法之间检查让出间隔，实测中局单次阻塞可达约 125ms。
+ *
+ * 搜索期间每个分片都会经由 checkSearch 看到 session.aborted（noteBoardInteraction
+ * 在触摸瞬间置位），因此"玩家碰了棋盘"最迟一个分片内就会让出主线程；
+ * 但分片之间要真正把线程还回宏任务队列，需要下一次 await 让出，所以整体收敛
+ * 在十几毫秒量级（而不是旧实现里那种"整个搜索期间触摸排不进来"）。
  */
 async function runHintSearch(state: GameState): Promise<AIMoveResult | null> {
   // 同样在私有副本上搜索：提示预计算在后台与玩家操作并行，更不能改写 live state
@@ -1589,10 +1774,13 @@ export function precomputeHint(state: GameState): void {
     // 延迟启动：让走棋动画/音效/UI 先完成渲染，避免争抢主线程造成动画卡顿
     await new Promise<void>(resolve => setTimeout(resolve, 250));
     // 延迟期间局面已变化（玩家快速走棋/悔棋/重开等）→ 放弃本次预计算
-    if (ponderEntry !== entry) return null;
+    if (hintInteractiveGuard(entry)) return null;
+    // P2：玩家仍在操作/刚操作过 → 继续等到闲时窗口再启动，绝不与交互抢线程
+    if (!(await waitForIdleHintWindow(entry))) return null;
+    if (hintInteractiveGuard(entry)) return null;
     const result = await runHintSearch(state);
-    // 搜索期间被取消（条目已替换/清空）→ 结果不入缓存
-    if (ponderEntry === entry) {
+    // 搜索期间被取消（条目已替换/清空，或玩家触碰了棋盘）→ 结果不入缓存
+    if (ponderEntry === entry && !touchInteractionActive) {
       entry.done = true;
       entry.result = result;
     }

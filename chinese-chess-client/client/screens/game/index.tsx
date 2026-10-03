@@ -221,25 +221,27 @@ export default function GameScreen() {
   const { moveEffect, triggerMoveEffect } = useMoveEffect();
 
   // 计算被吃掉的棋子
-  const getCapturedPieces = () => {
-    const capturedByRed: number[] = []; // 红方吃掉的（黑方棋子）
-    const capturedByBlack: number[] = []; // 黑方吃掉的（红方棋子）
-    
+  //
+  // 【P4】改为 useMemo：原来是每次渲染都重新遍历 32 个棋子并新建两个数组，
+  // 但 gameState.pieces 这个数组只在局面变化时才换引用，所以只要依赖不变
+  // 拿到的就是同一份结果——没有任何理由在每次渲染时重算。
+  const { capturedByRed, capturedByBlack } = useMemo(() => {
+    const byRed: number[] = []; // 红方吃掉的（黑方棋子）
+    const byBlack: number[] = []; // 黑方吃掉的（红方棋子）
+
     gameState.pieces.forEach(piece => {
       if (!piece.alive) {
         // 棋子ID 0-15 是黑方，16-31 是红方
         if (piece.id < 16) {
-          capturedByRed.push(piece.id); // 黑方棋子被红方吃掉
+          byRed.push(piece.id); // 黑方棋子被红方吃掉
         } else {
-          capturedByBlack.push(piece.id); // 红方棋子被黑方吃掉
+          byBlack.push(piece.id); // 红方棋子被黑方吃掉
         }
       }
     });
-    
-    return { capturedByRed, capturedByBlack };
-  };
 
-  const { capturedByRed, capturedByBlack } = getCapturedPieces();
+    return { capturedByRed: byRed, capturedByBlack: byBlack };
+  }, [gameState.pieces]);
 
   // 加载存档；并在进入对局时预加载常用音效、预热音频模式
   // （预加载消除首步音效按需加载的延迟与音频会话建立时序问题，修复概率性漏音）
@@ -351,7 +353,9 @@ export default function GameScreen() {
     alignedRowStyle,
     jueshaBoardFrame,
     ruleNoticeCenterY,
-    boardSize,
+    // 【P4】不取 boardSize：它在本页从未被读取（只有 onBoardLayout 需要 setBoardSize）。
+    // 但解构出来不等于没用——boardSize 变化会触发本页重渲染，
+    // 而这个值对渲染结果没有任何影响，属于白白多渲染一次。已从解构里移除。
     setBoardSize,
     screenWidth,
     windowHeight,
@@ -367,6 +371,11 @@ export default function GameScreen() {
     insetsBottom: insets.bottom,
     jueshaVisible: jueShaVisible,
   });
+
+  // 【P4】稳定化传给 ChessBoard 的 onBoardLayout：setBoardSize 本身已是 React 稳定的
+  // state setter，这里再包一层 useCallback 只是为了把意图写明——这个回调会驱动
+  // 父级（useGameBoardLayout 内部）setState，进而触发整页重渲染。
+  const stableSetBoardSize = useCallback(setBoardSize, [setBoardSize]);
 
   // 在线 AI 状态订阅：熔断/恢复/服务端繁忙/走法被拒都会主动广播，
   // 这里把它转成 state 触发重渲染——否则角标只能等下一次走子才刷新，
@@ -473,12 +482,18 @@ export default function GameScreen() {
         recordHistoryHash(newState);
 
         // 播放音效：将军时播放男声将军语音（替代走子音，避免与吃子/走子音混音重叠）
+        //
+        // 【P3】不再 await：音效播放失败/冷启动恢复的最坏路径有 ~520ms 的 sleep 与
+        // unload/reload（见 SoundManager.replayWithRecovery），而这里原本是"播完音效
+        // 才 setGameState"——于是每一次走子都要先等音频链路走完，界面才更新，
+        // 玩家在真机上看到的就是"落子后有一拍延迟"。音效与状态更新无因果依赖，
+        // fire-and-forget 即可；playSound 内部已按音效名串行化，不会互相打断。
         if (isCheck && !isGameOver) {
-          await playJiangJunSound();
+          void playJiangJunSound();
         } else if (captured !== -1) {
-          await playSound('eat');
+          void playSound('eat');
         } else {
-          await playSound('go');
+          void playSound('go');
         }
 
         // 吃子/将军特效（终局时不播，由绝杀特效接管）
@@ -490,11 +505,11 @@ export default function GameScreen() {
           const aiWonNow = !isDraw && getWinnerSideTag(newState) === aiSideTag;
           if (!isDraw) {
             // AI 胜=玩家败（gamelose）；AI 被判负=玩家胜（gamewin）；和棋不播胜负音效
-            await playSound(aiWonNow ? 'gamelose' : 'gamewin');
+            void playSound(aiWonNow ? 'gamelose' : 'gamewin');
           }
         }
 
-        // 音效播放期间局面也可能被重置（如玩家中途重开）→ 落地前再校验一次
+        // 落地前校验局面仍然有效（玩家中途重开/悔棋等）
         if (!isTicketLive(ticket)) return;
 
         setGameState(newState);
@@ -670,12 +685,17 @@ export default function GameScreen() {
     recordHistoryHash(newState);
 
     // 播放音效：将军时播放男声将军语音（替代走子音，避免与吃子/走子音混音重叠）
+    //
+    // 【P3】不再 await：见 AI 分支同处说明。音效与状态落地无因果依赖，
+    // 而 SoundManager.replayWithRecovery 的最坏恢复路径含 ~520ms 的 sleep 与
+    // unload/reload，await 它等于让每一次落子都先等音频链路走完才更新界面。
+    // playSound 内部按音效名串行化，fire-and-forget 不会导致音效互相打断。
     if (isCheck && !isGameOver) {
-      await playJiangJunSound();
+      void playJiangJunSound();
     } else if (captured !== -1) {
-      await playSound('eat');
+      void playSound('eat');
     } else {
-      await playSound('go');
+      void playSound('go');
     }
 
     // 【第 3 批 / §8 表 #8】与 AI 分支同口径的代数闸：音效 await 期间玩家可能已
@@ -739,10 +759,10 @@ export default function GameScreen() {
         savePveReplay(newState, playerWon); // 玩家走棋终局：按真实胜负保存复盘
       }
       // 按真实胜负播放结算音效（和棋不播胜负音效）
-      // 结算音效同样 await，落地后再过一次代数闸：期间用户可能已点「再来一局」
+      // 【P3】同样 fire-and-forget：结算界面（胜/负/续局）此时已经渲染完成，
+      // 再等音频链路只是让"再来一局"按钮晚 ~半秒可点。
       if (!isDraw) {
-        await playSound(playerWon ? 'gamewin' : 'gamelose');
-        if (!isTicketLive(ticket)) return;
+        void playSound(playerWon ? 'gamewin' : 'gamelose');
       }
       return;
     }
@@ -1142,7 +1162,9 @@ export default function GameScreen() {
                   ? gameState.ruleState.banMoves
                   : null
               }
-              onBoardLayout={setBoardSize}
+              // 【P4】稳定引用：ChessBoard 用 onBoardLayoutRef 读取它，
+              // 不再因为每次渲染新建函数而让子组件的 memo 失效
+              onBoardLayout={stableSetBoardSize}
             />
             </View>
 
