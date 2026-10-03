@@ -6,7 +6,7 @@
  */
 
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { BUILTIN_ENDGAMES, type EndgameLevel } from './chess/endgames';
+import { BUILTIN_ENDGAMES, type EndgameLevel, type EndgameTier } from './chess/endgames';
 import type { GameState } from './chess/GameEngine';
 import { BOARD_COLS, BOARD_ROWS } from './chess/types';
 
@@ -273,6 +273,8 @@ export interface EndgameLaunchParams {
   name: string;
   comment: string;
   fen: string;
+  /** 内置关难度分档（自定义关为空） */
+  tier?: EndgameTier;
   /** 继续局内存档 */
   continueBattle?: boolean;
 }
@@ -284,6 +286,7 @@ export function builtinLevelToLaunch(levelIndex: number, level: EndgameLevel, co
     name: level.name,
     comment: level.comment,
     fen: level.fen,
+    tier: level.tier,
     continueBattle,
   };
 }

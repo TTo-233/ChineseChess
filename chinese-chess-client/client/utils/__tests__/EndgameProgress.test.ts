@@ -440,6 +440,7 @@ describe('EndgameProgress', () => {
         name: level.name,
         comment: level.comment,
         fen: level.fen,
+        tier: level.tier,
         continueBattle: false,
       });
     });

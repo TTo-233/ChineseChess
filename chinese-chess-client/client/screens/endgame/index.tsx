@@ -1,6 +1,8 @@
 /**
  * 残局闯关选关页
- * - 内置 30 关（引用原开源项目残局库），从第 1 关开始依次解锁
+ * - 内置 100 关：前 30 关引用原开源项目残局库，第 31-100 关为本仓库新增，
+ *   按 入门 / 进阶 / 经典 / 其他 四档编排，从第 1 关开始依次解锁
+ * - 卡片左上角角标显示该关难度分档
  * - 支持继续挑战（局内存档）
  * - 支持导入自定义残局（FEN 识别校验后保存）
  */
@@ -21,7 +23,7 @@ import { AppModal, ModalButton, modalButtonRowStyle } from '@/components/Modal';
 import { useSafeRouter } from '@/hooks/useSafeRouter';
 import { useFocusEffect } from 'expo-router';
 import { FontAwesome6 } from '@expo/vector-icons';
-import { BUILTIN_ENDGAMES, validateEndgameFen } from '@/utils/chess/endgames';
+import { BUILTIN_ENDGAMES, validateEndgameFen, type EndgameTier } from '@/utils/chess/endgames';
 import {
   loadProgress,
   isLevelUnlocked,
@@ -61,9 +63,18 @@ const CROWN_COLORS = {
   bronze: '#B5763A',
 } as const;
 
+// 残局分档角标配色：入门最浅，越往后越重，与「大师级 AI + 皇冠评级」的调性一致
+const TIER_COLORS: Record<EndgameTier, { bg: string; text: string }> = {
+  入门: { bg: '#E8F0E4', text: '#4A7A3F' },
+  进阶: { bg: '#F5EBD8', text: '#8A6212' },
+  经典: { bg: '#F0E0DC', text: '#9C3A2C' },
+  其他: { bg: '#E4E6EE', text: '#4B5486' },
+};
+
 // 玩法说明（标题行右侧标识点击后弹窗展示）
 const RULE_LINES = [
   '从第 1 关开始依次解锁，必须从第一关开始闯关',
+  '共 100 关，按入门 / 进阶 / 经典 / 其他 四档编排，卡片角标即难度分档',
   '大师级 AI 难度，红方先行',
   '对局中禁止使用翻转',
   '每关限 3 次提示，次数用尽后按钮不可用',
@@ -386,6 +397,15 @@ export default function EndgameScreen() {
                       <Text style={[styles.levelName, !unlocked && styles.levelTextMuted]} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.7}>
                         {level.name}
                       </Text>
+                      {/* 难度分档角标：放在卡片内容之外层，与皇冠错开左上角，避免挤压居中布局 */}
+                      <View
+                        style={[styles.tierBadge, { backgroundColor: TIER_COLORS[level.tier].bg }]}
+                        pointerEvents="none"
+                      >
+                        <Text style={[styles.tierBadgeText, { color: TIER_COLORS[level.tier].text }]} numberOfLines={1}>
+                          {level.tier}
+                        </Text>
+                      </View>
                     </TouchableOpacity>
                     {completed && crown && (
                       <View style={styles.crownBadge} pointerEvents="none">
@@ -772,6 +792,20 @@ const styles = StyleSheet.create({
     top: 5,
     right: 5,
     transform: [{ rotate: '32deg' }],
+  },
+  // 难度分档角标：左上角（与皇冠错开），绝对定位在卡片之外层，不参与卡片内部居中布局
+  tierBadge: {
+    position: 'absolute',
+    top: 5,
+    left: 5,
+    paddingHorizontal: 4,
+    paddingVertical: 1,
+    borderRadius: 4,
+    overflow: 'hidden',
+  },
+  tierBadgeText: {
+    fontSize: FONT.micro,
+    fontWeight: '600',
   },
   levelNumber: {
     fontSize: FONT.display,

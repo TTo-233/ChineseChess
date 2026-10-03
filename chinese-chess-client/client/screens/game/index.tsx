@@ -1066,7 +1066,7 @@ export default function GameScreen() {
             </View>
             <Text style={styles.gameSubtitle}>
               {isEndgame && currentEndgame
-                ? `${currentEndgame.name} · 大师难度\n第 ${Math.ceil(moveCount / 2) + 1} 回合`
+                ? `${currentEndgame.name}${currentEndgame.tier ? ` · ${currentEndgame.tier}` : ''} · 大师难度\n第 ${Math.ceil(moveCount / 2) + 1} 回合`
                 : `${difficultyLabel} · 执${currentPlayerSide === 'red' ? '红' : '黑'}${aiFirst ? '后手' : '先手'}\n第 ${Math.ceil(moveCount / 2) + 1} 回合`}
             </Text>
           </View>
@@ -1326,7 +1326,7 @@ export default function GameScreen() {
         visible={endgameInfoVisible}
         title={
           currentEndgame
-            ? `${currentEndgame.customId ? '自定义残局' : `第${currentEndgame.levelIndex + 1}关`} · ${currentEndgame.name}`
+            ? `${currentEndgame.customId ? '自定义残局' : `第${currentEndgame.levelIndex + 1}关`} · ${currentEndgame.name}${currentEndgame.tier ? ` · ${currentEndgame.tier}` : ''}`
             : '残局说明'
         }
         message={currentEndgame?.comment?.trim() ? currentEndgame.comment : '本关无特别说明，将杀对方即获胜。'}
