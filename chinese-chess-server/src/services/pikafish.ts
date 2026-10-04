@@ -6,9 +6,11 @@
  * 因此每个引擎实例运行在独立的 worker_threads 线程中，获得真正的并行能力。
  *
  * 分道（Lane）设计：
- * - light 道：入门 + 进阶（浅搜索、快响应），2 个实例；
- * - heavy 道：大师（深搜索、耗时长），2 个实例。
+ * - light 道：入门 + 进阶（浅搜索、快响应），4 个实例；
+ * - heavy 道：大师（深搜索、耗时长），1 个实例。
  * 两条道各自维护独立队列与实例，深搜索不会挤占浅搜索，互不阻塞。
+ * 配比偏向 light：大师档深度 12 单次搜索约 3~8s，是长尾请求，真正需要并发的
+ * 是入门/进阶这类秒回的请求；4:1 在"多台设备同时点提示/对局"时明显更跟手。
  *
  * 调度策略：
  * - 请求按难度路由到对应道；道内优先分配空闲实例，无空闲则按
@@ -128,8 +130,8 @@ interface QueuedJob {
 function resolveLaneSizes(): Record<DifficultyLane, number> {
   const clamp = (v: number, fallback: number) =>
     Number.isFinite(v) && v >= 1 && v <= 8 ? Math.floor(v) : fallback;
-  const light = clamp(Number(process.env.PIKAFISH_LIGHT_WORKERS), 2);
-  const heavy = clamp(Number(process.env.PIKAFISH_HEAVY_WORKERS), 2);
+  const light = clamp(Number(process.env.PIKAFISH_LIGHT_WORKERS), 4);
+  const heavy = clamp(Number(process.env.PIKAFISH_HEAVY_WORKERS), 1);
   return { light, heavy };
 }
 

@@ -28279,8 +28279,8 @@ function uciToInternal(uci) {
 }
 function resolveLaneSizes() {
   const clamp = (v, fallback) => Number.isFinite(v) && v >= 1 && v <= 8 ? Math.floor(v) : fallback;
-  const light = clamp(Number(process.env.PIKAFISH_LIGHT_WORKERS), 2);
-  const heavy = clamp(Number(process.env.PIKAFISH_HEAVY_WORKERS), 2);
+  const light = clamp(Number(process.env.PIKAFISH_LIGHT_WORKERS), 4);
+  const heavy = clamp(Number(process.env.PIKAFISH_HEAVY_WORKERS), 1);
   return { light, heavy };
 }
 function resolveWorkerScript() {

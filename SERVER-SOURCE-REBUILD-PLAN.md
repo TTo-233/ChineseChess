@@ -576,7 +576,7 @@ deps 9 个 —— `@supabase/supabase-js`、`coze-coding-dev-sdk`、`dayjs`、`d
 - `src/index.ts`：57 行（read 计 64 含末尾空行）；`port = process.env.PORT || 9091`；`GET /api/v1/health`；挂载 `/api/v1/lan`、`/api/v1/ai`；`listen` 回调里 `loadOpeningBook(); warmupPikafish();`。
 - `src/routes/lanGame.ts`：1,520 行；24 条 REST 路由；`rooms = new Map()`；常量 `DISCONNECT_TIMEOUT=60s`、`HEARTBEAT_TIMEOUT=10s`、`UNDO_REQUEST_TTL=30s`、`UNDO_RESULT_TTL=15s`、`MAX_NEGOTIATION_REFUSALS=2`、`SPECTATOR_TTL=20s`、`EMOJI_TTL=6s`、`EMOJI_MAX=20`、`WAITING_ROOM_TTL=30min`、`ACTIVE_ROOM_TTL=2h`、`GC_INTERVAL=60s`、`START_COUNTDOWN_MS=3s`、`START_TOLERANCE_MS=500`、`WAITING_SWEEP_GRACE_MS=30s`；身份只走 `req.body.playerId ?? req.query.playerId`（**无自定义 header**）。
 - `src/routes/ai.ts`：155 行；`POST /move`、`GET /stats`；`MAX_INFLIGHT_PER_CLIENT=1`。
-- `src/services/pikafish.ts`：460 行；`PIKAFISH_LIGHT_WORKERS`/`PIKAFISH_HEAVY_WORKERS`（默认各 2）、`PIKAFISH_JOB_TIMEOUT_MS`（默认 15s）；worker 路径四候选；产物与 dist **字节相同**。
+- `src/services/pikafish.ts`：460 行；`PIKAFISH_LIGHT_WORKERS`/`PIKAFISH_HEAVY_WORKERS`（默认 4+1=5）、`PIKAFISH_JOB_TIMEOUT_MS`（默认 15s）；worker 路径四候选；产物与 dist **字节相同**。
 - `src/services/openingBook.ts`：73 行；`ai/openingBook.json` 四候选路径；产物与 dist **字节相同**。
 - `src/routes/battleWs.ts`：386 行；WS 路径 `/api/v1/lan/ws`；`PING_INTERVAL=15s`、`SOCKET_IDLE_TIMEOUT=30s`。
 - 服务端**无数据库**：全部状态在内存 `rooms` Map；快照源码的运行时依赖只有 `express`、`cors`、`ws`。

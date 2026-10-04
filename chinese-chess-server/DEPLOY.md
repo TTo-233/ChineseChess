@@ -102,17 +102,20 @@
 
 七、可选环境变量（一般无需修改）
   PORT                     服务端口（默认 9091，需与 Cloudflare Tunnel 源地址端口一致）
-  PIKAFISH_LIGHT_WORKERS   入门/进阶引擎实例数（默认 2）
-  PIKAFISH_HEAVY_WORKERS   大师引擎实例数（默认 2）
+  PIKAFISH_LIGHT_WORKERS   入门/进阶引擎实例数（默认 4）
+  PIKAFISH_HEAVY_WORKERS   大师/提示引擎实例数（默认 1）
   PIKAFISH_JOB_TIMEOUT_MS  单请求安全超时毫秒（默认 15000）
-  示例：set PIKAFISH_HEAVY_WORKERS=3 && node dist\index.js
+  取值范围均为 1~8（超出或非法值回落到默认值）。
+  默认 4+1=5 是按"秒回请求优先"配的：大师档深度 12 单次搜索约 3~8s 属长尾，
+  真正需要并发的是入门/进阶；多台设备同时点提示/对局时 4:1 明显更跟手。
+  示例：set PIKAFISH_HEAVY_WORKERS=2 && node dist\index.js
   注意：开机自启任务以 SYSTEM 运行，读取的是“系统级”环境变量；如需自定义 PORT，
      请在“系统属性→环境变量→系统变量”中设置，而非仅在当前窗口 set。
 
 八、部署验证
   本机：  http://localhost:9091/api/v1/health   返回 {"status":"ok"}
   公网：  https://<固定域名>/api/v1/health   返回 {"status":"ok"}（cloudflared 服务运行时）
-  引擎：  http://localhost:9091/api/v1/ai/stats  可看引擎池(2轻量+2大师)与开局库(520)。
+  引擎：  http://localhost:9091/api/v1/ai/stats  可看引擎池(4轻量+1大师)与开局库(520)。
 
 九、常见问题
   - 端口被占用：提示 listen EADDRINUSE 时，改用其它 PORT（并同步改 Cloudflare Tunnel 源地址端口）。
