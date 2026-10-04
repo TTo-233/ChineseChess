@@ -1015,13 +1015,15 @@ export default function GameScreen() {
   // 角标之外的说明条文案：把静默降级的原因讲清楚（拒收原因 / 对局过长 / 繁忙重试）。
   // 用 GameNotice 横幅承载（覆盖在棋盘中央、不阻塞落子），不新增常驻行，
   // 避免打乱棋盘高度预算（useBoardLayoutBudget 的 topFlowHeight）。
+  // 主文案控制在 12 字以内：窄屏（手机竖屏）提示条每行只排得下十来字，主文案再长
+  // 就得挤成三四行、把棋盘中心糊住；更细的原因放在 detail 里，由 GameNotice 断行。
   // key 只跟文案走：同一原因反复出现时不重复弹横幅（常驻指示靠角标，避免刷屏）；
   // 靠 onlineAiStatusTick 消费掉"订阅有更新"这一信号（状态枚举外的变化靠角标读数体现）。
   void onlineAiStatusTick;
   const onlineAiNoticeText = onlineAiInvalidReason
-    ? '在线走法与本地局面不同步，已改用本地AI'
+    ? '在线走法异常，改用本地'
     : longGameNotice
-      ? '对局过长，建议求和或重开'
+      ? '对局过长，建议求和'
       : onlineAiBusy
         ? '服务端繁忙，正在重试'
         : null;
@@ -1031,6 +1033,8 @@ export default function GameScreen() {
         ? {
             key: `online-ai-${onlineAiNoticeText}`,
             text: onlineAiNoticeText,
+            // 细分原因（拒收原因 / 超限步数）放 detail：主文案一行说完，
+            // 细节由 GameNotice 摘掉尾部「（…）」诊断注解后断行排版
             ...(onlineAiInvalidReason ? { detail: onlineAiInvalidReason } : {}),
             ...(longGameNotice ? { detail: longGameNotice } : {}),
             duration: 2600,

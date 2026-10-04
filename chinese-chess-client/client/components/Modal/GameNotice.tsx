@@ -1,8 +1,19 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Animated, Easing, StyleSheet, Text, View } from 'react-native';
+import { Animated, Easing, StyleSheet, Text, View, useWindowDimensions } from 'react-native';
 import type { StyleProp, ViewStyle } from 'react-native';
 import { COLORS, ELEVATION, NOTICE_DURATION_MS, RADIUS, Z_INDEX } from '@/constants/modal';
 import { FONT } from '@/utils/typography';
+import { buildNoticeDetail, condenseNoticeText, noticeUnitsPerLine } from './noticeText';
+
+/**
+ * 提示条横向尺寸口径。宽度比例与内边距既写在样式里，又参与 availableTextWidth()
+ * 的断行计算，所以集中成常量，避免两边各写一份数字后悄悄漂移。
+ * 百分比取整成 92 而非 `0.92 * 100`——浮点会算出 92.00000000000001 并原样进样式。
+ */
+const NOTICE_WIDTH_PERCENT = 92;
+const NOTICE_WIDTH_RATIO = NOTICE_WIDTH_PERCENT / 100;
+const NOTICE_PAD_X = 24;
+const NOTICE_PAD_Y = 16;
 
 export interface GameNoticeItem {
   /** 唯一 key：同一 key 重复触发会重置计时而不是堆叠 */
@@ -30,6 +41,10 @@ export interface GameNoticeProps {
   centerRatio?: number;
   /** 水平最大宽度，默认跟随棋盘宽度（约屏幕 - 32） */
   maxWidth?: number;
+  /** 主文案最多排几行（超出用「…」收尾）。默认 3，窄屏下按 FONT.control 再自动收紧 */
+  maxLines?: number;
+  /** 副标题最多排几行（超出用「…」收尾）。默认 2 */
+  detailMaxLines?: number;
   style?: StyleProp<ViewStyle>;
   onHide?: () => void;
 }
@@ -43,6 +58,10 @@ export interface GameNoticeProps {
  * 2. **自动消失**：默认 3s 后淡出；重复同 key 会重置计时。
  * 3. **不遮挡局面**：只有文字条，不覆盖棋盘中心的大部分视野，替代了原本的 Alert 弹窗。
  *
+ * 4. **窄屏不溢出**：文案宽度随屏宽变化，长句按可用字位主动分行（中文随处断、
+ *    走法 UCI/坐标这类半角串也允许内部断开），超过行数上限用「…」收尾。
+ *    排版口径见同目录 `noticeText.ts`（纯函数，含单测）。
+ *
  * Android 层级：容器同时设置 zIndex 与 elevation，防止被棋盘遮挡。
  */
 export default function GameNotice({
@@ -50,9 +69,14 @@ export default function GameNotice({
   centerY,
   centerRatio = 0.5,
   maxWidth,
+  maxLines = 3,
+  detailMaxLines = 2,
   style,
   onHide,
 }: GameNoticeProps) {
+  // 【C-77 口径】用订阅式 hook 而不是 Dimensions.get('window') 的模块级快照：
+  // 浏览器缩放/转屏后宽度不变会导致按旧宽度断行，行宽对不上实际渲染宽度。
+  const { width: windowWidth } = useWindowDimensions();
   const [visible, setVisible] = useState(false);
   const opacity = useRef(new Animated.Value(0)).current;
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -123,6 +147,22 @@ export default function GameNotice({
     [centerY, centerRatio, maxWidth, style],
   );
 
+  // 排版：按「条内实际可用像素」换算每行字位，再断行 + 限行数。
+  // maxWidth 由调用方（棋盘宽度）给定时优先用它，否则退回屏宽；随后再扣掉
+  // inner 的 92% 宽度上限与左右内边距，得到文字真正能用的宽度。
+  const textWidth = availableTextWidth(maxWidth ?? windowWidth);
+  const displayText = useMemo(
+    () => condenseNoticeText(notice?.text ?? '', noticeUnitsPerLine(textWidth, FONT.control), maxLines),
+    [notice?.text, textWidth, maxLines]
+  );
+  const displayDetail = useMemo(
+    () =>
+      notice?.detail
+        ? buildNoticeDetail(notice.detail, noticeUnitsPerLine(textWidth, FONT.caption), detailMaxLines)
+        : null,
+    [notice?.detail, textWidth, detailMaxLines]
+  );
+
   if (!notice) return null;
 
   return (
@@ -141,17 +181,28 @@ export default function GameNotice({
         style={styles.inner}
         collapsable={false}
       >
-        <Text style={styles.text} numberOfLines={4}>
-          {notice.text}
+        {/* 行数已在上面按字位收紧，numberOfLines 只做最后一道裁剪兜底 */}
+        <Text style={styles.text} numberOfLines={maxLines}>
+          {displayText}
         </Text>
-        {!!notice.detail && (
-          <Text style={styles.detail} numberOfLines={3}>
-            {notice.detail}
+        {!!displayDetail && (
+          <Text style={styles.detail} numberOfLines={detailMaxLines}>
+            {displayDetail}
           </Text>
         )}
       </View>
     </Animated.View>
   );
+}
+
+/**
+ * 提示条里文字真正可用的宽度：
+ * 屏宽/调用方给定宽度 → 乘 inner 的 `maxWidth: '92%'` → 扣掉左右内边距（NOTICE_PAD_X）。
+ *
+ * 留 4px 余量：字位是估算值（见 noticeText.ts），宁可少排半个字，也不要顶出屏幕。
+ */
+function availableTextWidth(containerWidth: number): number {
+  return Math.max(0, containerWidth * NOTICE_WIDTH_RATIO - NOTICE_PAD_X * 2 - 4);
 }
 
 const styles = StyleSheet.create({
@@ -166,11 +217,11 @@ const styles = StyleSheet.create({
     elevation: ELEVATION.overlay,
   },
   inner: {
-    maxWidth: '92%',
+    maxWidth: `${NOTICE_WIDTH_PERCENT}%`,
     backgroundColor: COLORS.noticeBg,
     borderRadius: RADIUS.notice,
-    paddingVertical: 16,
-    paddingHorizontal: 24,
+    paddingVertical: NOTICE_PAD_Y,
+    paddingHorizontal: NOTICE_PAD_X,
     alignItems: 'center',
   },
   text: {
