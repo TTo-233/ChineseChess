@@ -333,15 +333,16 @@ export default function GameScreen() {
   // 棋盘内容宿主顶边相对页面内容顶边的 Y（含顶部栏与顶部安全区）：预算封顶时用于推算可用高度
   const [drawerHostY, setDrawerHostY] = useState(0);
 
-  // 长将长捉规则提示（接近阈值"请尽快变招"/达到阈值"禁着请变招"/违规警告，
-  // 方案 10.3 / 12）：与联机对战一致，统一用覆盖在棋盘中央的 GameNotice 横幅
+  // 长将长捉/判和规则提示（阈值前一步的一次性预警，【提示口径 2026-10】）：
+  // 与联机对战一致，统一用覆盖在棋盘中央的 GameNotice 横幅
   // （centerY 的换算依赖下方 jueshaBoardFrame，故放在它之后）
   const [ruleNotice, setRuleNotice] = useState<GameNoticeItem | null>(null);
-  const ruleNoticeSeqRef = useRef(0);
+  // key 用「文案本身」而非自增序号：规则引擎的 noticeKey 是稳定的预警标识，
+  // 同一类预警在走子方交替时内容不变。自增序号会让每一步都当成新提示重新计时，
+  // 于是提示条常驻刷屏——这正是「过于频繁」的根因。语义不同的提示（「着法送将，
+  // 请另走」vs「长将已 5 着…」）文案必然不同，仍会各自重新计时。
   const showRuleNotice = useCallback((text: string) => {
-    // key 自增：即使用户连点触发同一文案，也保证重新计时
-    ruleNoticeSeqRef.current += 1;
-    setRuleNotice({ key: `rule-${ruleNoticeSeqRef.current}`, text });
+    setRuleNotice((prev) => (prev?.text === text ? prev : { key: `rule-${text}`, text }));
   }, []);
   const hideRuleNotice = useCallback(() => setRuleNotice(null), []);
 
@@ -1159,13 +1160,10 @@ export default function GameScreen() {
               maxBoardHeight={maxBoardHeight}
               capturedStripOffset={30}
               moveEffect={moveEffect}
-              banMoves={
-                gameState.ruleState?.banActive &&
-                gameState.ruleState.banSide === (currentPlayerSide === 'red' ? RED_SIDE : BLACK_SIDE) &&
-                gameState.sideTag === (currentPlayerSide === 'red' ? RED_SIDE : BLACK_SIDE)
-                  ? gameState.ruleState.banMoves
-                  : null
-              }
+              // 【提示口径 2026-10】不再向棋盘下发 banMoves 标红：提示统一收敛到
+              // 「阈值前一步的一次性提示条」。banMoves 本身仍在 RuleState 里计算，
+              // 因为 AI 择优（isMoveBanned）要用它过滤会走进僵局的着法。
+              banMoves={null}
               // 【P4】稳定引用：ChessBoard 用 onBoardLayoutRef 读取它，
               // 不再因为每次渲染新建函数而让子组件的 memo 失效
               onBoardLayout={stableSetBoardSize}

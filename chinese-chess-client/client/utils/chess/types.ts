@@ -97,6 +97,8 @@ export interface SideRuleCounters {
   jiangZhuoPieceIds: number[];
   /** 该方连续将军期间对方是否还过将（二将一还检测） */
   opponentCheckedDuringRun: boolean;
+  /** 自然限招窗口内本方累计将军着数（规则一.5：双方各自最多累计 10 次将军） */
+  checkCountInWindow: number;
 }
 
 export interface RuleState {
@@ -106,8 +108,6 @@ export interface RuleState {
   positionKeys: string[];
   /** 自最后一次吃子起双方累计着数（自然限招） */
   naturalMoveCounter: number;
-  /** 自然限招窗口内将军累计着数 */
-  checkCounterInWindow: number;
   /** 禁着是否激活（娱乐向改造：仅表示「存在超限红点警示」，不再拦截落子、不判负） */
   banActive: boolean;
   /** 被标红方（下一手会继续长将/长捉的一方） */

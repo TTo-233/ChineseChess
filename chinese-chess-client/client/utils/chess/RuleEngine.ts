@@ -6,11 +6,12 @@
  * - 每步走子后的判定流程（方案 5）：将军检测 → 捉子检测 → 计数更新 → 重复检测 → 阈值检查
  * - 捉子检测（方案 7）：走子后能够造成下一着吃掉对方无根子（假根视为无根），
  *   带特殊子力豁免（兵卒将帅长捉允许、未过河兵卒不算、单/双炮捉车不算、同类互献不算）
- * - 长将长捉超限（方案 10，娱乐向改造）：达到阈值后**不拦截落子、不判负**，
+ * - 长将长捉超限（规则二）：达到阈值后**不拦截落子、不判负**，
  *   仅生成 banMoves 红点警示并在提示条中提醒「请尽快变招」；双方僵持不下由
- *   自然限招/互长将互长捉判和收场（方案 2.1.2 / 2.2.3 / 2.4）
- * - 判和体系（方案 2.4）：互长将/互长捉/非将非捉重复 5 次/自然限招 120 着/
- *   将军累计 40 着/总步数 400 着/双方无进攻子力
+ *   判和体系收场
+ * - 判和体系（规则一.1~一.6）：无进攻子力 / 非将非应将非捉非应捉重复 5 次 /
+ *   互长将 6 次 / 互长捉 6 次 / 无吃子 120 步（单方将军累计上限 10）/ 总步数 400 步，
+ *   其中无吃子与总步数两项在「末步绝杀或困毙」时判胜不判和
  * - 二将一还（方案 2.1.3）：对方还过将时长将方直接判负
  * - 所有阈值集中于 RULE_CONFIG（方案 19.5：可配置）
  *
@@ -35,23 +36,23 @@ export type { BanReason, BanMove, SideRuleCounters, RuleState } from './types';
 // 阈值配置（方案 19.5：所有阈值必须可配置）
 // ---------------------------------------------------------------------------
 export const RULE_CONFIG = {
-  /** 长将允许着数：按参与长将的子力数量（1 子 / 2 子 / 3 子及以上），方案 2.1.1 */
+  /** 长将允许回合数：按参与长将的子力数量（1 子 / 2 子 / 3 子及以上，规则二.3） */
   longCheckByPieceCount: [6, 12, 18] as const,
-  /** 长捉同一子允许着数（方案 2.2.1） */
+  /** 长捉对方子允许回合数（规则二.1） */
   longChase: 6,
-  /** 将捉交替允许着数：一子 / 一子以上（方案 2.3） */
+  /** 将捉交替允许回合数：一子 / 一子以上（规则二.4） */
   checkChaseByPieceCount: [12, 18] as const,
-  /** 非将非捉局面重复判和次数（方案 2.4） */
+  /** 非将非应将非捉非应捉局面重复判和次数（规则一.2） */
   repetitionDraw: 5,
-  /** 互相长将判和阈值（双方各自长将达到该着数，方案 2.1.2） */
+  /** 互相长将判和阈值（双方各自长将达到该回合数，规则一.3） */
   mutualLongCheckDraw: 6,
-  /** 互相长捉判和阈值（方案 2.2.3） */
+  /** 互相长捉判和阈值（规则一.4） */
   mutualLongChaseDraw: 6,
-  /** 自然限招：无吃子着数上限（方案 2.4） */
+  /** 自然限招：无吃子着数上限（规则一.5：双方无吃子 120 步 = 60 回合） */
   naturalMoveLimit: 120,
-  /** 自然限招窗口内将军累计上限（方案 2.4） */
-  checkCountLimit: 40,
-  /** 双方累计总着数上限（方案 2.4） */
+  /** 自然限招窗口内**单方**累计将军上限（规则一.5：双方各自最多只累计 10 次将军） */
+  checkCountLimitPerSide: 10,
+  /** 双方累计总着数上限（规则一.6：总步数 400 步 = 200 回合） */
   totalMoveLimit: 400,
 } as const;
 
@@ -355,6 +356,7 @@ function emptySideCounters(): SideRuleCounters {
     jiangZhuoLoop: 0,
     jiangZhuoPieceIds: [],
     opponentCheckedDuringRun: false,
+    checkCountInWindow: 0,
   };
 }
 
@@ -364,7 +366,6 @@ export function createInitialRuleState(state: GameState): RuleState {
     black: emptySideCounters(),
     positionKeys: [positionKey(state)],
     naturalMoveCounter: 0,
-    checkCounterInWindow: 0,
     banActive: false,
     banSide: null,
     banReason: null,
@@ -383,6 +384,7 @@ function cloneSideCounters(s: SideRuleCounters): SideRuleCounters {
     jiangZhuoLoop: s.jiangZhuoLoop,
     jiangZhuoPieceIds: [...s.jiangZhuoPieceIds],
     opponentCheckedDuringRun: s.opponentCheckedDuringRun,
+    checkCountInWindow: s.checkCountInWindow,
   };
 }
 
@@ -392,7 +394,6 @@ export function cloneRuleState(r: RuleState): RuleState {
     black: cloneSideCounters(r.black),
     positionKeys: [...r.positionKeys],
     naturalMoveCounter: r.naturalMoveCounter,
-    checkCounterInWindow: r.checkCounterInWindow,
     banActive: r.banActive,
     banSide: r.banSide,
     banReason: r.banReason,
@@ -416,14 +417,14 @@ function resetSideCounters(s: SideRuleCounters) {
 // 禁着（娱乐向改造：仅红点警示，不拦截、不判负）
 // ---------------------------------------------------------------------------
 
-/** 长将允许着数（按参与子数分档：1 子 6 / 2 子 12 / 3 子及以上 18，方案 2.1.1） */
+/** 长将允许回合数（按参与长将的子力数量：1 子 6 / 2 子 12 / 3 子及以上 18，规则二.3） */
 function longCheckLimit(pieceCount: number): number {
   return pieceCount <= 1 ? RULE_CONFIG.longCheckByPieceCount[0]
     : pieceCount === 2 ? RULE_CONFIG.longCheckByPieceCount[1]
       : RULE_CONFIG.longCheckByPieceCount[2];
 }
 
-/** 将捉交替允许着数（一子 12 / 一子以上 18，方案 2.3） */
+/** 将捉交替允许回合数（一子 12 / 一子以上 18，规则二.4） */
 function checkChaseLimit(pieceCount: number): number {
   return pieceCount <= 1 ? RULE_CONFIG.checkChaseByPieceCount[0] : RULE_CONFIG.checkChaseByPieceCount[1];
 }
@@ -550,7 +551,11 @@ export function evaluateRuleAfterMove(
     resetSideCounters(mover);
     resetSideCounters(opponent);
     rs.naturalMoveCounter = 0;
-    rs.checkCounterInWindow = 0;
+    // 规则一.5 的单方将军累计属于「无吃子窗口」内的计数：吃子即窗口重置，
+    // 双方累计一并清零（resetSideCounters 本身不含此字段——非将非捉变招时
+    // 只断连续性，不该动窗口累计，故必须在此显式清）。
+    mover.checkCountInWindow = 0;
+    opponent.checkCountInWindow = 0;
   } else if (isCheck) {
     // 将军着：优先算将（方案 2.3.2），清空走子方捉子计数，将捉循环照常累计
     mover.jiangCount += 1;
@@ -558,7 +563,7 @@ export function evaluateRuleAfterMove(
     mover.jiangZhuoLoop += 1;
     if (!mover.jiangZhuoPieceIds.includes(move.pieceId)) mover.jiangZhuoPieceIds.push(move.pieceId);
     mover.zhuoCounts = {};
-    rs.checkCounterInWindow += 1;
+    mover.checkCountInWindow += 1; // 规则一.5：本方将军累计（单方上限 10）
     // 二将一还线索（方案 2.1.3）：对方（被我这步将军的一方）若正处于连将，
     // 则对方连将期间"我还过将"——为对方标记，待其长将达到阈值时判其负
     if (opponent.jiangCount > 0) {
@@ -592,40 +597,50 @@ export function evaluateRuleAfterMove(
   if (move.captured === -1) rs.naturalMoveCounter += 1;
   const totalMoves = afterState.moveHistory.length;
 
-  // --- 阈值检查（方案 9 触发表；判和优先，方案 0.2） ---
+  // --- 阈值检查（判和优先，见规则一「判和」） ---
+  //
+  // 【提示口径 2026-10】提示只在「跨过阈值的前一次」响一次，绝不每步重播：
+  // 1) 规则一 6 个判和条件在**到点前一步**给出预警（见 drawWarningsAt）；
+  // 2) 规则二的「已超限」横幅取消——超限后每一步都会重写 notice，实测刷屏。
+  //    超限信息改由 AI 择优（isMoveBanned）与判定流程本身承担。
+  // 3) 规则二的长将/长捉/将捉交替仍保留「下着将超限」的一次性预警（见末尾）。
+  // 判和阈值检查如下（判和本身优先于提示，命中即 finish 收场）。
 
-  // 双方无进攻子力（无车马炮卒）自动判和（方案 2.4 例外）
+  // 双方无进攻子力（无车马炮卒）自动判和（规则一.1）
   if (!hasAttackingPieces(afterState, RED_SIDE) && !hasAttackingPieces(afterState, BLACK_SIDE)) {
     return finish(rs, true, 'no_attacking', null);
   }
 
-  // 总步数上限（方案 2.4）
+  // 总步数上限 400 步（规则一.6；末步绝杀/困毙已在 GameEngine.makeMove 优先裁决）
   if (totalMoves >= RULE_CONFIG.totalMoveLimit) {
     return finish(rs, true, 'total_limit', null);
   }
 
-  // 自然限招：无吃子 120 着（方案 2.4）
+  // 无吃子 120 步（规则一.5；末步绝杀/困毙同上优先判胜）
   if (rs.naturalMoveCounter >= RULE_CONFIG.naturalMoveLimit) {
     return finish(rs, true, 'natural_limit', null);
   }
 
-  // 自然限招窗口内将军累计 40 着（方案 2.4）
-  if (rs.checkCounterInWindow >= RULE_CONFIG.checkCountLimit) {
+  // 自然限招窗口内**单方**累计将军 10 着判和（规则一.5：双方各自最多只累计 10 次将军）
+  if (mover.checkCountInWindow >= RULE_CONFIG.checkCountLimitPerSide
+    || opponent.checkCountInWindow >= RULE_CONFIG.checkCountLimitPerSide) {
     return finish(rs, true, 'natural_limit', null);
   }
 
-  // 互相长将：双方各自长将达到 6 着判和（方案 2.1.2）
+  // 互相长将：双方各自长将达到 6 回合判和（规则一.3）
   if (rs.red.jiangCount >= RULE_CONFIG.mutualLongCheckDraw && rs.black.jiangCount >= RULE_CONFIG.mutualLongCheckDraw) {
     return finish(rs, true, 'mutual_long_check', null);
   }
 
-  // 互相长捉：双方各一子连续被捉达到 6 着判和（方案 2.2.3）
+  // 互相长捉：双方各一子连续被捉达到 6 回合判和（规则一.4）
   if (maxZhuoCount(rs.red) >= RULE_CONFIG.mutualLongChaseDraw && maxZhuoCount(rs.black) >= RULE_CONFIG.mutualLongChaseDraw) {
     return finish(rs, true, 'mutual_long_chase', null);
   }
 
-  // 非将非捉局面重复 5 次判和（方案 2.4 / 8）
-  if (!isCheck && zhuoList.length === 0) {
+  // 非将非应将非捉非应捉时局面重复 5 次判和（规则一.2）
+  // 四类着法一律不计入重复：将军着（isCheck）、应将着（wasRespondingCheck）、
+  // 有效捉着（zhuoList 非空）、应将时产生的捉（应捉，wasRespondingCheck 且有捉）。
+  if (!isCheck && !wasRespondingCheck && zhuoList.length === 0) {
     let repetition = 1;
     for (let i = rs.positionKeys.length - 2; i >= 0; i--) {
       if (rs.positionKeys[i] === currentKey) repetition++;
@@ -644,32 +659,35 @@ export function evaluateRuleAfterMove(
     return finish(rs, true, 'changjiang', moverSide);
   }
 
-  // --- 长将长捉超限判定（方案 10，娱乐向改造：仅提示 + 红点，不拦截不判负） ---
+  // --- 长将长捉超限判定（规则二.1~二.4，娱乐向改造：仅提示 + 红点，不拦截不判负） ---
   // 对双方分别检查阈值：对方超限时其红点必须保留——对方上一步触发的超限
-  // 不应因本方闲着而消失（直到对方变招清零计数）。本方（刚走子方）优先。
-  const tryBan = (side: SideTag): { reason: BanReason; targets: number[] } | null => {
+  // 不应因本方闲着而消失（直到对方变招清零计数）。
+  // 各方的命中理由须**分开**求出（而非取首个满足的阈值），才能在规则二.2
+  // 「一方长将、一方长捉 → 长将方禁招」时跨方比较。
+  type BanHit = { reason: BanReason; targets: number[] };
+  const tryBan = (side: SideTag): BanHit | null => {
     const c = rs[sideKey(side)];
     const opp = rs[sideKey(!side as SideTag)];
-    // 长将阈值：一子 6 / 两子 12 / 三子及以上 18（方案 2.1.1）
+    // 长将阈值：一子 6 / 两子 12 / 三子及以上 18（规则二.3）
     if (c.jiangCount >= longCheckLimit(c.jiangPieceIds.length)) {
-      // 互相长将进行中（对方连将至 5+）：暂不提示超限，待对方到 6 判和（方案 2.1.2）
+      // 互相长将进行中（对方连将至 5+）：暂不提示超限，待对方到 6 判和（规则一.3）
       if (opp.jiangCount < RULE_CONFIG.mutualLongCheckDraw - 1) {
         return { reason: 'LONG_CHECK', targets: [] };
       }
       return null;
     }
-    // 长捉阈值：连续捉同一子 6 着（方案 2.2.1）
+    // 长捉阈值：连续捉同一子 6 回合（规则二.1）
     const targets = Object.keys(c.zhuoCounts)
       .filter(k => c.zhuoCounts[k] >= RULE_CONFIG.longChase)
       .map(k => Number(k));
     if (targets.length > 0) {
-      // 互相长捉进行中（对方也有 5+ 捉计数）：暂不提示，待对方到 6 判和（方案 2.2.3）
+      // 互相长捉进行中（对方也有 5+ 捉计数）：暂不提示，待对方到 6 判和（规则一.4）
       if (maxZhuoCount(opp) < RULE_CONFIG.mutualLongChaseDraw - 1) {
         return { reason: 'LONG_CHASE', targets };
       }
       return null;
     }
-    // 将捉交替阈值：一子 12 / 一子以上 18（方案 2.3）
+    // 将捉交替阈值：一子 12 / 一子以上 18（规则二.4）
     if (c.jiangZhuoLoop >= checkChaseLimit(c.jiangZhuoPieceIds.length)) {
       return { reason: 'CHECK_CHASE', targets: [] };
     }
@@ -678,53 +696,127 @@ export function evaluateRuleAfterMove(
 
   const moverBan = tryBan(moverSide);
   const oppBan = tryBan(opponentSide);
-  const hit = moverBan ?? oppBan;
-  const hitSide = moverBan ? moverSide : opponentSide;
 
-  /** 超限名称（长将 / 长捉 / 将捉交替），用于提示文案 */
+  // 规则二.2「一方长将、一方长捉，长将方禁招」：双方都超限时按理由裁决，
+  // 长将方（先考虑「将捉交替」，它含长将成分）优先被标红，另一方不标红。
+  // 若只有一方超限，或双方理由不含长将 vs 长捉的对立关系，则沿用
+  // 「刚走子方优先，其次对方」的旧口径。
+  let hit: BanHit | null = moverBan ?? oppBan;
+  let hitSide: SideTag = moverBan ? moverSide : opponentSide;
+  if (moverBan && oppBan) {
+    const moverIsCheckish = moverBan.reason === 'LONG_CHECK' || moverBan.reason === 'CHECK_CHASE';
+    const oppIsCheckish = oppBan.reason === 'LONG_CHECK' || oppBan.reason === 'CHECK_CHASE';
+    // 恰为「长将（含将捉交替） vs 长捉」的对立组合 → 判长将方
+    const isOpposed = (a: BanHit, b: BanHit) =>
+      (a.reason !== 'LONG_CHASE' && b.reason === 'LONG_CHASE')
+      || (a.reason === 'LONG_CHASE' && b.reason !== 'LONG_CHASE');
+    if (moverIsCheckish && !oppIsCheckish && isOpposed(moverBan, oppBan)) {
+      hit = moverBan; hitSide = moverSide;                       // 长将方（走子方）禁招
+    } else if (oppIsCheckish && !moverIsCheckish && isOpposed(moverBan, oppBan)) {
+      hit = oppBan; hitSide = opponentSide;                       // 长将方（对方）禁招
+    }
+  }
+
+  /**
+   * 超限名称（长将 / 长捉 / 将捉交替），用于提示文案
+   */
   const banName = (reason: BanReason): string =>
     reason === 'LONG_CHECK' ? '长将' : reason === 'LONG_CHASE' ? '长捉' : '将捉交替';
 
   if (hit) {
-    // 超限：**不拦截落子、不判负**。仅生成红点警示并给出「请尽快变招」提示。
-    // 双方继续僵持不下的收场由自然限招（120 着）与互长将/互长捉判和承担。
+    // 超限：**不拦截落子、不判负**，红点/禁着表仍然算出——它同时是 AI 择优的
+    // 过滤依据（AIEngine / aiDispatcher / 人机页兜底都读 isMoveBanned），
+    // 不能因为「不展示了」就删掉，否则 AI 会主动往僵局里走。
+    //
+    // 但**不再出提示条**：这里每一步都会重写 notice，而 noticeKey 在超限期间
+    // 恒为同一个字符串，UI 却按自增序号当 key，于是超限后每走一步就重播一次
+    // 「已超限，请尽快变招」——实测刷屏。改为只在跨过阈值前一步提示一次
+    // （见下方 noticeFor）。判和条件仍会在到点前一步预警。
     rs.banActive = true;
-    rs.banSide = hitSide; // 红点标记该方「会继续长将/长捉」的落点
+    rs.banSide = hitSide; // 标记该方「会继续长将/长捉」的落点
     rs.banReason = hit.reason;
     rs.banChaseTargets = hit.targets;
     rs.banMoves = buildBanMoves(afterState, hitSide, hit.reason, hit.targets);
-    rs.notice = `${banName(hit.reason)}已超限，请尽快变招`;
-    rs.noticeKey = `${sideKey(hitSide)}-ban-${hit.reason}`;
   } else {
     rs.banActive = false;
     rs.banSide = null;
     rs.banReason = null;
     rs.banChaseTargets = [];
     rs.banMoves = [];
+  }
 
-    // 接近阈值提示（倒数第 2 着，方案 10.3 / 12；刚走子方优先，其次对方）：
-    // 提醒玩家「下一着就会超限」，超限后不再判负但会陷入僵局
-    const noticeFor = (side: SideTag): { text: string; key: string } | null => {
-      const c = rs[sideKey(side)];
-      const checkLimit = longCheckLimit(c.jiangPieceIds.length);
-      if (c.jiangCount >= checkLimit - 1 && c.jiangCount < checkLimit) {
-        return { text: `长将已 ${c.jiangCount} 着，下着将超限，请尽快变招`, key: `${sideKey(side)}-jiang-${c.jiangCount}` };
-      }
-      const zhuoMax = maxZhuoCount(c);
-      if (zhuoMax >= RULE_CONFIG.longChase - 1 && zhuoMax < RULE_CONFIG.longChase) {
-        return { text: `长捉已 ${zhuoMax} 着，下着将超限，请尽快变招`, key: `${sideKey(side)}-zhuo-${zhuoMax}` };
-      }
-      const jzLimit = checkChaseLimit(c.jiangZhuoPieceIds.length);
-      if (c.jiangZhuoLoop >= jzLimit - 1 && c.jiangZhuoLoop < jzLimit) {
-        return { text: `将捉交替已 ${c.jiangZhuoLoop} 着，下着将超限，请尽快变招`, key: `${sideKey(side)}-jz-${c.jiangZhuoLoop}` };
-      }
-      return null;
-    };
-    const notice = noticeFor(moverSide) ?? noticeFor(opponentSide);
-    if (notice) {
-      rs.notice = notice.text;
-      rs.noticeKey = notice.key;
+  // 一次性预警（走子方优先，其次对方）：只在「下一着就会判和 / 就会超限」时响一次。
+  //
+  // 【key 的口径】key 一律**不含方别**，只由「预警种类 + 累计数字」构成。GameNotice
+  // 只在 key 变化时重新计时（见 components/Modal/GameNotice.tsx 的 useEffect），
+  // 而 UI 传下来的又是自增序号，所以：
+  // - key 含方别时，红黑交替各触发一次 → 提示条每步重播，正是「过于频繁」的成因；
+  // - key 不含方别时，同一类预警整个过程只会在首次跨到该数字时响一次。
+  // 代价是「变招清零后再次冲到同一数字」不再重响——按「只提示一次」的要求，
+  // 这是期望行为。
+  const noticeFor = (side: SideTag): { text: string; key: string } | null => {
+    const c = rs[sideKey(side)];
+    const other = rs[sideKey(!side as SideTag)];
+
+    // --- 规则一：判和类预警（到点前一步） ---
+    // 一.6 总步数
+    if (totalMoves === RULE_CONFIG.totalMoveLimit - 1) {
+      return { text: `双方已走 ${totalMoves} 步，下着将满 ${RULE_CONFIG.totalMoveLimit} 步判和`, key: `total-${totalMoves}` };
     }
+    // 一.5 无吃子步数（窗口内）
+    if (rs.naturalMoveCounter === RULE_CONFIG.naturalMoveLimit - 1) {
+      return { text: `已 ${rs.naturalMoveCounter} 步无吃子，下着将满 ${RULE_CONFIG.naturalMoveLimit} 步判和`, key: `natural-${rs.naturalMoveCounter}` };
+    }
+    // 一.5 单方将军累计：任一方到 9 都预警，文案不点名具体是哪一方
+    if (c.checkCountInWindow === RULE_CONFIG.checkCountLimitPerSide - 1
+      || other.checkCountInWindow === RULE_CONFIG.checkCountLimitPerSide - 1) {
+      const n = Math.max(c.checkCountInWindow, other.checkCountInWindow);
+      return { text: `有一方已将军 ${n} 次，下着再将军将满 ${RULE_CONFIG.checkCountLimitPerSide} 次判和`, key: `chkwin-${n}` };
+    }
+    // 一.3 互相长将（双方都到 5 时预警，再各走一着即判和）
+    if (c.jiangCount === RULE_CONFIG.mutualLongCheckDraw - 1 && other.jiangCount >= RULE_CONFIG.mutualLongCheckDraw - 1) {
+      return { text: `双方长将已达 ${RULE_CONFIG.mutualLongCheckDraw - 1} 次，双方继续长将将判和`, key: `mutualcheck-${c.jiangCount}-${other.jiangCount}` };
+    }
+    // 一.4 互相长捉
+    const cMax = maxZhuoCount(c);
+    const otherMax = maxZhuoCount(other);
+    if (cMax === RULE_CONFIG.mutualLongChaseDraw - 1 && otherMax >= RULE_CONFIG.mutualLongChaseDraw - 1) {
+      return { text: `双方长捉已达 ${RULE_CONFIG.mutualLongChaseDraw - 1} 次，双方继续长捉将判和`, key: `mutualzhuo-${cMax}-${otherMax}` };
+    }
+    // 一.2 局面重复：第 4 次出现时预警——下着若回到同一局面即第 5 次判和。
+    // 只在「本步确实计入了重复」时判断：将/应将/捉/应捉着压根不进重复计数，
+    // 拿它们去比对历史指纹会得到误导性的预警。
+    // 注意阈值是 repetitionDraw - 2：第 5 次出现时上面的判和检查已经先行收场，
+    // 预警必须提前一格，否则永远不会触发。
+    if (!isCheck && !wasRespondingCheck && zhuoList.length === 0) {
+      let seen = 0;
+      for (let i = 0; i < rs.positionKeys.length - 1; i++) {
+        if (rs.positionKeys[i] === currentKey) seen++;
+      }
+      if (seen === RULE_CONFIG.repetitionDraw - 2) {
+        return { text: `本局面已出现 ${seen + 1} 次，下着重复将判和`, key: `rep-${seen + 1}` };
+      }
+    }
+
+    // --- 规则二：超限类预警（到阈值前一步） ---
+    const checkLimit = longCheckLimit(c.jiangPieceIds.length);
+    if (c.jiangCount >= checkLimit - 1 && c.jiangCount < checkLimit) {
+      return { text: `${banName('LONG_CHECK')}已 ${c.jiangCount} 着，下着将超限，请尽快变招`, key: `jiang-${c.jiangCount}` };
+    }
+    const zhuoMax = maxZhuoCount(c);
+    if (zhuoMax >= RULE_CONFIG.longChase - 1 && zhuoMax < RULE_CONFIG.longChase) {
+      return { text: `${banName('LONG_CHASE')}已 ${zhuoMax} 着，下着将超限，请尽快变招`, key: `zhuo-${zhuoMax}` };
+    }
+    const jzLimit = checkChaseLimit(c.jiangZhuoPieceIds.length);
+    if (c.jiangZhuoLoop >= jzLimit - 1 && c.jiangZhuoLoop < jzLimit) {
+      return { text: `${banName('CHECK_CHASE')}已 ${c.jiangZhuoLoop} 着，下着将超限，请尽快变招`, key: `jz-${c.jiangZhuoLoop}` };
+    }
+    return null;
+  };
+  const notice = noticeFor(moverSide) ?? noticeFor(opponentSide);
+  if (notice) {
+    rs.notice = notice.text;
+    rs.noticeKey = notice.key;
   }
 
   return finish(rs, false, '', null);

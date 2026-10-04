@@ -520,11 +520,17 @@ export default function LanBattleScreen() {
   // 导致「长将长捉超限提示」「网络异常」等关键提示在 Web 端完全无显示。
   // 现统一改为覆盖在棋盘上的 GameNotice（3s 自动淡出，不阻塞落子）。
   const [notice, setNotice] = useState<GameNoticeItem | null>(null);
-  const noticeSeqRef = useRef(0);
+  // key 由文案决定而非自增序号（【提示口径 2026-10】）：GameNotice 只在 key 变化时
+  // 重新计时，自增序号会把「每走一步都触发的规则预警」当成新提示反复重播，提示条
+  // 因此常驻刷屏。规则预警的文案自带累计数字（如「长将已 5 着…」），同类预警在
+  // 走子方交替时内容不变，于是整个过程只响一次。
+  // 同文案仍会重新出现的情形：上一条已淡出（notice 变 null），用户可能已经错过。
   const showNotice = useCallback((text: string, detail?: string, duration?: number) => {
-    // key 自增：即使用户连点触发同一文案，也保证重新计时
-    noticeSeqRef.current += 1;
-    setNotice({ key: `notice-${noticeSeqRef.current}`, text, detail, duration });
+    setNotice((prev) =>
+      prev && prev.text === text && prev.detail === detail
+        ? prev
+        : { key: `notice-${text}-${detail ?? ''}`, text, detail, duration }
+    );
   }, []);
   const hideNotice = useCallback(() => setNotice(null), []);
 
@@ -2619,13 +2625,10 @@ export default function LanBattleScreen() {
               maxBoardHeight={maxBoardHeight}
               capturedStripOffset={30}
               moveEffect={moveEffect}
-              banMoves={
-                gameState?.ruleState?.banActive &&
-                gameState.ruleState.banSide === sideStringToTag(mySide) &&
-                gameState.sideTag === sideStringToTag(mySide)
-                  ? gameState.ruleState.banMoves
-                  : null
-              }
+              // 【提示口径 2026-10】不再向棋盘下发 banMoves 标红：提示统一收敛到
+              // 「阈值前一步的一次性提示条」。banMoves 本身仍在 RuleState 里计算，
+              // 因为 AI 择优（isMoveBanned）要用它过滤会走进僵局的着法。
+              banMoves={null}
               onBoardLayout={setBoardSize}
               ghostPieces={ghostPieces}
             />

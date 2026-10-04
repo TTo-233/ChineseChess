@@ -374,23 +374,23 @@ function afterMoveStillJiangJun(qiZi, x0, y0, x1, y1, qiPan, piecePositions) {
 
 // chinese-chess-client/client/utils/chess/RuleEngine.ts
 var RULE_CONFIG = {
-  /** 长将允许着数：按参与长将的子力数量（1 子 / 2 子 / 3 子及以上），方案 2.1.1 */
+  /** 长将允许回合数：按参与长将的子力数量（1 子 / 2 子 / 3 子及以上，规则二.3） */
   longCheckByPieceCount: [6, 12, 18],
-  /** 长捉同一子允许着数（方案 2.2.1） */
+  /** 长捉对方子允许回合数（规则二.1） */
   longChase: 6,
-  /** 将捉交替允许着数：一子 / 一子以上（方案 2.3） */
+  /** 将捉交替允许回合数：一子 / 一子以上（规则二.4） */
   checkChaseByPieceCount: [12, 18],
-  /** 非将非捉局面重复判和次数（方案 2.4） */
+  /** 非将非应将非捉非应捉局面重复判和次数（规则一.2） */
   repetitionDraw: 5,
-  /** 互相长将判和阈值（双方各自长将达到该着数，方案 2.1.2） */
+  /** 互相长将判和阈值（双方各自长将达到该回合数，规则一.3） */
   mutualLongCheckDraw: 6,
-  /** 互相长捉判和阈值（方案 2.2.3） */
+  /** 互相长捉判和阈值（规则一.4） */
   mutualLongChaseDraw: 6,
-  /** 自然限招：无吃子着数上限（方案 2.4） */
+  /** 自然限招：无吃子着数上限（规则一.5：双方无吃子 120 步 = 60 回合） */
   naturalMoveLimit: 120,
-  /** 自然限招窗口内将军累计上限（方案 2.4） */
-  checkCountLimit: 40,
-  /** 双方累计总着数上限（方案 2.4） */
+  /** 自然限招窗口内**单方**累计将军上限（规则一.5：双方各自最多只累计 10 次将军） */
+  checkCountLimitPerSide: 10,
+  /** 双方累计总着数上限（规则一.6：总步数 400 步 = 200 回合） */
   totalMoveLimit: 400
 };
 function sideOfPiece(id) {
@@ -588,7 +588,8 @@ function emptySideCounters() {
     zhuoCounts: {},
     jiangZhuoLoop: 0,
     jiangZhuoPieceIds: [],
-    opponentCheckedDuringRun: false
+    opponentCheckedDuringRun: false,
+    checkCountInWindow: 0
   };
 }
 function createInitialRuleState(state) {
@@ -597,7 +598,6 @@ function createInitialRuleState(state) {
     black: emptySideCounters(),
     positionKeys: [positionKey(state)],
     naturalMoveCounter: 0,
-    checkCounterInWindow: 0,
     banActive: false,
     banSide: null,
     banReason: null,
@@ -614,7 +614,8 @@ function cloneSideCounters(s) {
     zhuoCounts: { ...s.zhuoCounts },
     jiangZhuoLoop: s.jiangZhuoLoop,
     jiangZhuoPieceIds: [...s.jiangZhuoPieceIds],
-    opponentCheckedDuringRun: s.opponentCheckedDuringRun
+    opponentCheckedDuringRun: s.opponentCheckedDuringRun,
+    checkCountInWindow: s.checkCountInWindow
   };
 }
 function cloneRuleState(r) {
@@ -623,7 +624,6 @@ function cloneRuleState(r) {
     black: cloneSideCounters(r.black),
     positionKeys: [...r.positionKeys],
     naturalMoveCounter: r.naturalMoveCounter,
-    checkCounterInWindow: r.checkCounterInWindow,
     banActive: r.banActive,
     banSide: r.banSide,
     banReason: r.banReason,
@@ -713,14 +713,15 @@ function evaluateRuleAfterMove(beforeState, afterState, move) {
     resetSideCounters(mover);
     resetSideCounters(opponent);
     rs.naturalMoveCounter = 0;
-    rs.checkCounterInWindow = 0;
+    mover.checkCountInWindow = 0;
+    opponent.checkCountInWindow = 0;
   } else if (isCheck) {
     mover.jiangCount += 1;
     if (!mover.jiangPieceIds.includes(move.pieceId)) mover.jiangPieceIds.push(move.pieceId);
     mover.jiangZhuoLoop += 1;
     if (!mover.jiangZhuoPieceIds.includes(move.pieceId)) mover.jiangZhuoPieceIds.push(move.pieceId);
     mover.zhuoCounts = {};
-    rs.checkCounterInWindow += 1;
+    mover.checkCountInWindow += 1;
     if (opponent.jiangCount > 0) {
       opponent.opponentCheckedDuringRun = true;
     }
@@ -753,7 +754,7 @@ function evaluateRuleAfterMove(beforeState, afterState, move) {
   if (rs.naturalMoveCounter >= RULE_CONFIG.naturalMoveLimit) {
     return finish(rs, true, "natural_limit", null);
   }
-  if (rs.checkCounterInWindow >= RULE_CONFIG.checkCountLimit) {
+  if (mover.checkCountInWindow >= RULE_CONFIG.checkCountLimitPerSide || opponent.checkCountInWindow >= RULE_CONFIG.checkCountLimitPerSide) {
     return finish(rs, true, "natural_limit", null);
   }
   if (rs.red.jiangCount >= RULE_CONFIG.mutualLongCheckDraw && rs.black.jiangCount >= RULE_CONFIG.mutualLongCheckDraw) {
@@ -762,7 +763,7 @@ function evaluateRuleAfterMove(beforeState, afterState, move) {
   if (maxZhuoCount(rs.red) >= RULE_CONFIG.mutualLongChaseDraw && maxZhuoCount(rs.black) >= RULE_CONFIG.mutualLongChaseDraw) {
     return finish(rs, true, "mutual_long_chase", null);
   }
-  if (!isCheck && zhuoList.length === 0) {
+  if (!isCheck && !wasRespondingCheck && zhuoList.length === 0) {
     let repetition = 1;
     for (let i = rs.positionKeys.length - 2; i >= 0; i--) {
       if (rs.positionKeys[i] === currentKey) repetition++;
@@ -797,8 +798,20 @@ function evaluateRuleAfterMove(beforeState, afterState, move) {
   };
   const moverBan = tryBan(moverSide);
   const oppBan = tryBan(opponentSide);
-  const hit = moverBan ?? oppBan;
-  const hitSide = moverBan ? moverSide : opponentSide;
+  let hit = moverBan ?? oppBan;
+  let hitSide = moverBan ? moverSide : opponentSide;
+  if (moverBan && oppBan) {
+    const moverIsCheckish = moverBan.reason === "LONG_CHECK" || moverBan.reason === "CHECK_CHASE";
+    const oppIsCheckish = oppBan.reason === "LONG_CHECK" || oppBan.reason === "CHECK_CHASE";
+    const isOpposed = (a, b) => a.reason !== "LONG_CHASE" && b.reason === "LONG_CHASE" || a.reason === "LONG_CHASE" && b.reason !== "LONG_CHASE";
+    if (moverIsCheckish && !oppIsCheckish && isOpposed(moverBan, oppBan)) {
+      hit = moverBan;
+      hitSide = moverSide;
+    } else if (oppIsCheckish && !moverIsCheckish && isOpposed(moverBan, oppBan)) {
+      hit = oppBan;
+      hitSide = opponentSide;
+    }
+  }
   const banName = (reason) => reason === "LONG_CHECK" ? "\u957F\u5C06" : reason === "LONG_CHASE" ? "\u957F\u6349" : "\u5C06\u6349\u4EA4\u66FF";
   if (hit) {
     rs.banActive = true;
@@ -806,35 +819,61 @@ function evaluateRuleAfterMove(beforeState, afterState, move) {
     rs.banReason = hit.reason;
     rs.banChaseTargets = hit.targets;
     rs.banMoves = buildBanMoves(afterState, hitSide, hit.reason, hit.targets);
-    rs.notice = `${banName(hit.reason)}\u5DF2\u8D85\u9650\uFF0C\u8BF7\u5C3D\u5FEB\u53D8\u62DB`;
-    rs.noticeKey = `${sideKey(hitSide)}-ban-${hit.reason}`;
   } else {
     rs.banActive = false;
     rs.banSide = null;
     rs.banReason = null;
     rs.banChaseTargets = [];
     rs.banMoves = [];
-    const noticeFor = (side) => {
-      const c = rs[sideKey(side)];
-      const checkLimit = longCheckLimit(c.jiangPieceIds.length);
-      if (c.jiangCount >= checkLimit - 1 && c.jiangCount < checkLimit) {
-        return { text: `\u957F\u5C06\u5DF2 ${c.jiangCount} \u7740\uFF0C\u4E0B\u7740\u5C06\u8D85\u9650\uFF0C\u8BF7\u5C3D\u5FEB\u53D8\u62DB`, key: `${sideKey(side)}-jiang-${c.jiangCount}` };
-      }
-      const zhuoMax = maxZhuoCount(c);
-      if (zhuoMax >= RULE_CONFIG.longChase - 1 && zhuoMax < RULE_CONFIG.longChase) {
-        return { text: `\u957F\u6349\u5DF2 ${zhuoMax} \u7740\uFF0C\u4E0B\u7740\u5C06\u8D85\u9650\uFF0C\u8BF7\u5C3D\u5FEB\u53D8\u62DB`, key: `${sideKey(side)}-zhuo-${zhuoMax}` };
-      }
-      const jzLimit = checkChaseLimit(c.jiangZhuoPieceIds.length);
-      if (c.jiangZhuoLoop >= jzLimit - 1 && c.jiangZhuoLoop < jzLimit) {
-        return { text: `\u5C06\u6349\u4EA4\u66FF\u5DF2 ${c.jiangZhuoLoop} \u7740\uFF0C\u4E0B\u7740\u5C06\u8D85\u9650\uFF0C\u8BF7\u5C3D\u5FEB\u53D8\u62DB`, key: `${sideKey(side)}-jz-${c.jiangZhuoLoop}` };
-      }
-      return null;
-    };
-    const notice = noticeFor(moverSide) ?? noticeFor(opponentSide);
-    if (notice) {
-      rs.notice = notice.text;
-      rs.noticeKey = notice.key;
+  }
+  const noticeFor = (side) => {
+    const c = rs[sideKey(side)];
+    const other = rs[sideKey(!side)];
+    if (totalMoves === RULE_CONFIG.totalMoveLimit - 1) {
+      return { text: `\u53CC\u65B9\u5DF2\u8D70 ${totalMoves} \u6B65\uFF0C\u4E0B\u7740\u5C06\u6EE1 ${RULE_CONFIG.totalMoveLimit} \u6B65\u5224\u548C`, key: `total-${totalMoves}` };
     }
+    if (rs.naturalMoveCounter === RULE_CONFIG.naturalMoveLimit - 1) {
+      return { text: `\u5DF2 ${rs.naturalMoveCounter} \u6B65\u65E0\u5403\u5B50\uFF0C\u4E0B\u7740\u5C06\u6EE1 ${RULE_CONFIG.naturalMoveLimit} \u6B65\u5224\u548C`, key: `natural-${rs.naturalMoveCounter}` };
+    }
+    if (c.checkCountInWindow === RULE_CONFIG.checkCountLimitPerSide - 1 || other.checkCountInWindow === RULE_CONFIG.checkCountLimitPerSide - 1) {
+      const n = Math.max(c.checkCountInWindow, other.checkCountInWindow);
+      return { text: `\u6709\u4E00\u65B9\u5DF2\u5C06\u519B ${n} \u6B21\uFF0C\u4E0B\u7740\u518D\u5C06\u519B\u5C06\u6EE1 ${RULE_CONFIG.checkCountLimitPerSide} \u6B21\u5224\u548C`, key: `chkwin-${n}` };
+    }
+    if (c.jiangCount === RULE_CONFIG.mutualLongCheckDraw - 1 && other.jiangCount >= RULE_CONFIG.mutualLongCheckDraw - 1) {
+      return { text: `\u53CC\u65B9\u957F\u5C06\u5DF2\u8FBE ${RULE_CONFIG.mutualLongCheckDraw - 1} \u6B21\uFF0C\u53CC\u65B9\u7EE7\u7EED\u957F\u5C06\u5C06\u5224\u548C`, key: `mutualcheck-${c.jiangCount}-${other.jiangCount}` };
+    }
+    const cMax = maxZhuoCount(c);
+    const otherMax = maxZhuoCount(other);
+    if (cMax === RULE_CONFIG.mutualLongChaseDraw - 1 && otherMax >= RULE_CONFIG.mutualLongChaseDraw - 1) {
+      return { text: `\u53CC\u65B9\u957F\u6349\u5DF2\u8FBE ${RULE_CONFIG.mutualLongChaseDraw - 1} \u6B21\uFF0C\u53CC\u65B9\u7EE7\u7EED\u957F\u6349\u5C06\u5224\u548C`, key: `mutualzhuo-${cMax}-${otherMax}` };
+    }
+    if (!isCheck && !wasRespondingCheck && zhuoList.length === 0) {
+      let seen = 0;
+      for (let i = 0; i < rs.positionKeys.length - 1; i++) {
+        if (rs.positionKeys[i] === currentKey) seen++;
+      }
+      if (seen === RULE_CONFIG.repetitionDraw - 2) {
+        return { text: `\u672C\u5C40\u9762\u5DF2\u51FA\u73B0 ${seen + 1} \u6B21\uFF0C\u4E0B\u7740\u91CD\u590D\u5C06\u5224\u548C`, key: `rep-${seen + 1}` };
+      }
+    }
+    const checkLimit = longCheckLimit(c.jiangPieceIds.length);
+    if (c.jiangCount >= checkLimit - 1 && c.jiangCount < checkLimit) {
+      return { text: `${banName("LONG_CHECK")}\u5DF2 ${c.jiangCount} \u7740\uFF0C\u4E0B\u7740\u5C06\u8D85\u9650\uFF0C\u8BF7\u5C3D\u5FEB\u53D8\u62DB`, key: `jiang-${c.jiangCount}` };
+    }
+    const zhuoMax = maxZhuoCount(c);
+    if (zhuoMax >= RULE_CONFIG.longChase - 1 && zhuoMax < RULE_CONFIG.longChase) {
+      return { text: `${banName("LONG_CHASE")}\u5DF2 ${zhuoMax} \u7740\uFF0C\u4E0B\u7740\u5C06\u8D85\u9650\uFF0C\u8BF7\u5C3D\u5FEB\u53D8\u62DB`, key: `zhuo-${zhuoMax}` };
+    }
+    const jzLimit = checkChaseLimit(c.jiangZhuoPieceIds.length);
+    if (c.jiangZhuoLoop >= jzLimit - 1 && c.jiangZhuoLoop < jzLimit) {
+      return { text: `${banName("CHECK_CHASE")}\u5DF2 ${c.jiangZhuoLoop} \u7740\uFF0C\u4E0B\u7740\u5C06\u8D85\u9650\uFF0C\u8BF7\u5C3D\u5FEB\u53D8\u62DB`, key: `jz-${c.jiangZhuoLoop}` };
+    }
+    return null;
+  };
+  const notice = noticeFor(moverSide) ?? noticeFor(opponentSide);
+  if (notice) {
+    rs.notice = notice.text;
+    rs.noticeKey = notice.key;
   }
   return finish(rs, false, "", null);
 }
