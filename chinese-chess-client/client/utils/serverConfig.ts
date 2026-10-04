@@ -60,6 +60,38 @@ export const SERVER_PROFILES: readonly ServerProfile[] = [
 /** 默认线路 id（SERVER_PROFILES[0].id） */
 export const DEFAULT_SERVER_PROFILE_ID = 'sakura';
 
+/**
+ * 线路延迟档位（界面上用绿/黄/红三色标注）
+ *
+ * 阈值取自实测手感（具体分界见下方两个常量）：≤200ms 落子反馈基本无感；
+ * 200~400ms 能明显感到"点了要等"；>400ms（Cloudflare Tunnel 实测 600~1700ms）
+ * 已经影响对战体验。
+ * 非有限值（NaN/Infinity）一律按最差档处理，避免界面出现 NaNms。
+ */
+export type LatencyTier = 'fast' | 'fair' | 'slow';
+
+/**
+ * fast → fair 的分界。实测 82~100ms（樱花）与 735ms（Cloudflare）之间没有中间样本，
+ * 分界取 200ms：低于它的链路落子反馈基本无感。
+ */
+export const LATENCY_FAIR_MS = 200;
+/**
+ * fair → slow 的分界，取 400ms 而非 500ms。
+ *
+ * 这样两条预置线路的参考值会分处绿/红两档（实测值同样如此）：
+ * 樱花 p50 100ms → 绿；Cloudflare p50 735ms → 红。若取 500ms，Cloudflare
+ * 的参考值 500 恰好落在黄档，与绿档看不出差别，界面的颜色对比就失去意义。
+ */
+export const LATENCY_SLOW_MS = 400;
+
+/** 延迟毫秒 → 档位；null（未探测）与非法数值都按 slow 处理 */
+export function latencyTier(ms: number | null | undefined): LatencyTier {
+  if (typeof ms !== 'number' || !Number.isFinite(ms)) return 'slow';
+  if (ms <= LATENCY_FAIR_MS) return 'fast';
+  if (ms <= LATENCY_SLOW_MS) return 'fair';
+  return 'slow';
+}
+
 /** 按 id 取预置线路 */
 export function getServerProfile(id: string): ServerProfile | null {
   return SERVER_PROFILES.find((p) => p.id === id) ?? null;

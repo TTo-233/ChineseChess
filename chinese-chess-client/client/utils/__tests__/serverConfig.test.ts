@@ -44,6 +44,10 @@ import {
   resetOnlineServerUrl,
   setOnlineServerProfile,
   setOnlineServerUrl,
+  latencyTier,
+  LATENCY_FAIR_MS,
+  LATENCY_SLOW_MS,
+  type LatencyTier,
 } from '@/utils/serverConfig';
 
 const SAKURA = getServerProfile('sakura')!;
@@ -185,5 +189,40 @@ describe('serverConfig 旧版本迁移', () => {
     const spy = jest.spyOn(AsyncStorage, 'getItem').mockRejectedValueOnce(new Error('storage down'));
     await expect(migrateLegacyServerUrl()).resolves.toBeUndefined();
     spy.mockRestore();
+  });
+});
+
+/**
+ * 延迟档位决定卡片右侧数字的绿/黄/红。阈值一旦调错，玩家会被误导去选慢线路，
+ * 因此把边界值全部钉住（尤其是 200 与 400 这两个分界本身）。
+ */
+describe('serverConfig 延迟档位', () => {
+  it('≤200ms 为 fast（绿）：落子反馈基本无感', () => {
+    const cases: number[] = [1, 82, 100, 199, LATENCY_FAIR_MS];
+    cases.forEach(ms => expect(latencyTier(ms)).toBe<LatencyTier>('fast'));
+  });
+
+  it('200~400ms 为 fair（黄）：能明显感到"点了要等"', () => {
+    const cases: number[] = [201, 300, 399, LATENCY_SLOW_MS];
+    cases.forEach(ms => expect(latencyTier(ms)).toBe<LatencyTier>('fair'));
+  });
+
+  it('>400ms 为 slow（红）：Cloudflare Tunnel 实测区间必须落在这一档', () => {
+    const cases: number[] = [401, 500, 735, 1115, 1700];
+    cases.forEach(ms => expect(latencyTier(ms)).toBe<LatencyTier>('slow'));
+  });
+
+  it('两条预置线路的参考值分别落在 fast / slow，颜色上可区分', () => {
+    // 参考值只是未探测时的兜底显示，但若两个值同档，卡片右侧会显示同一种颜色，
+    // 界面上就失去了"哪条更快"的直观对比。
+    expect(latencyTier(SAKURA.latencyMs)).toBe('fast');
+    expect(latencyTier(CF.latencyMs)).toBe('slow');
+  });
+
+  it('null / undefined / NaN / Infinity 一律 slow（界面绝不出现 NaNms）', () => {
+    expect(latencyTier(null)).toBe('slow');
+    expect(latencyTier(undefined)).toBe('slow');
+    expect(latencyTier(NaN)).toBe('slow');
+    expect(latencyTier(Infinity)).toBe('slow');
   });
 });

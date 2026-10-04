@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useMemo } from 'react';
+import React, { useState, useCallback, useMemo, useRef } from 'react';
 import {
   View,
   Text,
@@ -9,6 +9,7 @@ import {
   ActivityIndicator,
   ScrollView,
   TouchableWithoutFeedback,
+  Pressable,
 } from 'react-native';
 import { Screen } from '@/components/Screen';
 import { AppModal, ModalButton, modalButtonRowStyle } from '@/components/Modal';
@@ -25,6 +26,7 @@ import {
   testServerConnection,
   SERVER_PROFILES,
   DEFAULT_SERVER_URL,
+  latencyTier,
 } from '@/utils/serverConfig';
 import { getPlayerId, getPlayerName, savePlayerName, setRoomSessionToken } from '@/utils/playerIdentity';
 import { HandicapBoard } from '@/components/HandicapBoard';
@@ -49,6 +51,30 @@ const COLORS = {
   success: '#2E7D32',
   danger: '#C62828',
 };
+
+/**
+ * 「自定义地址」的解锁门槛：连续点击弹窗标题服务器设置达到该次数才显示。
+ * 面向普通玩家只开放两条预置节点；自建服务端 / 内网地址等场景再走隐藏入口。
+ */
+const CUSTOM_UNLOCK_TAP_COUNT = 5;
+/** 两次点击间隔超过该毫秒数即视为中断，重新从 1 次开始数 */
+const CUSTOM_UNLOCK_TAP_WINDOW_MS = 3000;
+
+/**
+ * 延迟档位 → 文字样式。
+ *
+ * 取色沿用本文件已有的 success #2E7D32 与 danger #C62828；黄色补一个与同一宣纸底
+ * (#F5F0E8) 对比度足够的琥珀色，不用 global.css 里的 --warning（那是 Web 侧
+ * oklch 值，RN StyleSheet 无法消费 CSS 变量）。
+ * 档位与阈值（200ms / 400ms）见 @/utils/serverConfig 的 latencyTier。
+ */
+function latencyToneStyle(tier: 'fast' | 'fair' | 'slow') {
+  return tier === 'fast'
+    ? styles.profileLatencyFast
+    : tier === 'fair'
+      ? styles.profileLatencyFair
+      : styles.profileLatencySlow;
+}
 
 /** 让子 id → 棋子字（红方：21/22 马，23/24 车，25/26 炮，27~31 兵） */
 function handicapPieceChar(id: number): string | null {
@@ -143,6 +169,15 @@ export default function LanGameScreen() {
   const [profileLatency, setProfileLatency] = useState<Record<string, number | null>>({});
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<string | null>(null);
+  /**
+   * 自定义地址是否已解锁。
+   *
+   * 面向普通玩家只开放两条预置节点，手填地址容易误改导致连不上，因此默认隐藏；
+   * 连续点击弹窗标题【自定义地址解锁所需的连续点击次数】次后才显示（自建服务端、
+   * 内网地址等预置之外的场景仍要能配）。解锁状态只在本页会话内存活，关闭弹窗即失效。
+   */
+  const [customUnlocked, setCustomUnlocked] = useState(false);
+  const unlockTapCountRef = useRef({ count: 0, tappedAt: 0 });
 
   // 房间码加入
   // 房间大厅搜索关键词：模糊匹配房间号/房间名/房主名（实时过滤列表）
@@ -242,11 +277,36 @@ export default function LanGameScreen() {
     }, [])
   );
 
-  // 打开服务器设置弹窗
+  /** 打开服务器设置弹窗 */
   const handleOpenServerModal = () => {
     setServerInput(serverUrl);
     setTestResult(null);
+    // 每次打开都重新要求解锁，避免上次解锁后长期敞着自定义地址
+    unlockTapCountRef.current = { count: 0, tappedAt: 0 };
+    setCustomUnlocked(false);
     setShowServerModal(true);
+  };
+
+  /**
+   * 连续点击弹窗标题若干次后解锁「自定义地址」区。
+   *
+   * 用 ref 计数而不是 state：点击频繁且只在达到阈值时才需要触发重渲染。
+   * 超过【解锁阈值】的点击间隔（防止"今天点过 3 次、明天再点 2 次"也算连续）即重新计数。
+   */
+  const handleServerTitleTap = () => {
+    const now = Date.now();
+    if (now - unlockTapCountRef.current.tappedAt > CUSTOM_UNLOCK_TAP_WINDOW_MS) {
+      unlockTapCountRef.current = { count: 1, tappedAt: now };
+    } else {
+      unlockTapCountRef.current = {
+        count: unlockTapCountRef.current.count + 1,
+        tappedAt: now,
+      };
+    }
+    if (unlockTapCountRef.current.count >= CUSTOM_UNLOCK_TAP_COUNT) {
+      unlockTapCountRef.current = { count: 0, tappedAt: 0 };
+      setCustomUnlocked(true);
+    }
   };
 
   // 切换到某条预置线路：立即落盘 + 关闭弹窗 + 刷新大厅
@@ -733,15 +793,27 @@ export default function LanGameScreen() {
         <AppModal
           visible={showServerModal}
           onClose={() => setShowServerModal(false)}
-          title="服务器设置"
+          titleNode={
+            // 标题可连点：连续 CUSTOM_UNLOCK_TAP_COUNT 次才解锁下方「自定义地址」
+            <Pressable
+              onPress={handleServerTitleTap}
+              hitSlop={8}
+              accessibilityLabel="服务器设置"
+            >
+              <Text style={styles.serverModalTitle}>服务器设置</Text>
+            </Pressable>
+          }
           showCloseBtn
           closeBtnType="text"
         >
-          {/* 线路选择：卡片式单选，点击即切换并立即生效 */}
-          <Text style={styles.serverSectionLabel}>对战线路</Text>
+          {/* 线路选择：卡片式单选，点击即切换并立即生效。
+              卡片只保留「单选圈 + 节点名 + 右侧延迟」三项，域名/说明文字一律不在此展示 ——
+              普通用户只需要知道"选哪个"，具体地址属于高级信息，隐藏入口里自会回显。 */}
           {SERVER_PROFILES.map(profile => {
             const active = selectedProfileId === profile.id;
             const measured = profileLatency[profile.id];
+            const shown = measured ?? profile.latencyMs;
+            const tier = latencyTier(measured);
             return (
               <TouchableOpacity
                 key={profile.id}
@@ -749,7 +821,9 @@ export default function LanGameScreen() {
                 onPress={() => handleSelectProfile(profile.id)}
                 accessibilityRole="radio"
                 accessibilityState={{ selected: active }}
-                accessibilityLabel={`${profile.name}，延迟约 ${measured ?? profile.latencyMs} 毫秒`}
+                accessibilityLabel={`${profile.name}，延迟约 ${shown} 毫秒${
+                  measured === null ? '（参考值）' : ''
+                }`}
               >
                 <View style={styles.profileRadio}>
                   {active && <View style={styles.profileRadioDot} />}
@@ -761,66 +835,72 @@ export default function LanGameScreen() {
                     </Text>
                     {active && <Text style={styles.profileBadge}>当前</Text>}
                   </View>
-                  <Text style={styles.profileDesc}>
-                    {profile.desc}　·　延迟约 {measured ?? profile.latencyMs}ms
-                  </Text>
-                  <Text style={styles.profileUrl} numberOfLines={1}>
-                    {profile.url.replace(/^https?:\/\//i, '')}
+                </View>
+                {/* 延迟固定在卡片右侧：实测值优先，未探测成功则回落预置参考值 */}
+                <View style={styles.profileLatencyCol}>
+                  <Text style={[styles.profileLatency, latencyToneStyle(tier)]}>
+                    {shown}
+                    <Text style={styles.profileLatencyUnit}>ms</Text>
                   </Text>
                 </View>
               </TouchableOpacity>
             );
           })}
 
-          {/* 预置线路之外的状态提示（自定义地址 / 环境变量地址） */}
-          {selectedProfileId === null && serverUrl !== DEFAULT_SERVER_URL && (
-            <Text style={styles.serverCustomHint}>
-              当前使用自定义地址，请在下方输入并保存。
-            </Text>
-          )}
-
-          {/* 自定义地址：预置线路之外的场景（自建服务端、内网地址）仍可手填 */}
-          <Text style={[styles.serverSectionLabel, styles.serverSectionLabelSpaced]}>自定义地址</Text>
-          <TextInput
-            style={styles.serverInput}
-            value={serverInput}
-            onChangeText={(text) => {
-              setServerInput(text);
-              setTestResult(null);
-            }}
-            placeholder="https://服务器地址:端口"
-            placeholderTextColor={COLORS.textLight}
-            autoCapitalize="none"
-            autoCorrect={false}
-            keyboardType="url"
-          />
-          <View style={styles.testRow}>
-            <TouchableOpacity
-              style={styles.testBtn}
-              onPress={handleTestServer}
-              disabled={testing}
-            >
-              {testing ? (
-                <ActivityIndicator size="small" color={COLORS.primary} />
-              ) : (
-                <Text style={styles.testBtnText}>测试连接</Text>
+          {/* 自定义地址：默认隐藏，连续点击标题 CUSTOM_UNLOCK_TAP_COUNT 次后才出现。
+              自建服务端 / 内网地址等预置之外的场景仍要能配，所以保留而非删除。 */}
+          {customUnlocked && (
+            <>
+              {selectedProfileId === null && serverUrl !== DEFAULT_SERVER_URL && (
+                <Text style={styles.serverCustomHint}>
+                  当前使用自定义地址，请在下方输入并保存。
+                </Text>
               )}
-            </TouchableOpacity>
-            {testResult && (
-              <Text
-                style={[
-                  styles.testResultText,
-                  testResult.startsWith('连接成功') ? styles.testOk : styles.testFail,
-                ]}
-              >
-                {testResult}
+              <Text style={[styles.serverSectionLabel, styles.serverSectionLabelSpaced]}>
+                自定义地址
               </Text>
-            )}
-          </View>
-          <View style={[modalButtonRowStyle, styles.serverFooter]}>
-            <ModalButton label="恢复默认" variant="secondary" onPress={handleResetServer} />
-            <ModalButton label="保存" onPress={handleSaveServer} />
-          </View>
+              <TextInput
+                style={styles.serverInput}
+                value={serverInput}
+                onChangeText={(text) => {
+                  setServerInput(text);
+                  setTestResult(null);
+                }}
+                placeholder="https://服务器地址:端口"
+                placeholderTextColor={COLORS.textLight}
+                autoCapitalize="none"
+                autoCorrect={false}
+                keyboardType="url"
+              />
+              <View style={styles.testRow}>
+                <TouchableOpacity
+                  style={styles.testBtn}
+                  onPress={handleTestServer}
+                  disabled={testing}
+                >
+                  {testing ? (
+                    <ActivityIndicator size="small" color={COLORS.primary} />
+                  ) : (
+                    <Text style={styles.testBtnText}>测试连接</Text>
+                  )}
+                </TouchableOpacity>
+                {testResult && (
+                  <Text
+                    style={[
+                      styles.testResultText,
+                      testResult.startsWith('连接成功') ? styles.testOk : styles.testFail,
+                    ]}
+                  >
+                    {testResult}
+                  </Text>
+                )}
+              </View>
+              <View style={[modalButtonRowStyle, styles.serverFooter]}>
+                <ModalButton label="恢复默认" variant="secondary" onPress={handleResetServer} />
+                <ModalButton label="保存" onPress={handleSaveServer} />
+              </View>
+            </>
+          )}
         </AppModal>
 
         {/* 房间设置弹窗 */}
@@ -1456,15 +1536,36 @@ const styles = StyleSheet.create({
     paddingVertical: 1,
     overflow: 'hidden',
   },
-  profileDesc: {
-    fontSize: FONT.caption,
-    color: COLORS.textLight,
-    marginTop: 2,
+  /** 弹窗标题（titleNode 自定义渲染，行高/字重与 AppModal 默认标题一致） */
+  serverModalTitle: {
+    fontSize: FONT.title,
+    fontWeight: '700',
+    color: COLORS.textPrimary,
+    textAlign: 'center',
   },
-  profileUrl: {
+  /** 延迟数值列：卡片右侧固定宽度，数值左对齐，两条线路的数字上下对齐 */
+  profileLatencyCol: {
+    alignItems: 'flex-end',
+    justifyContent: 'center',
+    minWidth: 56,
+  },
+  profileLatency: {
+    fontSize: FONT.control,
+    fontWeight: '700',
+    fontVariant: ['tabular-nums'],
+  },
+  profileLatencyUnit: {
     fontSize: FONT.micro,
-    color: COLORS.textLight,
-    marginTop: 2,
+    fontWeight: '600',
+  },
+  profileLatencyFast: {
+    color: COLORS.success,
+  },
+  profileLatencyFair: {
+    color: '#B26A00',
+  },
+  profileLatencySlow: {
+    color: COLORS.danger,
   },
   testRow: {
     flexDirection: 'row',

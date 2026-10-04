@@ -32,6 +32,13 @@ export interface AppModalProps {
   /** 标题（省略则不渲染标题区） */
   title?: string;
   /**
+   * 自定义标题内容，优先级高于 title。
+   *
+   * 用于标题需要可点击/可交互的场景（例如「连续点击标题 N 次解锁隐藏功能」）：
+   * AppModal 内部仍负责居中与行高，只把渲染权交给调用方。
+   */
+  titleNode?: React.ReactNode;
+  /**
    * 遮罩风格：
    *   dark  = rgba(0,0,0,0.5)，默认，绝大多数弹窗使用
    *   light = rgba(245,240,232,0.92)，lanBattle 等「棋盘仍需可辨认」场景
@@ -83,6 +90,7 @@ export default function AppModal({
   visible,
   onClose,
   title,
+  titleNode,
   variant = 'dark',
   placement = 'center',
   showCloseBtn = false,
@@ -135,13 +143,17 @@ export default function AppModal({
         {/* 卡片 */}
         <TouchableWithoutFeedback onPress={() => Keyboard.dismiss()}>
           <View style={[styles.card, placement === 'bottom' && styles.cardBottom, cardStyle, anchorOffsetStyle]}>
-            {(!!title || showCloseBtn) && (
+            {((!!title || !!titleNode) || showCloseBtn) && (
               <View style={styles.header}>
                 <View style={styles.headerSpacer} />
-                {!!title && (
-                  <Text style={styles.title} numberOfLines={2}>
-                    {title}
-                  </Text>
+                {!!titleNode ? (
+                  <View style={styles.titleHost}>{titleNode}</View>
+                ) : (
+                  !!title && (
+                    <Text style={styles.title} numberOfLines={2}>
+                      {title}
+                    </Text>
+                  )
                 )}
                 <View style={styles.headerSpacer}>
                   {showCloseBtn && (
@@ -264,6 +276,12 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     color: COLORS.modalText,
     textAlign: 'center',
+  },
+  /** titleNode 的承载容器：与 title 同样的 flex/居中，保证自定义标题视觉位置一致 */
+  titleHost: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   closeIconBtn: {
     width: 28,
