@@ -18,6 +18,8 @@
 import React, { useEffect, useState } from 'react';
 import { Animated, Image, StyleSheet, Text, TouchableOpacity, useWindowDimensions, View } from 'react-native';
 import { COLORS as MODAL_COLORS, RADIUS } from '@/constants/modal';
+import { BOARD_H_PADDING } from '@/utils/chess/boardStyles';
+import { useBoardStyle } from '@/utils/chess/boardStyleStore';
 import { FONT } from '@/utils/typography';
 
 // 大"绝"图片: 270x270 位于 (0,0)
@@ -95,6 +97,8 @@ export default function JueShaOverlay({
   showEffect = true,
 }: JueShaOverlayProps) {
   const { width: screenWidth, height: screenHeight } = useWindowDimensions();
+  // 兜底估算用的棋盘样式几何（与 ChessBoard 同一份样式，随用户在首页的设置变化）
+  const boardStyle = useBoardStyle();
 
   const [jue1Opacity] = useState(() => new Animated.Value(0));
   const [jue5Opacity] = useState(() => new Animated.Value(0));
@@ -174,13 +178,14 @@ export default function JueShaOverlay({
   if (!visible) return null;
 
   // 棋盘几何：优先用传入的真实棋盘位置（动态布局预算下棋盘尺寸/位置会变化），
-  // 未传入时退回"屏幕居中"估算，保证向后兼容
-  const boardW = boardFrame ? boardFrame.width : screenWidth - 16;
+  // 未传入时退回"按屏宽估算"，保证向后兼容。估算口径与 ChessBoard 一致
+  // （screenWidth - BOARD_H_PADDING 再按样式基准缩放），见 @/utils/chess/boardStyles
+  const boardW = boardFrame ? boardFrame.width : screenWidth - BOARD_H_PADDING;
   const boardCenterX = boardFrame ? boardFrame.x + boardFrame.width / 2 : screenWidth / 2;
   const boardCenterY = boardFrame ? boardFrame.y + boardFrame.height / 2 : screenHeight / 2;
   const boardBottom = boardFrame
     ? boardFrame.y + boardFrame.height
-    : screenHeight / 2 + ((screenWidth - 16) / 631 * 842) / 2;
+    : screenHeight / 2 + ((screenWidth - BOARD_H_PADDING) / boardStyle.scaleBaseWidth * boardStyle.scaleBaseHeight) / 2;
 
   // 缩放比例：内容包围盒宽度约为棋盘宽度的 80%（随动态棋盘大小自适应，兜底防止过小）
   const scale = Math.max((boardW * 0.8) / CONTENT_WIDTH, 0.1);

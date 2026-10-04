@@ -15,7 +15,7 @@ import React, { useMemo } from 'react';
 import { View, Image, StyleSheet, useWindowDimensions, GestureResponderEvent } from 'react-native';
 import { getPieceImage } from '@/utils/chess/pieceImages';
 import { useBoardStyle } from '@/utils/chess/boardStyleStore';
-import { gridSpacingX, gridSpacingY } from '@/utils/chess/boardStyles';
+import { gridSpacingX, gridSpacingY, BOARD_H_PADDING } from '@/utils/chess/boardStyles';
 import { COLS, ROWS } from '@/components/ChessBoard';
 
 interface BoardEditorProps {
@@ -34,7 +34,7 @@ export default function BoardEditor({ placements, onPointPress }: BoardEditorPro
   // 【C-77】Dimensions.get('window') 是模块级快照，旋转/改窗口后不更新；
   // 摆棋编辑器的棋盘宽度会停在旧视口（网格与棋子整体偏移）。改为订阅式 hook。
   const { width: screenWidth } = useWindowDimensions();
-  const boardWidth = screenWidth - 16;
+  const boardWidth = screenWidth - BOARD_H_PADDING;
   const scale = boardWidth / boardStyle.scaleBaseWidth;
 
   const scaledImageWidth = boardStyle.imgWidth * scale;

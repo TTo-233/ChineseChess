@@ -21,7 +21,7 @@
 
 import { useMemo } from 'react';
 import { useBoardStyle } from './boardStyleStore';
-import type { BoardStyle } from './boardStyles';
+import { BOARD_H_PADDING, type BoardStyle } from './boardStyles';
 
 /** 抽屉按棋子类型分组展示（同类型合并为 1 项 + 右上角数量角标），单方最多 7 种类型
  * （将/帅、士/仕、象/相、马、车、炮、兵/卒）。抽屉展开高度按最多 7 项估算——
@@ -132,7 +132,7 @@ export function computeBoardLayoutBudget(
     return { maxBoardHeight: undefined, paddingTop: 0, drawerHeight: 0 };
   }
 
-  const widthScale = (screenWidth - 16) / boardStyle.scaleBaseWidth;
+  const widthScale = (screenWidth - BOARD_H_PADDING) / boardStyle.scaleBaseWidth;
   const widthBoardHeight = widthScale * boardStyle.scaleBaseHeight;
   // 摘要条悬浮区：摘要条高 30 + 基础间距 8 + 角标行让位偏移 stripOffset
   const stripReserve = STRIP_BASE_GAP + stripOffset + STRIP_SUMMARY_H;

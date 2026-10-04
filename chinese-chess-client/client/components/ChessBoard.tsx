@@ -24,7 +24,7 @@ import { View, Image, StyleSheet, useWindowDimensions, Text, GestureResponderEve
 import type { GameState } from '@/utils/chess/GameEngine';
 import { getPieceImage, PIECE_NAMES } from '@/utils/chess/pieceImages';
 import { useBoardStyle } from '@/utils/chess/boardStyleStore';
-import { gridSpacingX, gridSpacingY } from '@/utils/chess/boardStyles';
+import { gridSpacingX, gridSpacingY, BOARD_H_PADDING } from '@/utils/chess/boardStyles';
 // 【C-86】原 import { RED_SIDE, BLACK_SIDE } from '@/utils/chess/types' 是未使用 import
 // （全文件只命中这一行），已删除。
 import MoveEffectOverlay, { type MoveEffect } from '@/components/MoveEffectOverlay';
@@ -250,8 +250,8 @@ export default function ChessBoard({
   // 已是这个写法。
   const { width: screenWidth } = useWindowDimensions();
 
-  // 棋盘宽度 = 屏幕宽度（留少量边距）
-  const boardWidth = screenWidth - 16;
+  // 棋盘宽度 = 屏幕宽度（减去两侧留白 BOARD_H_PADDING，见 @/utils/chess/boardStyles）
+  const boardWidth = screenWidth - BOARD_H_PADDING;
 
   // 当前棋盘样式（用户可在首页设置中切换）：几何参数与背景图均随样式变化
   const boardStyle = useBoardStyle();
@@ -957,7 +957,7 @@ export function CapturedPiecesDrawer({ side, gameState, playerSide, maxBoardHeig
   // 【C-77】同 ChessBoard 主组件：Dimensions.get('window') 是模块级快照，改为订阅式 hook
   const { width: screenWidth } = useWindowDimensions();
   const drawerStyle = useBoardStyle();
-  const widthScale = (screenWidth - 16) / drawerStyle.scaleBaseWidth;
+  const widthScale = (screenWidth - BOARD_H_PADDING) / drawerStyle.scaleBaseWidth;
   const scale = maxBoardHeight && maxBoardHeight > 0
     ? Math.min(widthScale, maxBoardHeight / drawerStyle.scaleBaseHeight)
     : widthScale;

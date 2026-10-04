@@ -11,6 +11,20 @@
 
 export type BoardStyleId = 'classic' | 'huali' | 'xuanmo';
 
+/**
+ * 棋盘相对屏幕左右两侧的留白总量（两侧合计，屏幕与棋盘本体边缘之间各留 BOARD_H_PADDING / 2）。
+ *
+ * 全仓库唯一的棋盘横向留白来源：凡「按屏宽换算棋盘缩放」的地方都必须取本常量，
+ * 包括 ChessBoard / CapturedPiecesDrawer（components/ChessBoard.tsx）、BoardEditor
+ * （components/BoardEditor.tsx）、残局摆棋面板（screens/endgameEdit/index.tsx）、
+ * 布局预算与对齐行宽度（utils/chess/capturedDrawerMetrics.ts、utils/chess/boardContentWidth.ts）
+ * 以及绝杀特效的兜底估算（components/JueShaOverlay.tsx）。
+ * 各处此前各自硬编码同一个 16，任何一处漏改都会让棋盘与角标行/抽屉/特效错位。
+ *
+ * 历史值 16（单侧 8）；2026-10 依据真机反馈「棋盘与屏幕两侧还有一定空余」收紧一半为 8（单侧 4）。
+ */
+export const BOARD_H_PADDING = 8;
+
 export interface BoardStyle {
   id: BoardStyleId;
   /** 样式展示名 */
@@ -28,7 +42,7 @@ export interface BoardStyle {
   pieceBottom: number;
   /** 棋子直径（原始图像素），随 scale 等比缩放 */
   pieceDiameter: number;
-  /** 屏宽映射基准：scale = (screenWidth - 16) / scaleBaseWidth */
+  /** 屏宽映射基准：scale = (screenWidth - BOARD_H_PADDING) / scaleBaseWidth */
   scaleBaseWidth: number;
   /** 纵向限高基准：scale = maxBoardHeight / scaleBaseHeight */
   scaleBaseHeight: number;

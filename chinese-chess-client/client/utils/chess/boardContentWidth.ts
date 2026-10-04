@@ -7,15 +7,14 @@
  * 与棋盘边缘脱节。
  *
  * ChessBoard 的实际渲染宽度与本文件口径完全一致（见 components/ChessBoard.tsx）：
- *   boardWidth = screenWidth - 16
+ *   boardWidth = screenWidth - BOARD_H_PADDING
  *   widthScale = boardWidth / boardStyle.scaleBaseWidth
  *   scale      = maxBoardHeight > 0 ? min(widthScale, maxBoardHeight / boardStyle.scaleBaseHeight) : widthScale
  *   渲染宽度   = boardStyle.imgWidth * scale
  * 因此角标行改用「棋盘本体宽度」并保持居中，即可与棋盘左右边缘精确对齐。
  */
 
-/** 棋盘水平留白：与 ChessBoard 内部 `boardWidth = screenWidth - 16` 的固定留白保持一致 */
-const BOARD_H_PADDING = 16;
+import { BOARD_H_PADDING } from './boardStyles';
 
 /**
  * 棋盘本体宽度（与 ChessBoard 渲染结果一致的预测值）。

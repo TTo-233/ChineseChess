@@ -23,6 +23,7 @@ import { Screen } from '@/components/Screen';
 import { AppModal, ModalButton, modalButtonRowStyle } from '@/components/Modal';
 import BoardEditor from '@/components/BoardEditor';
 import { useBoardStyle } from '@/utils/chess/boardStyleStore';
+import { BOARD_H_PADDING } from '@/utils/chess/boardStyles';
 import { useSafeRouter, useSafeSearchParams } from '@/hooks/useSafeRouter';
 import { createFromFen } from '@/utils/chess/GameEngine';
 import { FEN_CHARS } from '@/utils/chess/types';
@@ -193,7 +194,7 @@ export default function EndgameEditScreen() {
   // 数量角标的尺寸/偏移/字号同样沿用被吃棋子角标随棋子图比例联动的算法
   const screenWidth = Dimensions.get('window').width;
   const editBoardStyle = useBoardStyle();
-  const widthScale = (screenWidth - 16) / editBoardStyle.scaleBaseWidth;
+  const widthScale = (screenWidth - BOARD_H_PADDING) / editBoardStyle.scaleBaseWidth;
   const pieceSize = Math.floor(editBoardStyle.pieceDiameter * widthScale);
   const palettePieceSize = Math.max(Math.floor(pieceSize * 0.8), 1);
   const paletteBadgeSize = Math.max(Math.round(palettePieceSize * 0.47), 12);
