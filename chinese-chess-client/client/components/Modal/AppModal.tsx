@@ -71,6 +71,19 @@ export interface AppModalProps {
   dismissOnMaskPress?: boolean;
   /** 内容区样式（可覆盖内边距） */
   bodyStyle?: StyleProp<ViewStyle>;
+  /**
+   * 固定在卡片底部的操作区（取消/保存等）。
+   *
+   * 传入后 AppModal 会把 children 放进「可收缩的内容区」、把该节点放进「不收缩的页脚区」，
+   * 二者之间用一条分隔线隔开。内容再高也只会让**内容区**内部滚动，
+   * 页脚永远贴在卡片下沿内侧，不会被顶出卡片外（真机曾出现「取消/保存」压在背景棋盘上）。
+   *
+   * 典型用法：children 传表单主体并自包 ScrollView，footer 传按钮行。
+   * 不传（默认）时行为与既往完全一致：children 原样铺满 body。
+   */
+  footer?: React.ReactNode;
+  /** 页脚内边距（可覆盖）；页脚本身始终保留 body 的横向内边距 */
+  footerStyle?: StyleProp<ViewStyle>;
   /** 卡片样式（可覆盖圆角、宽度、maxHeight 等） */
   cardStyle?: StyleProp<ViewStyle>;
   /** 键盘弹出时是否避让（表单类弹窗使用） */
@@ -99,6 +112,8 @@ export default function AppModal({
   blockBackButton = false,
   dismissOnMaskPress = false,
   bodyStyle,
+  footer,
+  footerStyle,
   cardStyle,
   avoidKeyboard = false,
   anchorCenter = null,
@@ -170,7 +185,35 @@ export default function AppModal({
                 </View>
               </View>
             )}
-            <View style={[styles.body, bodyStyle]}>{children}</View>
+            {/*
+              【C-81】卡片高度预算：header / 内容区 / 页脚三段，卡片封顶时只让「内容区」收缩。
+
+              此前 body 是「padding + children」的一整块，调用方各自在 children 里塞
+              `ScrollView style={{flexGrow:0, flexShrink:1, minHeight:0}}`。这条链在真机上仍然失效：
+              Yoga 的 flex 基准尺寸（flexBasis:auto）对列向 flex 子项取 auto 时是**内容尺寸**，
+              body 虽然写了 minHeight:0，但它的 flexShrink 仍是 RN 默认的 0
+              （RN 与 CSS 不同，flexShrink 默认 0，不是 1），所以内容超高时
+              body 不肯收缩、卡片又被 maxHeight:88% 硬切，children 的 ScrollView
+              实际拿到的可视高度大于卡片剩余空间，于是页脚被顶到卡片下沿之外——
+              实机表现就是「取消/保存」压在背景棋盘上、点不到。
+
+              现在改成：
+              · body 显式 flexShrink:1（能收缩）+ minHeight:0（解除自动最小尺寸）；
+              · 传了 footer 时，children 进 styles.bodyContent（flexGrow:0 + flexShrink:1
+                + minHeight:0）这一层，footer 单独占 styles.footer（不收缩、不滚动）；
+              · card 保持 maxHeight:88%，于是内容再高也只有中间那段滚动，按钮行恒在卡片内。
+              未传 footer 时 children 仍直接铺在 body 里，与既往渲染一致。
+            */}
+            <View style={[styles.body, bodyStyle]}>
+              {footer == null ? (
+                children
+              ) : (
+                <View style={styles.bodyContent} testID="app-modal-body-content">{children}</View>
+              )}
+              {footer != null && (
+                <View style={[styles.footer, footerStyle]} testID="app-modal-footer">{footer}</View>
+              )}
+            </View>
           </View>
         </TouchableWithoutFeedback>
       </View>
@@ -299,11 +342,30 @@ const styles = StyleSheet.create({
   body: {
     padding: SIZES.modalPadding,
     paddingTop: SIZES.modalPadding - 4,
-    // ⚠️ minHeight:0 是「内容超高时内部滚动」的关键，不能删。
-    // 卡片有 maxHeight:88%，但 flex 子项的自动最小尺寸等于其内容尺寸：内容一旦超过
-    // 卡片上限，body（以及它内部 flexGrow:0 的 ScrollView）都不肯收缩，直接把内容
-    // 顶出卡片下沿——实机表现为短屏机型上「取消/创建」按钮溢出弹窗、点不到。
-    // minHeight:0 解除这个自动最小尺寸，卡片才会封顶、ScrollView 才会真正滚动。
+    // ⚠️ minHeight:0 与 flexShrink:1 是一对，缺一不可。
+    // ① minHeight:0 解除 flex 子项的「自动最小尺寸 = 内容尺寸」——内容一旦超过
+    //    卡片上限，body 才会肯收缩，否则直接撑破 maxHeight:88%。
+    // ② flexShrink:1 是收缩的开关。RN 的 flexShrink 默认值是 0（与 CSS 的 1 相反），
+    //    只写 minHeight:0 并不会让 body 收缩。
+    // 这两条缺任一条，调用方 children 里的 ScrollView 拿到的可视高度就会大于卡片
+    // 剩余空间，页脚被顶出卡片下沿——见上方 C-81 注释。
     minHeight: 0,
+    flexShrink: 1,
+  },
+  /** 有 footer 时的内容区：唯一允许被压缩并内部滚动的一段 */
+  bodyContent: {
+    flexGrow: 0,
+    flexShrink: 1,
+    minHeight: 0,
+  },
+  /**
+   * 固定页脚：不收缩、不滚动，恒贴在卡片下沿内侧。
+   * 顶部用一条描边分隔（不额外加 margin，避免改变调用方 buttonRow 的既有间距）。
+   */
+  footer: {
+    flexShrink: 0,
+    paddingTop: SIZES.modalPadding - 8,
+    borderTopWidth: 1,
+    borderTopColor: COLORS.modalBorder,
   },
 });

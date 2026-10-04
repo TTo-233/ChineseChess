@@ -176,6 +176,12 @@ export const formStyles = StyleSheet.create({
   // 而本遮罩是 ScrollView 的 absoluteFill 子元素。若不外扩，卡片左右两侧各 24px
   // 会形成点不到的死区，展开的悬浮面板也只覆盖内边距以内的宽度。
   // 这里向四周外扩 24px 抵消内边距，让遮罩真正铺满卡片。
+  //
+  // 【C-81】页脚化后的行为变化：按钮行已移到 AppModal 的 footer（不再位于本 ScrollView 内），
+  // 因此本遮罩盖不到按钮行。展开下拉时点「取消/保存」会**直接执行**该按钮
+  // （旧行为是遮罩吃掉这次点击、只收起下拉，需点第二次才生效）。这是更少一次点击的改进，
+  // 不属于回归。代价是 footer 顶部约 24px（paddingTop + 下探的 bottom 负边距）
+  // 仍被遮罩覆盖、点它只收起下拉——按钮主体不受影响。
   selectBackdrop: {
     ...StyleSheet.absoluteFillObject,
     top: -SIZES.modalPadding,

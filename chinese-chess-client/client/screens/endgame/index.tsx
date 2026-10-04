@@ -548,6 +548,15 @@ export default function EndgameScreen() {
           title="导入自定义残局"
           showCloseBtn
           avoidKeyboard
+          /* 【C-81】按钮行交给 AppModal 的 footer：此前它虽已位于 ScrollView 之外，
+             但同处 body 之内，body 不收缩（缺 flexShrink:1）时整块仍会被卡片
+             maxHeight 硬切、把按钮顶出卡片下沿。改为页脚后按钮恒在卡片内。 */
+          footer={
+            <View style={modalButtonRowStyle}>
+              <ModalButton label="取消" variant="secondary" onPress={() => setImportVisible(false)} />
+              <ModalButton label="识别并保存" onPress={handleImportSave} />
+            </View>
+          }
         >
           <ScrollView style={styles.modalBody} keyboardShouldPersistTaps="handled">
             <Text style={styles.fieldLabel}>名称</Text>
@@ -582,10 +591,6 @@ export default function EndgameScreen() {
             />
             {importError ? <Text style={styles.errorText}>{importError}</Text> : null}
           </ScrollView>
-          <View style={[modalButtonRowStyle, styles.importModalFooter]}>
-            <ModalButton label="取消" variant="secondary" onPress={() => setImportVisible(false)} />
-            <ModalButton label="识别并保存" onPress={handleImportSave} />
-          </View>
         </AppModal>
 
         {/* 玩法说明弹窗 */}
@@ -951,17 +956,16 @@ const styles = StyleSheet.create({
   // 尺寸与配色统一走 @/constants/modal 的 Design Tokens。
   // 内边距（左右 24 / 上 20 / 下 24）由 AppModal 的 body 统一提供，
   // 这里不再覆盖 paddingHorizontal —— 否则标签与输入框会贴到卡片边框上。
-  // 只保留按钮行与上一个区块之间的间距。
-  importModalFooter: {
-    marginTop: 16,
-  },
+  // 【C-81】导入弹窗的按钮行已移交给 AppModal 的 footer（页脚区自带分隔线与间距），
+  // 原来的 importModalFooter 随之移除。
   ruleModalFooter: {
     marginTop: 18,
   },
   modalBody: {
     // flexGrow:0 = 内容不多时按内容高度收缩；
-    // flexShrink:1 + minHeight:0 = 内容超高时这一层先收缩、由 ScrollView 内部滚动，
-    // 而不是把底部按钮顶出卡片下沿（与 AppModal.body 的 minHeight:0 配套）。
+    // flexShrink:1 + minHeight:0 = 内容超高时这一层先收缩、由 ScrollView 内部滚动。
+    // 收缩能否真正生效还取决于 AppModal.body 的 flexShrink:1 + minHeight:0（见 C-81）——
+    // RN 的 flexShrink 默认是 0，只在滚动容器自身声明并不足以让整条链收缩。
     flexGrow: 0,
     flexShrink: 1,
     minHeight: 0,

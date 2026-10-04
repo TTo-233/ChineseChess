@@ -2027,6 +2027,11 @@ export default function LanBattleScreen() {
   // 是否可使用表情：对手已加入且处于准备/对局阶段
   const canUseEmoji = !!opponentName && (phase === 'waiting' || phase === 'playing');
 
+  // 房间设置弹窗的编辑权限：仅房主、仅等待阶段。
+  // 提取出来是因为该弹窗的「表单区」与 AppModal 的「footer 按钮区」是两棵子树
+  // （见 C-81），两边都要用同一份判据，否则会出现表单只读、却仍显示「保存」的错配。
+  const canEditSettings = phase === 'waiting' && hostId === playerId;
+
   // 切换表情下拉栏：打开瞬间用 measureInWindow 实测名称行位置（窗口坐标 → 根容器坐标），
   // 确保下拉栏精确落在名称行正下方；测量接口不可用时退化为 onLayout 相对坐标锚点
   const toggleEmojiPicker = useCallback(() => {
@@ -2999,12 +3004,33 @@ export default function LanBattleScreen() {
           visible={settingsVisible}
           onClose={() => setSettingsVisible(false)}
           title="房间设置"
+          /* 【C-81】按钮行交给 AppModal 的 footer：卡片封顶时只让表单区收缩滚动，
+             「取消/保存」恒在卡片下沿内侧。修掉的是真机上按钮被顶出卡片、压在背景棋盘上
+             且点不到的溢出（此前靠 children 内 ScrollView 的 flexShrink 无法生效）。 */
+          footer={
+            <View style={modalButtonRowStyle}>
+              <ModalButton
+                label={canEditSettings ? '取消' : '关闭'}
+                variant="secondary"
+                onPress={() => setSettingsVisible(false)}
+              />
+              {canEditSettings && (
+                <ModalButton
+                  label="保存"
+                  onPress={handleSaveSettings}
+                  loading={savingSettings}
+                  disabled={!editName.trim()}
+                />
+              )}
+            </View>
+          }
         >
-          {/* flexGrow:0 = 内容不多时按内容高度收缩；flexShrink:1 + minHeight:0 = 内容超高时
-              这一层先收缩、由 ScrollView 内部滚动，避免「取消/保存」被顶出卡片下沿。 */}
-          <ScrollView style={{ flexGrow: 0, flexShrink: 1, minHeight: 0 }} showsVerticalScrollIndicator={false} keyboardShouldPersistTaps="handled">
+          {/* 由 AppModal 的 bodyContent 承载：高度富余时按内容高度展示，
+              超出卡片上限时这一层先收缩、由 ScrollView 内部滚动。 */}
+          <ScrollView style={styles.settingsScroll} showsVerticalScrollIndicator={false} keyboardShouldPersistTaps="handled">
               {(() => {
-                const canEdit = phase === 'waiting' && hostId === playerId;
+                const canEdit = canEditSettings;
+                const showOnlyHostHint = !canEdit && phase === 'waiting';
                 // 展示值：编辑模式取编辑态，查看模式取房间实际值
                 const baseVal = canEdit ? editBaseTime : baseTimeSeconds;
                 const turnVal = canEdit ? editTurn : turnTimeLimit;
@@ -3131,28 +3157,13 @@ export default function LanBattleScreen() {
                     <Text style={formStyles.hcSummary}>
                       {hcVal.length === 0 ? '不让子（标准开局）' : `已让 ${hcVal.length} 枚棋子（红方让子先行）`}
                     </Text>
-                    {!canEdit && phase === 'waiting' && (
+                    {showOnlyHostHint && (
                       <Text style={styles.modalHint}>仅房主可修改房间信息与设置</Text>
                     )}
-                    <View style={[modalButtonRowStyle, styles.settingsFooter]}>
-                      <ModalButton
-                        label={canEdit ? '取消' : '关闭'}
-                        variant="secondary"
-                        onPress={() => setSettingsVisible(false)}
-                      />
-                      {canEdit && (
-                        <ModalButton
-                          label="保存"
-                          onPress={handleSaveSettings}
-                          loading={savingSettings}
-                          disabled={!editName.trim()}
-                        />
-                      )}
-                    </View>
                   </>
                 );
               })()}
-              </ScrollView>
+          </ScrollView>
         </AppModal>
 
         {/* 中途退出二次确认：对局进行中（playing/reveal/countdown）返回时拦一道。
@@ -3423,8 +3434,15 @@ const styles = StyleSheet.create({
   // 房间设置弹窗（卡片壳子与遮罩已收敛到 AppModal；表单网格样式见共享组件
   // RoomSettingsControls 的 formStyles）。内边距由 AppModal 的 body 统一提供，
   // 这里不再覆盖 paddingHorizontal —— 否则表单标签会贴到卡片边框上。
-  settingsFooter: {
-    marginTop: 20,
+  // 【C-81】按钮行已移交给 AppModal 的 footer（分页脚区自带分隔线与间距），
+  // 原来的 settingsFooter 随之移除；此处只保留表单滚动容器的收缩契约。
+  settingsScroll: {
+    // 高度富余时按内容高度展示（不强行撑满卡片）；超出卡片上限时先收缩、
+    // 由 ScrollView 内部滚动。AppModal 的 bodyContent 已提供同款约束，
+    // 这里再写一份是为了让本组件自带该样式名，调用处不必手写内联对象。
+    flexGrow: 0,
+    flexShrink: 1,
+    minHeight: 0,
   },
   // 执棋结果公示：仅剩颜色角色（字号由使用处的 FONT.* 决定）
   revealSideRed: {
