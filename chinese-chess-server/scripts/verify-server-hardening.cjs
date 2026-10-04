@@ -38,6 +38,10 @@
  *     而不是「房间3」（旧实现 let n = rooms.size + 1 的结果）。D1 只是基准守卫，D3 才是判据。
  *   E 长将长捉不拦截：dist/index.js 全文不含 isMoveBanned（出现即说明拦截逻辑回到了产物里）。
  *
+ *   S2b 悔棋深度自适应：轮到对方（发起方刚走完、对方未落子）时发起悔棋 → depth=1，
+ *     同意后只退 1 手且回到发起方回合；轮到自己时 → depth=2，退 2 手。
+ *     两者都从 undo 响应与 gameState 载荷两处校验 depth 一致。
+ *
  * 实现要点：走子不硬编码 pieceId/目标格，而是先 GET gameState 拿服务端局面，再用同源的
  * 规则引擎（../ruleEngine.cjs）枚举一个合法着法/非法着法，避免「测错子」这类假阳性。
  *
@@ -411,6 +415,109 @@ async function scenarioUndoSnapshot() {
 }
 
 /**
+ * S2b. 悔棋深度自适应（新增：修「我方走完、对方未走」时悔棋按钮不可用）
+ *
+ * 改造前 UNDO_DEPTH 恒为 2，于是：
+ *   - 发起悔棋的条件绑定「轮到发起方」，导致发起方刚走完、对方还没落子的那个窗口完全无法悔棋；
+ *   - 即使放开条件，按 2 手退也会连带撤掉对方更早的那一手，不是本窗口该撤的。
+ * 现在 actUndo 在**请求时**按局面锁定 depth（轮到自己 → 2；轮到对方 → 1），
+ * actUndoResponse 原样执行，故这里分别覆盖两种口径。
+ */
+async function scenarioUndoDepthAdaptive() {
+  console.log('\n[S2b] 悔棋深度自适应（退 1 手 / 退 2 手）');
+  const { roomId, pa, pb, hostSide, ta, tb } = await setupPlayingRoom('ud');
+  const tokenOf = { red: hostSide === 'red' ? ta : tb, black: hostSide === 'red' ? tb : ta };
+  const mover = hostSide; // 开局走子方（让子房房主恒为红）
+  const responder = mover === 'red' ? 'black' : 'red';
+
+  // 开局局面（mover 尚未走子）作为「退 1 手后应当回到」的参照
+  const s0 = await roomState(roomId);
+  const boardAtStart = JSON.stringify(s0.gameState.qiPan);
+
+  const moveOnce = async (side) => {
+    const st = await roomState(roomId);
+    const m = findLegalMoveForSide(st.gameState, side);
+    assert.ok(m, `枚举不到 ${side} 的合法着法`);
+    const r = await post(`/rooms/${roomId}/move`, {
+      move: { pieceId: m.pieceId, toCol: m.toCol, toRow: m.toRow },
+    }, tokenOf[side]);
+    assert.strictEqual(r.status, 200, `${side} 走子失败: ${JSON.stringify(r.json)}`);
+    return m;
+  };
+
+  // ---- 场景一：mover 刚走完、responder 还没走 → depth 必须是 1 ----
+  await moveOnce(mover);
+  const s1 = await roomState(roomId);
+  const movesAtDepth1 = s1.gameState.moveHistory.length;
+  const turnAtDepth1 = (s1.gameState.sideTag === true || s1.gameState.sideTag === 'red') ? 'red' : 'black';
+  ok('S2b-0 基准成立：mover 走完 1 手后轮到 responder', turnAtDepth1 === responder,
+    `expected=${responder} actual=${turnAtDepth1}`);
+  ok('S2b-0b 基准成立：mover 那手确实改变了棋盘',
+    JSON.stringify(s1.gameState.qiPan) !== boardAtStart, '棋盘未变化，后续断言会假通过');
+
+  const reqDepth1 = await post(`/rooms/${roomId}/undo`, {}, tokenOf[mover]);
+  ok('S2b-1 对方回合发起悔棋成功（200）', reqDepth1.status === 200,
+    `status=${reqDepth1.status} body=${JSON.stringify(reqDepth1.json)}`);
+  ok('S2b-2 响应体 depth=1（只撤自己刚走的一手）',
+    reqDepth1.json?.depth === 1, `depth=${JSON.stringify(reqDepth1.json?.depth)}`);
+
+  // gameState 载荷必须把 depth 下发给响应方（弹窗据此措辞）
+  const pendState = await roomState(roomId);
+  const pendUndo = pendState.pendingUndo;
+  ok('S2b-3 载荷 pendingUndo.depth=1 且携带发起方 id',
+    pendUndo?.depth === 1 && pendUndo?.playerId === (mover === 'red' ? pa : pb),
+    `pendingUndo=${JSON.stringify(pendUndo)}`);
+
+  const agreeDepth1 = await post(`/rooms/${roomId}/undoResponse`, { agreed: true }, tokenOf[responder]);
+  ok('S2b-4 同意退 1 手成功（200）', agreeDepth1.status === 200,
+    `status=${agreeDepth1.status} body=${JSON.stringify(agreeDepth1.json)}`);
+
+  const s2 = await roomState(roomId);
+  ok('S2b-5 退 1 手后 moveHistory 减少 1（不再是旧实现的 -2）',
+    s2.gameState.moveHistory.length === movesAtDepth1 - 1,
+    `expected=${movesAtDepth1 - 1} actual=${s2.gameState.moveHistory.length}`);
+  ok('S2b-6 退 1 手后棋盘回到 mover 走棋前（与开局局面一致）',
+    JSON.stringify(s2.gameState.qiPan) === boardAtStart,
+    '棋盘未回退到 mover 走棋前');
+  const turnAfterDepth1 = (s2.gameState.sideTag === true || s2.gameState.sideTag === 'red') ? 'red' : 'black';
+  ok('S2b-7 退 1 手后重新轮到 mover（走子权不落到对方手上）', turnAfterDepth1 === mover,
+    `expected=${mover} actual=${turnAfterDepth1}`);
+
+  // ---- 场景二：轮到自己 → depth 必须是 2 ----
+  // 上一段结束时是「0 手、轮到 mover」，正好是干净起点。
+  await moveOnce(mover); // mover 走第 1 手 → 轮到 responder
+  await moveOnce(responder); // responder 走第 1 手 → 轮到 mover（经典悔棋窗口）
+  const s4 = await roomState(roomId);
+  const movesBeforeDepth2 = s4.gameState.moveHistory.length;
+  const turn4 = (s4.gameState.sideTag === true || s4.gameState.sideTag === 'red') ? 'red' : 'black';
+  ok('S2b-8 基准成立：此时轮到 mover 且已走过 2 手',
+    turn4 === mover && movesBeforeDepth2 === 2,
+    `expected turn=${mover} moves=2, actual turn=${turn4} moves=${movesBeforeDepth2}`);
+
+  const reqDepth2 = await post(`/rooms/${roomId}/undo`, {}, tokenOf[mover]);
+  ok('S2b-9 自己回合发起悔棋成功（200）', reqDepth2.status === 200,
+    `status=${reqDepth2.status} body=${JSON.stringify(reqDepth2.json)}`);
+  ok('S2b-10 响应体 depth=2（撤双方各一步）',
+    reqDepth2.json?.depth === 2, `depth=${JSON.stringify(reqDepth2.json?.depth)}`);
+
+  const agreeDepth2 = await post(`/rooms/${roomId}/undoResponse`, { agreed: true }, tokenOf[responder]);
+  ok('S2b-11 同意退 2 手成功（200）', agreeDepth2.status === 200,
+    `status=${agreeDepth2.status} body=${JSON.stringify(agreeDepth2.json)}`);
+
+  const s5 = await roomState(roomId);
+  ok('S2b-12 退 2 手后 moveHistory 减少 2',
+    s5.gameState.moveHistory.length === movesBeforeDepth2 - 2,
+    `expected=${movesBeforeDepth2 - 2} actual=${s5.gameState.moveHistory.length}`);
+  ok('S2b-13 退 2 手后棋盘回到 mover 走棋前（与开局局面一致）',
+    JSON.stringify(s5.gameState.qiPan) === boardAtStart, '棋盘未回退');
+  const turnAfterDepth2 = (s5.gameState.sideTag === true || s5.gameState.sideTag === 'red') ? 'red' : 'black';
+  ok('S2b-14 退 2 手后仍轮到 mover', turnAfterDepth2 === mover,
+    `expected=${mover} actual=${turnAfterDepth2}`);
+
+  await leaveAll(roomId, [{ id: pa, token: ta }, { id: pb, token: tb }]);
+}
+
+/**
  * S8. 旧协议下线（补丁九 / 【S-8】）
  * 改造前 POST /rooms/:roomId/gameState 接受完整 gameState/gameOver/winner 上传。
  * 现在该端点改名为 /move，只接受 { move: { pieceId, toCol, toRow } }。
@@ -591,6 +698,7 @@ async function main() {
   await scenarioAuthorityMoves();
   await scenarioSessionAuth();
   await scenarioUndoSnapshot();
+  await scenarioUndoDepthAdaptive();
   await scenarioLegacyProtocolRemoved();
   await scenarioMalformedFen();
   await scenarioRoomNameMinGap();

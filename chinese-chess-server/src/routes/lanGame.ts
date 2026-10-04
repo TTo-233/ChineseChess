@@ -201,7 +201,15 @@ export interface Room {
   lastMoveTime: number | null; // 上一步的时间（用于限时判定）
   disconnectedPlayerId: string | null; // 断线玩家ID
   disconnectTime: number | null; // 断线检测时间
-  pendingUndo: { playerId: string; requestTime: number } | null; // 待对方同意的悔棋请求
+  // 待对方同意的悔棋请求。
+  // 【悔棋深度】depth = 本次悔棋**实际回退的手数**（1 或 2），在「发起请求的那一刻」
+  // 由服务端按当前局面的走子归属算出并锁定（见 resolveUndoDepth），对方同意时原样执行。
+  // 语义：
+  //   - 2 = 退自己的上一手 + 对方再上一手，撤回「双方各一步」，回到自己走棋前（轮到自己）；
+  //   - 1 = 只撤自己刚走的那一手（我方已走、对方尚未回应的那一步窗口），回到该走之前（仍轮到自己）。
+  // 必须在请求时锁定而不是同意时再算：协商期间对方一旦落子，actMove 会清掉 pendingUndo，
+  // 但若「同意」与对方落子竞态，先到先处理——若在同意时按新局面重算，深度会与发起方的意图不符。
+  pendingUndo: { playerId: string; requestTime: number; depth: 1 | 2 } | null; // 待对方同意的悔棋请求
   // 【S-2 / §3.2】悔棋快照栈：每次**合法走子落盘之前**把当前权威局面压入。
   // 元素类型沿用 gameState 的 any（规则引擎的 GameState 类型没有跨端导出，见 ruleEngine.bundle.ts）。
   // 栈顶 = 上一步落子之前的局面，悔棋同意时直接 pop 使用，客户端不再有权提交目标局面。
@@ -220,8 +228,9 @@ export interface Room {
   lastRejectionSyncAt?: number; // 被拒动作回推权威状态的限流锚点：同一房间 3 秒计数窗口的起点
   rejectionSyncCount?: number; // 同一计数窗口内已回推的次数（上限 8）；【S-2】从模块级全局移到这里
   // 【P4】下一次广播必须走**全量**载荷（含完整 moveHistory）而不是增量载荷。
-  // 悔棋会把 gameState 换成更短的快照（历史被截断 2 手），增量载荷只带 moveCount/lastMove，
-  // 客户端的棋谱会与真实历史静默分叉；置位后由 buildGameStatePayload 的调用方消费并清零。
+  // 悔棋会把 gameState 换成更短的快照（历史被截断 1~2 手，取决于 pendingUndo.depth），
+  // 增量载荷只带 moveCount/lastMove，客户端的棋谱会与真实历史静默分叉；置位后由
+  // buildGameStatePayload 的调用方消费并清零。
   fullSyncPending?: boolean;
   createdAt: number;
   lastActivity: number;
@@ -533,8 +542,9 @@ export function buildGameStatePayload(room: Room): Record<string, unknown> {
     lastMoveTime: room.lastMoveTime,
     disconnectedPlayerId: room.disconnectedPlayerId,
     disconnectTime: room.disconnectTime,
+    // 【悔棋深度】depth 必须下发：对方据此说明「撤销 N 手」，发起方据此对齐本地口径
     pendingUndo: room.pendingUndo
-      ? { playerId: room.pendingUndo.playerId, requestTime: room.pendingUndo.requestTime }
+      ? { playerId: room.pendingUndo.playerId, requestTime: room.pendingUndo.requestTime, depth: room.pendingUndo.depth }
       : null,
     undoResult: room.undoResult,
     pendingDraw: room.pendingDraw
@@ -1813,6 +1823,33 @@ router.post('/rooms/:roomId/returnToRoom', (req, res) => {
 });
 
 /**
+ * 计算本次悔棋应回退的手数（悔棋深度）。
+ *
+ * 【新增】此前悔棋一律按「退 2 手」处理（见下方 actUndoResponse 的历史注释），
+ * 于是「我方刚走完、对方还没走」这个窗口完全无法悔棋：按 2 手退会连带撤掉
+ * 对方更早的那一手（不是本窗口该撤的），而发起方的诉求其实只是「把刚走的那一手撤回」。
+ *
+ * 两种口径（以发起方能回退的最少手数为准，保证回退后仍轮到发起方）：
+ * - **轮到发起方**（自己该走）：可退自己的上一手 + 对方应的那手 → 2 手（传统「悔一步」）；
+ * - **对方该走**（发起方刚走完、对方尚未落子）：只退自己刚走的那一手 → 1 手。
+ *
+ * 返回 null 表示此刻无法悔棋（自己还没走过子，或快照栈为空）。
+ */
+function resolveUndoDepth(room: Room, player: { side: 'red' | 'black' | null }): 1 | 2 | null {
+  if (!player.side) return null;
+  const historyLen = room.stateHistory?.length ?? 0;
+  if (historyLen === 0) return null;
+  const sideTag = (room.gameState as { sideTag?: unknown }).sideTag;
+  const currentSide: 'red' | 'black' = (sideTag === true || sideTag === 'red') ? 'red' : 'black';
+  // 轮到发起方 → 退 2 手；轮到对方（我方刚走完）→ 退 1 手
+  if (currentSide === player.side) {
+    // 退 2 手需要栈里至少两个快照；只剩 1 个说明自己一手都没走过，无从悔起
+    return historyLen >= 2 ? 2 : null;
+  }
+  return 1;
+}
+
+/**
  * 发起悔棋核心逻辑（HTTP 与 WebSocket 共用）。
  *
  * 【S-2 / §3.2】**不再接收 proposedState**：改造前客户端算好「回退两步」的局面一并上传，
@@ -1820,6 +1857,9 @@ router.post('/rooms/:roomId/returnToRoom', (req, res) => {
  * 零合法性校验 —— 等于把权威局面交给客户端任意改写（可回退到「对手少子、自己多子」的伪造局面，
  * 也可据此凭空造出一个「已绝杀」的局面）。现在服务端用 actMove 自己维护的快照栈回退，
  * 客户端只表达意图（「我要悔棋」），不参与决定回到哪个局面。
+ *
+ * 【悔棋深度】回退手数由服务端在请求时按当前局面算出（resolveUndoDepth）并锁进 pendingUndo，
+ * 对方同意时原样执行——客户端不再需要本地模拟退几步来推断能不能悔。
  */
 export function actUndo(roomId: string, _body: Record<string, unknown>, sessionToken: string): ActionResult {
   const room = rooms.get(roomId);
@@ -1851,14 +1891,29 @@ export function actUndo(roomId: string, _body: Record<string, unknown>, sessionT
     return actionFailure(400, '没有可回退的着法');
   }
 
-  room.pendingUndo = { playerId: player.id, requestTime: Date.now() };
+  // 【悔棋深度】按当前局面算出本次应退几手：轮到对方（我方刚走完）退 1 手，轮到自己退 2 手。
+  // 算出 null 表示此刻退不动（如轮到自己但本局只走过一手）。
+  const depth = resolveUndoDepth(room, player);
+  if (depth === null) {
+    return actionFailure(400, '没有可回退的着法');
+  }
+
+  room.pendingUndo = { playerId: player.id, requestTime: Date.now(), depth };
   room.undoResult = null;
   pauseClock(room); // 悔棋协商期间暂停棋钟
   room.lastActivity = Date.now();
 
+  // depth 一并回给发起方：客户端据此提示「撤销 N 手」并在本地做即时反馈（乐观回退）；
+  // 对方响应方则从 buildGameStatePayload 的 pendingUndo.depth 拿到同一口径，
+  // 用来在弹窗上说明「对方请求悔棋（撤销 N 手）」，两端展示与实际回退一致。
   return {
     status: 200,
-    body: { success: true, message: '悔棋请求已发送，等待对方同意', pending: true },
+    body: {
+      success: true,
+      message: '悔棋请求已发送，等待对方同意',
+      pending: true,
+      depth,
+    },
   };
 }
 
@@ -1899,9 +1954,13 @@ export function actUndoResponse(roomId: string, body: Record<string, unknown>, s
   if (agreed) {
     // 【S-2 / §3.2】回退到服务端自己的快照，不再采纳客户端上传的 proposedState。
     // 快照栈语义：stateHistory[k] = 走完 k 手后的局面（actMove 在执行前 push，
-    // 故第 1 手前压入的是 0 手开局局面）。悔棋按「退 2 手」处理（自己的 + 对方应的那手），
-    // 与客户端旧实现 undoMove(undoMove(state)) 的口径一致，也保证回退后仍轮到发起方。
-    const UNDO_DEPTH = 2;
+    // 故第 1 手前压入的是 0 手开局局面）。
+    //
+    // 【悔棋深度】UNDO_DEPTH 不再是常量，取发起请求时就锁定在 pendingUndo.depth 的值：
+    //   - depth=2：撤回「双方各一步」，回到发起方走棋前（轮回到发起方）；
+    //   - depth=1：只撤回发起方刚走的那一手（对方尚未落子的窗口），同样回到发起方回合。
+    // 两种深度回退后 sideTag 都翻转回发起方，回退后仍然轮到发起方走子。
+    const UNDO_DEPTH = room.pendingUndo.depth;
     if (!room.stateHistory || room.stateHistory.length < UNDO_DEPTH) {
       // 快照不足（例如栈已被封顶丢弃到头）：拒绝回退并把协商按"不可执行"处理，
       // 不改动任何局面；此处理论上不可达（actUndo 已按同一判据拒绝），保留为防御。
@@ -1919,7 +1978,7 @@ export function actUndoResponse(roomId: string, body: Record<string, unknown>, s
     room.gameState = room.stateHistory[keep];
     room.stateHistory.length = keep; // 回退出的快照一并出栈，否则下一手会在错误位置压栈
     // 【P4】历史被截断，必须让下一次广播发全量载荷：
-    // 增量载荷只带 moveCount/lastMove，客户端的本地棋谱会比服务端少 2 手且无法察觉。
+    // 增量载荷只带 moveCount/lastMove，客户端的本地棋谱会比服务端少（UNDO_DEPTH）手且无法察觉。
     room.fullSyncPending = true;
     room.lastMoveTime = Date.now();
     // 终局可能被回退掉（原本已判绝杀/困毙的局面不再成立）

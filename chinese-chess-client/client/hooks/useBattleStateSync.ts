@@ -179,6 +179,12 @@ export interface BattleStateSyncOptions {
   setUndoPending?: (pending: boolean) => void;
   setDrawPending?: (pending: boolean) => void;
   setUndoRequestFromOpponent?: (pending: boolean) => void;
+  /**
+   * 对方发起的悔棋请求的回退手数（1 或 2），仅在 setUndoRequestFromOpponent(true) 时非 0。
+   * 【悔棋深度】服务端在请求时锁定 pendingUndo.depth，这里原样透出供弹窗措辞；
+   * 无请求时为 0。缺省 0 由屏幕侧按「退 2 手」兜底显示。
+   */
+  setOpponentUndoDepth?: (depth: 0 | 1 | 2) => void;
   setDrawRequestFromOpponent?: (pending: boolean) => void;
   setOpponentDisconnected?: (disconnected: boolean) => void;
   setDisconnectCountdown?: (seconds: number) => void;
@@ -488,7 +494,11 @@ export function useBattleStateSync(options: BattleStateSyncOptions): BattleState
 
     // ---- 对方发起的悔棋/求和请求 ----
     const pendingUndo = asObject<BattlePendingUndo>(data.pendingUndo);
-    opt.setUndoRequestFromOpponent?.(!!(pendingUndo && pendingUndo.playerId !== opt.selfId));
+    const opponentUndo = !!(pendingUndo && pendingUndo.playerId !== opt.selfId);
+    opt.setUndoRequestFromOpponent?.(opponentUndo);
+    // 【悔棋深度】把服务端锁定的回退手数透给响应方，弹窗才能说清「同意后撤几步」。
+    // 缺省按 2（旧服务端不下发该字段）处理；非对方发起的请求一律清 0。
+    opt.setOpponentUndoDepth?.(opponentUndo ? (pendingUndo?.depth ?? 2) : 0);
 
     // ---- 我方发起的悔棋请求有了处理结果 ----
     const undoResult = asObject<BattleUndoResult>(data.undoResult);

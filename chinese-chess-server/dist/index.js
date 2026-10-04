@@ -26999,7 +26999,8 @@ function buildGameStatePayload(room) {
     lastMoveTime: room.lastMoveTime,
     disconnectedPlayerId: room.disconnectedPlayerId,
     disconnectTime: room.disconnectTime,
-    pendingUndo: room.pendingUndo ? { playerId: room.pendingUndo.playerId, requestTime: room.pendingUndo.requestTime } : null,
+    // 【悔棋深度】depth 必须下发：对方据此说明「撤销 N 手」，发起方据此对齐本地口径
+    pendingUndo: room.pendingUndo ? { playerId: room.pendingUndo.playerId, requestTime: room.pendingUndo.requestTime, depth: room.pendingUndo.depth } : null,
     undoResult: room.undoResult,
     pendingDraw: room.pendingDraw ? { playerId: room.pendingDraw.playerId, requestTime: room.pendingDraw.requestTime } : null,
     drawResult: room.drawResult,
@@ -27955,6 +27956,17 @@ function expireReturnedPlayers(room, now) {
 router.post("/rooms/:roomId/returnToRoom", (req, res) => {
   respondAction(res, req.params.roomId, actReturnToRoom(req.params.roomId, req.body, readSessionToken(req)));
 });
+function resolveUndoDepth(room, player) {
+  if (!player.side) return null;
+  const historyLen = room.stateHistory?.length ?? 0;
+  if (historyLen === 0) return null;
+  const sideTag = room.gameState.sideTag;
+  const currentSide = sideTag === true || sideTag === "red" ? "red" : "black";
+  if (currentSide === player.side) {
+    return historyLen >= 2 ? 2 : null;
+  }
+  return 1;
+}
 function actUndo(roomId, _body, sessionToken) {
   const room = rooms.get(roomId);
   if (!room) {
@@ -27976,13 +27988,22 @@ function actUndo(roomId, _body, sessionToken) {
   if (!room.stateHistory || room.stateHistory.length === 0) {
     return actionFailure(400, "\u6CA1\u6709\u53EF\u56DE\u9000\u7684\u7740\u6CD5");
   }
-  room.pendingUndo = { playerId: player.id, requestTime: Date.now() };
+  const depth = resolveUndoDepth(room, player);
+  if (depth === null) {
+    return actionFailure(400, "\u6CA1\u6709\u53EF\u56DE\u9000\u7684\u7740\u6CD5");
+  }
+  room.pendingUndo = { playerId: player.id, requestTime: Date.now(), depth };
   room.undoResult = null;
   pauseClock(room);
   room.lastActivity = Date.now();
   return {
     status: 200,
-    body: { success: true, message: "\u6094\u68CB\u8BF7\u6C42\u5DF2\u53D1\u9001\uFF0C\u7B49\u5F85\u5BF9\u65B9\u540C\u610F", pending: true }
+    body: {
+      success: true,
+      message: "\u6094\u68CB\u8BF7\u6C42\u5DF2\u53D1\u9001\uFF0C\u7B49\u5F85\u5BF9\u65B9\u540C\u610F",
+      pending: true,
+      depth
+    }
   };
 }
 router.post("/rooms/:roomId/undo", (req, res) => {
@@ -28011,7 +28032,7 @@ function actUndoResponse(roomId, body, sessionToken) {
     undoRequester.undoRefusals = agreed ? 0 : undoRequester.undoRefusals + 1;
   }
   if (agreed) {
-    const UNDO_DEPTH = 2;
+    const UNDO_DEPTH = room.pendingUndo.depth;
     if (!room.stateHistory || room.stateHistory.length < UNDO_DEPTH) {
       room.undoResult = {
         playerId: requesterId,

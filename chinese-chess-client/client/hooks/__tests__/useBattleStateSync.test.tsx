@@ -507,6 +507,69 @@ describe('useBattleStateSync', () => {
       expect(setUndoRequestFromOpponent).toHaveBeenCalledWith(false);
     });
 
+    // 【悔棋深度】响应方需要知道同意后会回退几手（1 = 只撤对方刚走的一手，2 = 撤双方各一步）
+    it('对方请求带 depth=1 → 透出回退手数 1', () => {
+      const setOpponentUndoDepth = jest.fn();
+      const h = mount({ setOpponentUndoDepth });
+      act(() =>
+        h.api.applyPayload({
+          phase: 'playing',
+          pendingUndo: { playerId: 'p2', requestTime: 1, depth: 1 },
+        })
+      );
+      expect(setOpponentUndoDepth).toHaveBeenCalledWith(1);
+    });
+
+    it('对方请求带 depth=2 → 透出回退手数 2', () => {
+      const setOpponentUndoDepth = jest.fn();
+      const h = mount({ setOpponentUndoDepth });
+      act(() =>
+        h.api.applyPayload({
+          phase: 'playing',
+          pendingUndo: { playerId: 'p2', requestTime: 1, depth: 2 },
+        })
+      );
+      expect(setOpponentUndoDepth).toHaveBeenCalledWith(2);
+    });
+
+    it('旧服务端不下发 depth → 按 2 手兜底，不显示成「退 1 手」', () => {
+      const setOpponentUndoDepth = jest.fn();
+      const h = mount({ setOpponentUndoDepth });
+      act(() =>
+        h.api.applyPayload({
+          phase: 'playing',
+          pendingUndo: { playerId: 'p2', requestTime: 1 },
+        })
+      );
+      expect(setOpponentUndoDepth).toHaveBeenCalledWith(2);
+    });
+
+    it('无在途请求 → 回退手数清 0（残留值不得留在弹窗上）', () => {
+      const setOpponentUndoDepth = jest.fn();
+      const h = mount({ setOpponentUndoDepth });
+      act(() =>
+        h.api.applyPayload({
+          phase: 'playing',
+          pendingUndo: { playerId: 'p2', requestTime: 1, depth: 1 },
+        })
+      );
+      expect(setOpponentUndoDepth).toHaveBeenLastCalledWith(1);
+      act(() => h.api.applyPayload({ phase: 'playing', pendingUndo: null }));
+      expect(setOpponentUndoDepth).toHaveBeenLastCalledWith(0);
+    });
+
+    it('自己发起的请求不把回退手数当作对方的（清 0）', () => {
+      const setOpponentUndoDepth = jest.fn();
+      const h = mount({ setOpponentUndoDepth });
+      act(() =>
+        h.api.applyPayload({
+          phase: 'playing',
+          pendingUndo: { playerId: 'me', requestTime: 1, depth: 1 },
+        })
+      );
+      expect(setOpponentUndoDepth).toHaveBeenCalledWith(0);
+    });
+
     it('我方请求被同意 → 清除在途状态且不弹拒绝提示', () => {
       const setUndoPending = jest.fn();
       const pendingUndoRef = { current: true };

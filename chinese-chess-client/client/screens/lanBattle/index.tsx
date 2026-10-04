@@ -503,6 +503,8 @@ export default function LanBattleScreen() {
   const [undoPending, setUndoPending] = useState(false); // 我方已发起，等待对方同意
   const undoPendingRef = useRef(false);
   const [undoRequestFromOpponent, setUndoRequestFromOpponent] = useState(false); // 对方发起的悔棋请求
+  // 【悔棋深度】对方请求要回退几手（服务端锁定）：弹窗据此措辞，避免同意后才发现撤了几步
+  const [opponentUndoDepth, setOpponentUndoDepth] = useState<0 | 1 | 2>(0);
   // 求和协商状态
   const [drawPending, setDrawPending] = useState(false); // 我方已发起求和，等待对方同意
   const drawPendingRef = useRef(false);
@@ -626,6 +628,7 @@ export default function LanBattleScreen() {
     setJueShaVisible(false);
     setOpponentDisconnected(false);
     setUndoRequestFromOpponent(false);
+    setOpponentUndoDepth(0); // 【悔棋深度】残留的协商深度必须随请求一起清掉
     setDrawRequestFromOpponent(false);
     // 【S-1 / §3.1】会话终结 → 本地凭证已无意义（席位已被服务端移除或房间已销毁），
     // 必须清掉，否则下次进同一 roomId 的房间会带着过期 token，且在存储里无限堆积。
@@ -887,6 +890,7 @@ export default function LanBattleScreen() {
     setUndoPending,
     setDrawPending,
     setUndoRequestFromOpponent,
+    setOpponentUndoDepth,
     setDrawRequestFromOpponent,
     setOpponentDisconnected,
     setDisconnectCountdown,
@@ -1934,29 +1938,56 @@ export default function LanBattleScreen() {
   };
 
   // 【P5】服务端已走手数：增量载荷不再下发完整 moveHistory（见 buildGameStatePayload）。
-  // 悔棋入口的「不足 2 手不可悔」等判断改读这里。
+  // 悔棋入口的「本局还没走过子」等判断改读这里。
   const moveCount = gameState.moveHistory?.length ?? 0;
+
+  // 本次悔棋应退的手数（0 = 不可悔棋），与服务端 resolveUndoDepth 同一判据：
+  //   - 轮到对方（我刚走完、对方还没回应）→ 1 手，正是此前悔棋按钮点不动的那个窗口；
+  //   - 轮到自己 → 2 手（撤双方各一步），需要至少走过 2 手。
+  // 换边关系由「每走一手 sideTag 必翻转」保证：轮到对方 ⇔ 最后一手是我走的，
+  // 故不需要再回头检查棋谱里最后一手的阵营（那只会引入与服务端不一致的第二判据）。
+  // moveCount 用本地合并后的完整棋谱长度，服务端用的是快照栈长度；
+  // 二者在本局正常推进时始终相等（每手压 1 个快照），故用它判「走过几手」是安全的。
+  const canUndoDepth: 0 | 1 | 2 = (() => {
+    if (phase !== 'playing' || moveCount < 1) return 0;
+    if (isMyTurn) return moveCount >= 2 ? 2 : 0;
+    return 1;
+  })();
 
   // 悔棋（需对方同意）
   //
   // 【S-2】改造前本函数在本地 undoMove 两步后把「目标局面」随请求提交给服务端，
   // 而服务端在对方同意时**直接采纳**这份客户端上传的局面——等于把权威局面交给
   // 任一方任意改写（可以伪造"对手少子、自己多子"的局面）。现在服务端保存自己的
-  // 走子前快照栈（stateHistory），对方同意时从自己的快照回退 2 步，客户端不再上传局面。
-  // 本地仍保留同样的 2 步守卫，让"不足 2 手时不可悔棋"的规则在两端一致且即时反馈。
+  // 走子前快照栈（stateHistory），对方同意时从自己的快照回退，客户端不再上传局面。
+  //
+  // 【悔棋深度】本次退几手由**服务端**按当前局面判定（resolveUndoDepth）：
+  //   - 轮到我走 → 退 2 手（撤自己上一手 + 对方应的那手），与旧行为一致；
+  //   - 对方该走（我刚走完、对方还没回应）→ 退 1 手（只撤自己刚走的那一手）。
+  // 客户端用 canUndoDepth 复刻同一判据，使按钮的可用状态与服务端一致、点击即时生效；
+  // 真正回退仍以服务端快照为准，本地 undoMove 只做「有资格发请求」的前置校验。
   const handleUndo = async () => {
-    if (!isMyTurn || moveCount < 2 || undoPendingRef.current) return;
+    if (undoPendingRef.current) return;
     if (undoBlockedRef.current) {
       showNotice('对方已连续拒绝 2 次，本局不能再发起悔棋');
       return;
     }
 
-    // 悔棋 = 回退对方一步 + 回退我方一步，回到我方走棋前。
-    // 这里只用于守卫（不足两步不可悔棋），不再把结果发给服务端。
-    // 前提：本地 moveHistory 必须是**完整**的——undoMove 末尾会 recomputeRuleState
-    // 全量重放；增量载荷下由 useBattleStateSync 的 mergeHistory 负责补齐。
-    const afterOpponent = undoMove(gameState);
-    if (!afterOpponent || !undoMove(afterOpponent)) return;
+    const depth = canUndoDepth;
+    if (depth === 0) {
+      showNotice('还没有可回退的着法');
+      return;
+    }
+
+    // 守卫：本地 moveHistory 必须能退 depth 步，否则不发请求。
+    // undoMove 末尾会 recomputeRuleState 全量重放；增量载荷下由
+    // useBattleStateSync 的 mergeHistory 负责补齐完整历史。
+    let probe = gameState;
+    for (let i = 0; i < depth; i += 1) {
+      const next = undoMove(probe);
+      if (!next) return;
+      probe = next;
+    }
 
     // 先进入「等待对方同意」态：服务端拒绝或超时时由 handleActionRejected 回退该态
     undoPendingRef.current = true;
@@ -1967,6 +1998,7 @@ export default function LanBattleScreen() {
   // 响应对方的悔棋请求
   const handleUndoResponse = async (agreed: boolean) => {
     setUndoRequestFromOpponent(false);
+    setOpponentUndoDepth(0); // 【悔棋深度】已响应，不再需要展示回退手数
     // 处理结果由服务端状态广播推送；ack 仅用于暴露「服务端拒绝/超时」
     await sendBattleAction('undoResponse', { agreed });
   };
@@ -2151,6 +2183,13 @@ export default function LanBattleScreen() {
     resetSyncBaseline(); // 清除走子乐观保护基线（含回滚快照）
     selfDisconnectedRef.current = false; // 新一局重新计算断线状态（避免沿用上一局的断线判负文案）
     replaySavedRef.current = false; // 重新对局允许再次自动保存复盘
+    // 悔棋协商状态重置
+    // 【C-46 顺带修复】此前重赛只复位求和协商，漏了悔棋：上一局残留的 undoPending 会让
+    // 新一局的悔棋按钮一直停在「等待对方同意」（服务端已随重赛清空 pendingUndo）。
+    undoPendingRef.current = false;
+    setUndoPending(false);
+    setUndoRequestFromOpponent(false);
+    setOpponentUndoDepth(0);
     // 求和协商状态重置
     drawPendingRef.current = false;
     setDrawPending(false);
@@ -2660,13 +2699,19 @@ export default function LanBattleScreen() {
               {phase === 'playing' && !jueShaVisible && (
                 <>
                   <TouchableOpacity
-                    style={[styles.actionButton, (!isMyTurn || moveCount < 2 || undoPending || undoBlocked) && styles.actionButtonDisabled]}
+                    style={[styles.actionButton, (canUndoDepth === 0 || undoPending || undoBlocked) && styles.actionButtonDisabled]}
                     onPress={handleUndo}
-                    disabled={!isMyTurn || moveCount < 2 || undoPending || undoBlocked}
+                    disabled={canUndoDepth === 0 || undoPending || undoBlocked}
                   >
                     <FontAwesome6 name="rotate-left" size={16} color={COLORS.textPrimary} />
                     <Text style={styles.actionButtonText}>
-                      {undoPending ? '等待对方同意' : undoBlocked ? '悔棋已禁' : '悔棋'}
+                      {undoPending
+                        ? '等待对方同意'
+                        : undoBlocked
+                          ? '悔棋已禁'
+                          : canUndoDepth === 1
+                            ? '悔棋(退1手)'
+                            : '悔棋'}
                     </Text>
                   </TouchableOpacity>
                   <TouchableOpacity
@@ -3140,11 +3185,16 @@ export default function LanBattleScreen() {
         />
 
         {/* 对方悔棋请求：卡片精确居中于棋盘（anchorCenter 用窗口坐标对齐 boardFrame），
-            强交互场景阻断物理返回键 */}
+            强交互场景阻断物理返回键。
+            正文按服务端锁定的 depth 措辞：退 1 手 / 退 2 手，让对方知道同意后到底撤几步 */}
         <AppDialog
           visible={undoRequestFromOpponent}
           title="悔棋请求"
-          message="对方请求悔棋（撤销双方各一步），是否同意？"
+          message={
+            opponentUndoDepth === 1
+              ? '对方请求悔棋（只撤销其刚走的一手），是否同意？'
+              : '对方请求悔棋（撤销双方各一步），是否同意？'
+          }
           cancelText="拒绝"
           confirmText="同意"
           confirmVariant="success"

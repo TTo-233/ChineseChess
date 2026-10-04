@@ -59,6 +59,13 @@ export interface BattleMove {
 export interface BattlePendingUndo {
   playerId: string;
   requestTime: number;
+  /**
+   * 本次悔棋实际回退的手数（服务端在请求时算好并锁定）：
+   * - 2 = 撤回「双方各一步」，回到请求方走棋前；
+   * - 1 = 只撤回请求方刚走的那一手（对方尚未落子的窗口）。
+   * 缺省按 2 处理，以兼容旧服务端载荷。
+   */
+  depth?: 1 | 2;
   proposedState?: GameState;
 }
 

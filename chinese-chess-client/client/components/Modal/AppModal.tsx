@@ -143,13 +143,13 @@ export default function AppModal({
         {/* 卡片 */}
         <TouchableWithoutFeedback onPress={() => Keyboard.dismiss()}>
           <View style={[styles.card, placement === 'bottom' && styles.cardBottom, cardStyle, anchorOffsetStyle]}>
-            {((!!title || !!titleNode) || showCloseBtn) && (
+            {(!!title || titleNode || showCloseBtn) && (
               <View style={styles.header}>
                 <View style={styles.headerSpacer} />
-                {!!titleNode ? (
+                {titleNode ? (
                   <View style={styles.titleHost}>{titleNode}</View>
                 ) : (
-                  !!title && (
+                  title && (
                     <Text style={styles.title} numberOfLines={2}>
                       {title}
                     </Text>
