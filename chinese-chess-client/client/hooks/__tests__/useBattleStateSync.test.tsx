@@ -211,13 +211,47 @@ describe('useBattleStateSync', () => {
     it('长时间未见本端着法 → 放弃保护并按服务端局面恢复', () => {
       const h = mount();
       h.api.markOptimisticMove(3, gameState([1, 2, 3]));
-      // 乐观保护窗口 8s
+      // 【P5】乐观保护窗口已由写死的 8s 改为按 RTT 标定（下限 12s、上限 30s），
+      // 未注入 rttMs 时按 12s 计。
       act(() => {
-        jest.advanceTimersByTime(9000);
+        jest.advanceTimersByTime(13000);
         h.api.applyPayload({ phase: 'playing', gameState: gameState([1]) });
       });
       expect(h.setGameState).toHaveBeenCalledTimes(1);
       expect(h.pendingMoveRef.current).toBeNull();
+    });
+
+    it('【P5】窗口内（12s）仍保护本端着法，不因慢链路误判为上传失败', () => {
+      const h = mount();
+      h.api.markOptimisticMove(3, gameState([1, 2, 3]));
+      act(() => {
+        jest.advanceTimersByTime(11000);
+        h.api.applyPayload({ phase: 'playing', gameState: gameState([1]) });
+      });
+      // 局面被延迟，控制信息仍处理
+      expect(h.setGameState).not.toHaveBeenCalled();
+      expect(h.pendingMoveRef.current).not.toBeNull();
+    });
+
+    it('【P5】注入 RTT 时窗口按 RTT×6 放大，并受 30s 上限约束', () => {
+      const slow = mount({ rttMs: () => 20000 });
+      slow.api.markOptimisticMove(3, gameState([1, 2, 3]));
+      act(() => {
+        jest.advanceTimersByTime(29000);
+        slow.api.applyPayload({ phase: 'playing', gameState: gameState([1]) });
+      });
+      // 29s < 20000×6（已到 30s 上限）→ 仍保护
+      expect(slow.setGameState).not.toHaveBeenCalled();
+
+      const mid = mount({ rttMs: () => 3000 });
+      mid.api.markOptimisticMove(3, gameState([1, 2, 3]));
+      act(() => {
+        jest.advanceTimersByTime(19000);
+        mid.api.applyPayload({ phase: 'playing', gameState: gameState([1]) });
+      });
+      // 3000×6=18000 < 19s → 窗口已过，放弃保护
+      expect(mid.setGameState).toHaveBeenCalledTimes(1);
+      expect(mid.pendingMoveRef.current).toBeNull();
     });
 
     it('未登记乐观保护时永远直接落地', () => {
@@ -227,6 +261,87 @@ describe('useBattleStateSync', () => {
       expect(h.handlers.onBoardApplied).toHaveBeenCalledWith(
         expect.objectContaining({ historyLen: 2, isNewMove: true })
       );
+    });
+
+    // ---- P4：增量载荷（gameState 不含 moveHistory）的兼容 ----
+
+    it('增量载荷：着法数读顶层 moveCount，并把 lastMove 合并进本地棋谱', () => {
+      const h = mount();
+      const lastMove = { pieceId: 6, fromCol: 7, fromRow: 0, toCol: 4, toRow: 2, capturedPieceId: -1 };
+      // 服务端增量载荷：gameState 里完全没有 moveHistory
+      act(() =>
+        h.api.applyPayload({
+          phase: 'playing',
+          moveCount: 1,
+          lastMove,
+          gameState: { sideTag: false } as unknown as GameState,
+        })
+      );
+      const applied = h.setGameState.mock.calls.at(-1)?.[0] as GameState;
+      expect(applied.moveHistory).toEqual([lastMove]);
+      expect(h.handlers.onBoardApplied).toHaveBeenCalledWith(
+        expect.objectContaining({ historyLen: 1, isNewMove: true, lastMove })
+      );
+    });
+
+    it('增量载荷：连续多手时本地棋谱逐手累积，不被清空', () => {
+      const h = mount();
+      const base = { sideTag: true } as unknown as GameState;
+      for (let i = 1; i <= 3; i += 1) {
+        const lastMove = { pieceId: i, fromCol: 0, fromRow: 0, toCol: 1, toRow: i, capturedPieceId: -1 };
+        act(() =>
+          h.api.applyPayload({ phase: 'playing', moveCount: i, lastMove, gameState: base })
+        );
+        const applied = h.setGameState.mock.calls.at(-1)?.[0] as GameState;
+        expect(applied.moveHistory).toHaveLength(i);
+        expect(applied.moveHistory[i - 1]).toEqual(lastMove);
+      }
+    });
+
+    it('全量载荷（含 moveHistory）直接采用服务端棋谱', () => {
+      const h = mount();
+      const full = gameState([1, 2, 3]);
+      act(() => h.api.applyPayload({ phase: 'playing', moveCount: 3, lastMove: 3, gameState: full }));
+      const applied = h.setGameState.mock.calls.at(-1)?.[0] as GameState;
+      expect(applied.moveHistory).toEqual([1, 2, 3]);
+    });
+
+    it('增量载荷：悔棋截断历史时按 moveCount 截断本地棋谱', () => {
+      const h = mount();
+      const base = { sideTag: true } as unknown as GameState;
+      for (let i = 1; i <= 3; i += 1) {
+        const lastMove = { pieceId: i, fromCol: 0, fromRow: 0, toCol: 1, toRow: i, capturedPieceId: -1 };
+        act(() => h.api.applyPayload({ phase: 'playing', moveCount: i, lastMove, gameState: base }));
+      }
+      // 悔棋：服务端回退两手并发全量载荷；这里验证增量形态下 moveCount 变小也能截断
+      act(() => h.api.applyPayload({ phase: 'playing', moveCount: 1, lastMove: 1, gameState: base }));
+      const applied = h.setGameState.mock.calls.at(-1)?.[0] as GameState;
+      expect(applied.moveHistory).toHaveLength(1);
+    });
+
+    it('重开一局：resetSyncBaseline 清空本地棋谱基线', () => {
+      const h = mount();
+      const base = { sideTag: true } as unknown as GameState;
+      const lastMove = { pieceId: 1, fromCol: 0, fromRow: 0, toCol: 1, toRow: 1, capturedPieceId: -1 };
+      act(() => h.api.applyPayload({ phase: 'playing', moveCount: 1, lastMove, gameState: base }));
+      act(() => { h.api.resetSyncBaseline(); });
+      // 新一局第 1 手：不应把上一局的着法接在后面
+      const firstOfNew = { pieceId: 9, fromCol: 2, fromRow: 0, toCol: 2, toRow: 2, capturedPieceId: -1 };
+      act(() => h.api.applyPayload({ phase: 'playing', moveCount: 1, lastMove: firstOfNew, gameState: base }));
+      const applied = h.setGameState.mock.calls.at(-1)?.[0] as GameState;
+      expect(applied.moveHistory).toEqual([firstOfNew]);
+    });
+
+    it('结算的 moveCount 优先取顶层字段', () => {
+      const h = mount();
+      act(() => h.api.applyPayload({ phase: 'ended', winner: 'p1', moveCount: 12 }));
+      expect(h.handlers.onEnded.mock.calls[0][0].moveCount).toBe(12);
+    });
+
+    it('老服务端（无顶层 moveCount）回落到 gameState.moveHistory.length', () => {
+      const h = mount();
+      act(() => h.api.applyPayload({ phase: 'ended', winner: 'p1', gameState: gameState([1, 2, 3, 4]) }));
+      expect(h.handlers.onEnded.mock.calls[0][0].moveCount).toBe(4);
     });
   });
 

@@ -17,9 +17,13 @@ import { useFocusEffect } from 'expo-router';
 import { FontAwesome6 } from '@expo/vector-icons';
 import {
   getOnlineServerUrl,
+  getOnlineServerProfile,
   setOnlineServerUrl,
+  setOnlineServerProfile,
   resetOnlineServerUrl,
+  migrateLegacyServerUrl,
   testServerConnection,
+  SERVER_PROFILES,
   DEFAULT_SERVER_URL,
 } from '@/utils/serverConfig';
 import { getPlayerId, getPlayerName, savePlayerName, setRoomSessionToken } from '@/utils/playerIdentity';
@@ -130,6 +134,13 @@ export default function LanGameScreen() {
   const [serverStatus, setServerStatus] = useState<'unknown' | 'ok' | 'fail'>('unknown');
   const [showServerModal, setShowServerModal] = useState(false);
   const [serverInput, setServerInput] = useState('');
+  /**
+   * 当前选中的预置线路 id；为空表示正在用自定义地址（或环境变量地址），
+   * 此时两个预置节点都不高亮，提示用户"当前为自定义地址"。
+   */
+  const [selectedProfileId, setSelectedProfileId] = useState<string | null>(null);
+  /** 各线路的实测探测结果（毫秒）；null = 未探测或探测失败 */
+  const [profileLatency, setProfileLatency] = useState<Record<string, number | null>>({});
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<string | null>(null);
 
@@ -146,9 +157,15 @@ export default function LanGameScreen() {
   const refreshServer = useCallback(async () => {
     const url = await getOnlineServerUrl();
     setServerUrl(url);
+    setSelectedProfileId((await getOnlineServerProfile())?.id ?? null);
     setServerStatus('unknown');
     const latency = await testServerConnection(url, 4000);
     setServerStatus(latency !== null ? 'ok' : 'fail');
+    if (latency !== null) {
+      // 把实测值回填到对应线路，供弹窗里显示"实测 xxxms"
+      const profile = await getOnlineServerProfile();
+      if (profile) setProfileLatency((prev) => ({ ...prev, [profile.id]: latency }));
+    }
   }, []);
 
   // 获取房间列表
@@ -215,11 +232,30 @@ export default function LanGameScreen() {
     }, [refreshServer, fetchRooms, fetchActiveRoom])
   );
 
+  /**
+   * 旧版本用户迁移：老版本把默认地址硬编码为 Cloudflare 并在首次启动时写盘，
+   * 不迁移的话存量用户升级后仍停在 500ms 线路上。详见 serverConfig.migrateLegacyServerUrl。
+   */
+  useFocusEffect(
+    useCallback(() => {
+      migrateLegacyServerUrl();
+    }, [])
+  );
+
   // 打开服务器设置弹窗
   const handleOpenServerModal = () => {
     setServerInput(serverUrl);
     setTestResult(null);
     setShowServerModal(true);
+  };
+
+  // 切换到某条预置线路：立即落盘 + 关闭弹窗 + 刷新大厅
+  const handleSelectProfile = async (id: string) => {
+    setShowServerModal(false);
+    setTestResult(null);
+    await setOnlineServerProfile(id);
+    refreshServer();
+    fetchRooms();
   };
 
   // 测试连接
@@ -701,6 +737,50 @@ export default function LanGameScreen() {
           showCloseBtn
           closeBtnType="text"
         >
+          {/* 线路选择：卡片式单选，点击即切换并立即生效 */}
+          <Text style={styles.serverSectionLabel}>对战线路</Text>
+          {SERVER_PROFILES.map(profile => {
+            const active = selectedProfileId === profile.id;
+            const measured = profileLatency[profile.id];
+            return (
+              <TouchableOpacity
+                key={profile.id}
+                style={[styles.profileCard, active && styles.profileCardActive]}
+                onPress={() => handleSelectProfile(profile.id)}
+                accessibilityRole="radio"
+                accessibilityState={{ selected: active }}
+                accessibilityLabel={`${profile.name}，延迟约 ${measured ?? profile.latencyMs} 毫秒`}
+              >
+                <View style={styles.profileRadio}>
+                  {active && <View style={styles.profileRadioDot} />}
+                </View>
+                <View style={styles.profileBody}>
+                  <View style={styles.profileTitleRow}>
+                    <Text style={[styles.profileName, active && styles.profileNameActive]}>
+                      {profile.name}
+                    </Text>
+                    {active && <Text style={styles.profileBadge}>当前</Text>}
+                  </View>
+                  <Text style={styles.profileDesc}>
+                    {profile.desc}　·　延迟约 {measured ?? profile.latencyMs}ms
+                  </Text>
+                  <Text style={styles.profileUrl} numberOfLines={1}>
+                    {profile.url.replace(/^https?:\/\//i, '')}
+                  </Text>
+                </View>
+              </TouchableOpacity>
+            );
+          })}
+
+          {/* 预置线路之外的状态提示（自定义地址 / 环境变量地址） */}
+          {selectedProfileId === null && serverUrl !== DEFAULT_SERVER_URL && (
+            <Text style={styles.serverCustomHint}>
+              当前使用自定义地址，请在下方输入并保存。
+            </Text>
+          )}
+
+          {/* 自定义地址：预置线路之外的场景（自建服务端、内网地址）仍可手填 */}
+          <Text style={[styles.serverSectionLabel, styles.serverSectionLabelSpaced]}>自定义地址</Text>
           <TextInput
             style={styles.serverInput}
             value={serverInput}
@@ -1301,6 +1381,90 @@ const styles = StyleSheet.create({
     color: COLORS.textPrimary,
     borderWidth: 1,
     borderColor: COLORS.border,
+  },
+  serverSectionLabel: {
+    fontSize: FONT.body,
+    fontWeight: '600',
+    color: COLORS.textSecondary,
+    marginBottom: 8,
+  },
+  serverSectionLabelSpaced: {
+    marginTop: 18,
+  },
+  serverCustomHint: {
+    fontSize: FONT.caption,
+    color: COLORS.textLight,
+    marginTop: 8,
+  },
+  /** 线路卡片：单选态用主色描边 + 浅色底区分，未选中保持中性 */
+  profileCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    paddingVertical: 11,
+    paddingHorizontal: 12,
+    marginBottom: 8,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.background,
+  },
+  profileCardActive: {
+    borderColor: COLORS.primary,
+    borderWidth: 2,
+    backgroundColor: 'rgba(139, 105, 20, 0.08)',
+  },
+  /** 自绘单选圆圈（RN 无内置 radio，用双层 View 组合） */
+  profileRadio: {
+    width: 18,
+    height: 18,
+    borderRadius: 9,
+    borderWidth: 2,
+    borderColor: COLORS.primary,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  profileRadioDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: COLORS.primary,
+  },
+  profileBody: {
+    flex: 1,
+  },
+  profileTitleRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  profileName: {
+    fontSize: FONT.control,
+    fontWeight: '600',
+    color: COLORS.textPrimary,
+  },
+  profileNameActive: {
+    color: COLORS.primary,
+  },
+  profileBadge: {
+    fontSize: FONT.micro,
+    fontWeight: '700',
+    color: '#FFFFFF',
+    backgroundColor: COLORS.primary,
+    borderRadius: 4,
+    paddingHorizontal: 5,
+    paddingVertical: 1,
+    overflow: 'hidden',
+  },
+  profileDesc: {
+    fontSize: FONT.caption,
+    color: COLORS.textLight,
+    marginTop: 2,
+  },
+  profileUrl: {
+    fontSize: FONT.micro,
+    color: COLORS.textLight,
+    marginTop: 2,
   },
   testRow: {
     flexDirection: 'row',

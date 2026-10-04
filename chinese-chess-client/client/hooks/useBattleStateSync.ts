@@ -38,9 +38,22 @@ import {
   type GameStatePayload,
 } from '@/utils/battleProtocol';
 import { applyServerNow, serverElapsedMs, serverNow } from '@/utils/serverClock';
+import type { MoveRecord } from '@/utils/chess/types';
 
-/** 本端走子的乐观保护窗口：超过该时长仍未在服务端局面里看到本端着法，即判定上传失败 */
-const OPTIMISTIC_SYNC_TIMEOUT_MS = 8000;
+/**
+ * 【P5】慢链路下的乐观保护窗口下限（取代原先写死的 8000ms）。
+ *
+ * 实测本站线路（上海电信 → Cloudflare SEA 节点 → 回源隧道）着法往返 p50 457 ms、p90 1763 ms，
+ * 对手着法可见 p50 735 ms、p90 1733 ms；8 秒的固定窗口在 p90 抖动下会在**服务端已收到、
+ * 广播在路上**时被误判为「上传失败」，从而把局面拉回旧快照——比多等几秒更糟。
+ * 因此窗口按实测 RTT 放大，并硬性保底 12 秒。
+ */
+const OPTIMISTIC_SYNC_TIMEOUT_MIN_MS = 12000;
+/** 【P5】RTT 放大倍数：窗口 = RTT × 该倍数，并夹在 [下限, 上限] 之间 */
+const OPTIMISTIC_SYNC_RTT_FACTOR = 6;
+const OPTIMISTIC_SYNC_TIMEOUT_MAX_MS = 30000;
+/** 页面未提供 RTT 采样时的占位（等价「链路未知」，直接用下限窗口） */
+const NO_RTT = (): number => 0;
 /** 协商（悔棋/求和）连续被对方拒绝多少次后封禁入口 */
 const NEGOTIATION_REFUSAL_LIMIT = 2;
 /** 对方断线等待判负的总时长（与服务端 detectDisconnect 的 60s 对齐，仅用于展示倒计时） */
@@ -82,6 +95,11 @@ export interface BattleStateSyncHandlers {
     prevHistoryLen: number;
     /** 本帧着法数是否增加 */
     isNewMove: boolean;
+    /**
+     * 【P4】本帧的最新一手（增量载荷里 moveHistory 已不再下发）。
+     * 走子动画、着子音效与「最后一步」高亮都只用到这一条记录。
+     */
+    lastMove: MoveRecord | null;
   }) => void;
   /** 收到表情消息（已按 id 去重；页面据此入列展示） */
   onEmoji?: (message: BattleEmojiMessage) => void;
@@ -166,6 +184,13 @@ export interface BattleStateSyncOptions {
   setDisconnectCountdown?: (seconds: number) => void;
 
   handlers?: BattleStateSyncHandlers;
+
+  /**
+   * 【P5】当前链路的实测 RTT（毫秒，由 battleSocket 的 `rttMs` 提供）。
+   * 用于把「乐观保护窗口」与「回执超时」按线路标定，而不是按 20–80ms 的理想链路写死。
+   * 不传时按 0 处理（等价于使用 OPTIMISTIC_SYNC_TIMEOUT_MIN_MS 下限）。
+   */
+  rttMs?: () => number;
 }
 
 export interface BattleStateSyncApi {
@@ -211,6 +236,77 @@ function narrowEndReason(
     : fallback;
 }
 
+/**
+ * 【P4】读取服务端已走手数。
+ *
+ * 增量载荷以顶层 `moveCount` 为准；全量载荷（welcome / HTTP /gameState / 悔棋后补推）
+ * 两者等价。老服务端没有顶层字段时回落到 moveHistory.length，保证向前兼容。
+ */
+function readMoveCount(data: GameStatePayload): number {
+  const n = data.moveCount;
+  if (typeof n === 'number' && Number.isFinite(n) && n >= 0) return n;
+  return data.gameState?.moveHistory?.length ?? 0;
+}
+
+/**
+ * 【P5】按实测 RTT 标定乐观保护窗口。
+ *
+ * 窗口需要覆盖「着法已到达服务端 → 广播在网络上飞回来」这一整段，
+ * 因此按 RTT 的数倍取值，并夹在 [12s, 30s]：12s 足以覆盖本站线路 p90 1733ms 的
+ * 多倍抖动，而 30s 又不至于让真正的上传失败长时间停在旧画面上。
+ */
+function optimisticTimeoutMs(rttMs: () => number): number {
+  let rtt = 0;
+  try {
+    rtt = rttMs() || 0;
+  } catch {
+    rtt = 0;
+  }
+  if (!Number.isFinite(rtt) || rtt <= 0) return OPTIMISTIC_SYNC_TIMEOUT_MIN_MS;
+  const scaled = Math.round(rtt * OPTIMISTIC_SYNC_RTT_FACTOR);
+  return Math.min(
+    OPTIMISTIC_SYNC_TIMEOUT_MAX_MS,
+    Math.max(OPTIMISTIC_SYNC_TIMEOUT_MIN_MS, scaled),
+  );
+}
+
+/**
+ * 【P4】把最新一手补回本地棋谱，使 moveHistory 在增量载荷下依旧完整。
+ *
+ * 背景：`recomputeRuleState`（`utils/chess/RuleEngine.ts`）与 `undoInPlace`
+ * 都需要**自起始局面起完整**的 moveHistory 才会重放。服务端增量载荷不再下发全量历史，
+ * 若客户端直接丢弃，本地悔棋预演与规则重算就会静默出错。
+ *
+ * 参数 `prev` 是本端上一次应用的局面（含完整历史）。
+ * 规则（按服务端给出的 moveCount 对齐）：
+ * - 载荷自带完整历史（长度就等于 moveCount）→ 直接用服务端的，权威；
+ * - 本地历史比 moveCount 短 → 缺的那几手用 lastMove 补齐（只补最新一手）；
+ * - 本地历史比 moveCount 长（悔棋截断）→ 截到 moveCount，信任服务端。
+ * - 无需改动时返回原引用，避免无谓的重渲染。
+ */
+function mergeHistory(
+  state: GameState,
+  moveCount: number,
+  lastMove: MoveRecord | null | undefined,
+  prev: GameState | null,
+): GameState {
+  const incoming = state.moveHistory ?? [];
+  // 服务端已下发完整历史（welcome / HTTP /gameState / 悔棋后补推）→ 权威，直接采用
+  if (incoming.length >= moveCount) {
+    return incoming.length === moveCount ? state : { ...state, moveHistory: incoming.slice(0, moveCount) };
+  }
+  const base = prev?.moveHistory ?? [];
+  if (base.length === moveCount) return { ...state, moveHistory: base };
+  if (base.length < moveCount && lastMove) {
+    // 只可能缺最新一手（本端乐观着法先落地时长度已相等，走上面的分支）
+    const tail = base[base.length - 1];
+    const merged = tail === lastMove ? base : [...base, lastMove];
+    return { ...state, moveHistory: merged.slice(0, moveCount) };
+  }
+  // 兜底：本地无历史且载荷也无从补齐 → 至少不要把 moveHistory 留成 null
+  return { ...state, moveHistory: base.slice(0, moveCount) };
+}
+
 export function useBattleStateSync(options: BattleStateSyncOptions): BattleStateSyncApi {
   // 每次渲染都刷新最新配置：applyPayload 经 ref 被 WS/轮询回调调用，
   // 依赖数组无法表达「页面每个函数都是新引用」这件事，用 optionsRef 规避闭包捕获旧回调。
@@ -224,6 +320,9 @@ export function useBattleStateSync(options: BattleStateSyncOptions): BattleState
 
   // 已见着法数：识别「本帧是否有新着法」（对手走棋检测、悔棋回退基线）
   const seenHistoryLenRef = useRef(0);
+  // 【P4】本端上一次应用的局面（携带完整本地 moveHistory）。
+  // 增量载荷的 gameState 不含 moveHistory，需要与它合并才能维持可重放的完整棋谱。
+  const prevStateRef = useRef<GameState | null>(null);
   // 表情按 id 去重：WS 与轮询双通道都会下发同一批，必须幂等
   const seenEmojiIdsRef = useRef<Set<string>>(new Set());
 
@@ -326,7 +425,7 @@ export function useBattleStateSync(options: BattleStateSyncOptions): BattleState
           data.endReason,
           !data.winner ? 'draw' : data.surrenderBy ? 'resign' : 'checkmate',
         ),
-        moveCount: data.gameState?.moveHistory?.length,
+        moveCount: data.moveCount ?? data.gameState?.moveHistory?.length,
         // 第 3 批 / §8 #7：gameStartTime 是服务端时间戳，必须用校正后的服务端时间求差
         duration: serverElapsedMs(opt.serverTimeOffsetRef, data.gameStartTime),
       });
@@ -335,7 +434,9 @@ export function useBattleStateSync(options: BattleStateSyncOptions): BattleState
     // ---- 局面块（可能因乐观保护被延迟） ----
     const newState = data.gameState ?? undefined;
     if (newState) {
-      const historyLen = newState.moveHistory?.length ?? 0;
+      // 【P4】增量载荷不再带完整 moveHistory（30 步局面实测 2381 B，占载荷 31%），
+      // 着法数统一读顶层 moveCount；全量载荷（welcome/重连/悔棋后）两个来源等价。
+      const historyLen = readMoveCount(data);
       const pendingMove = opt.pendingMoveRef?.current;
       let applyBoard = true;
 
@@ -343,7 +444,7 @@ export function useBattleStateSync(options: BattleStateSyncOptions): BattleState
         if (historyLen >= pendingMove.historyLen) {
           // 服务端已包含本端着法（或更多）→ 解除保护，恢复正常同步
           opt.pendingMoveRef!.current = null;
-        } else if (Date.now() - pendingMove.at < OPTIMISTIC_SYNC_TIMEOUT_MS) {
+        } else if (Date.now() - pendingMove.at < optimisticTimeoutMs(opt.rttMs ?? NO_RTT)) {
           // 仍是走子前的旧局面（上报尚在途）→ 只延迟本帧的局面覆盖，控制信息继续处理
           applyBoard = false;
         } else {
@@ -354,7 +455,12 @@ export function useBattleStateSync(options: BattleStateSyncOptions): BattleState
 
       if (applyBoard) {
         const prevHistoryLen = seenHistoryLenRef.current;
-        opt.setGameState(newState);
+        // 【P4】增量载荷的 gameState 里**完全没有** moveHistory，
+        // 必须与本地已有棋谱合并，否则每帧都会把历史清空（undoInPlace /
+        // recomputeRuleState 这类「按 moveHistory 重放」的逻辑会随之失效）。
+        const mergedState = mergeHistory(newState, historyLen, data.lastMove, prevStateRef.current);
+        prevStateRef.current = mergedState;
+        opt.setGameState(mergedState);
         if (historyLen !== prevHistoryLen) seenHistoryLenRef.current = historyLen;
 
         h?.onBoardApplied?.({
@@ -362,6 +468,8 @@ export function useBattleStateSync(options: BattleStateSyncOptions): BattleState
           historyLen,
           prevHistoryLen,
           isNewMove: historyLen > prevHistoryLen,
+          // 【P4】最新一手直接来自载荷，页面不必再去索引 moveHistory
+          lastMove: data.lastMove ?? null,
         });
       }
     }
@@ -463,6 +571,8 @@ export function useBattleStateSync(options: BattleStateSyncOptions): BattleState
     if (!ref || !pending) return false;
     ref.current = null;
     optionsRef.current.setGameState(pending.snapshot);
+    // 【P4】回滚快照同样携带完整棋谱，本地历史基线要跟着回退
+    prevStateRef.current = pending.snapshot;
     return true;
   }, []);
 
@@ -498,6 +608,8 @@ export function useBattleStateSync(options: BattleStateSyncOptions): BattleState
 
   const resetSyncBaseline = useCallback(() => {
     seenHistoryLenRef.current = 0;
+    // 【P4】重开一局：本地棋谱一并作废，否则会与新局的着法序列串在一起
+    prevStateRef.current = null;
     if (optionsRef.current.pendingMoveRef) optionsRef.current.pendingMoveRef.current = null;
   }, []);
 

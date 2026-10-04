@@ -228,10 +228,11 @@ export default function SpectateScreen() {
           { id: message.id, playerId: message.playerId, emoji: message.emoji, receivedAt: Date.now() },
         ]),
       // 局面已应用：着法数增加 → 触发吃子/将军特效与音效
-      onBoardApplied: ({ state, isNewMove }) => {
+      // 【P4】最新一手直接取自负载（增量载荷不再下发完整 moveHistory）
+      onBoardApplied: ({ state, isNewMove, lastMove }) => {
         if (!isNewMove) return;
-        const last = state.moveHistory[state.moveHistory.length - 1];
-        if (!last) return;
+        if (!lastMove) return;
+        const last = lastMove;
         const ended = phaseRef.current === 'ended';
         triggerMoveEffect(last.capturedPieceId, state.isCheck, ended);
         // 走子音效：将军时播男声将军语音（内置节流），否则吃子/走子音（终局不播）
@@ -495,6 +496,8 @@ export default function SpectateScreen() {
     });
   }
 
+  // 【P4】最近一步与着法数：增量载荷的 gameState 不含 moveHistory，
+  // 但 useBattleStateSync 会把 lastMove 合并进本地棋谱，故这里仍从本地历史读。
   const lastMove = gameState && gameState.moveHistory.length > 0
     ? (() => {
         const m = gameState.moveHistory[gameState.moveHistory.length - 1];

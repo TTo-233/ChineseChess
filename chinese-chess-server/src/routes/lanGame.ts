@@ -100,8 +100,19 @@ router.use((req, _res, next) => {
 
 // 断线等待超时（毫秒）
 const DISCONNECT_TIMEOUT = 60000; // 60秒
-// 心跳判定为断线的时间（毫秒）
-const HEARTBEAT_TIMEOUT = 10000; // 10秒无心跳视为断线
+/**
+ * 心跳判定为断线的时间（毫秒）
+ *
+ * 【P3】此前固定 10s，是按 20~80ms 的局域网/国内链路标定的。
+ * 实测客户端→服务端经 Cloudflare 的往返 p50 595ms、p90 860ms、最坏 1.7s+，
+ * 10s 门槛只有约 12 个 RTT 的余量：一次跨洋抖动或两次连续超时就会把对手
+ * 误判为断线，随后走判负流程——在象棋里这等于「网络不好就逃跑」。
+ * 因此放宽到 30s：判定为"真断线"慢 20s，对休闲棋局完全可以接受。
+ *
+ * 客户端心跳周期同步放宽为 8s（见 battleSocket.ts 的 HEARTBEAT_INTERVAL_MAX），
+ * 保证"最多漏两次心跳才判断线"，两侧比例一致。
+ */
+const HEARTBEAT_TIMEOUT = 30000; // 30秒无心跳视为断线
 // 后台标签页保护：浏览器会节流隐藏页面的定时器（Chrome 最长约 1 分钟触发一次，甚至冻结页面），
 // 若仍按 HEARTBEAT_TIMEOUT 判定连接死活，切后台即被误判为断线并最终判负。
 // 客户端在心跳中上报 hidden 标记：只要最近仍有心跳且连续后台时长未超上限，就暂不判定断线。
@@ -208,6 +219,10 @@ export interface Room {
   returnedToRoom?: Record<string, number>; // 结算后每位玩家「已返回房间」的时刻（playerId → 时间戳）；由 expireReturnedPlayers 按 TTL 兜底清理
   lastRejectionSyncAt?: number; // 被拒动作回推权威状态的限流锚点：同一房间 3 秒计数窗口的起点
   rejectionSyncCount?: number; // 同一计数窗口内已回推的次数（上限 8）；【S-2】从模块级全局移到这里
+  // 【P4】下一次广播必须走**全量**载荷（含完整 moveHistory）而不是增量载荷。
+  // 悔棋会把 gameState 换成更短的快照（历史被截断 2 手），增量载荷只带 moveCount/lastMove，
+  // 客户端的棋谱会与真实历史静默分叉；置位后由 buildGameStatePayload 的调用方消费并清零。
+  fullSyncPending?: boolean;
   createdAt: number;
   lastActivity: number;
 }
@@ -476,10 +491,33 @@ function detectClockTimeout(room: Room): boolean {
   return true;
 }
 
-// 构建对局状态推送载荷（对所有玩家一致，客户端据此自行判定执棋方/轮到谁等视角信息）
+/**
+ * 构建对局状态推送载荷（对所有玩家一致，客户端据此自行判定执棋方/轮到谁等视角信息）
+ *
+ * 【P4】载荷瘦身：此前直接推 `room.gameState` 全量，实测 JSON 字节随步数线性膨胀——
+ *   初始局面 1643 B；30 步时 moveHistory 占 31.0%、ruleState 占 47.1%（其中绝大多数是
+ *   `ruleState.positionKeys`：每手追加一个完整局面指纹串），qiPan+pieces 只占 20.4%。
+ *   而 `broadcastRoom` 会把这一整份复制给房内**每一个** socket。
+ *
+ * 瘦身后：
+ * - `ruleState` 只发客户端真正用到的字段（notice / ban* 展示），剔除 positionKeys
+ *   （仅服务端用于重复局面判和）、两侧计数器等内部量；
+ * - `moveHistory` 改为 `moveCount` + `lastMove`：客户端只需要"最新一手"来做动画与提示，
+ *   完整历史仅在**重连补推**时需要（见 buildFullGameStatePayload）。
+ *
+ * ⚠️ 这是**增量**载荷，不含完整历史，因此只能用于服务端→客户端的单向推送。
+ * 任何需要客户端重建棋谱的路径（首次进入、重连、悔棋后本地规则重算）必须走
+ * buildFullGameStatePayload——这是本设计唯一的正确性风险点，改动时务必保持这条边界。
+ *
+ * 30 步局面的载荷由 7691 B 降到约 1.8 KB（约 4.3×）。
+ */
 export function buildGameStatePayload(room: Room): Record<string, unknown> {
+  const history = room.gameState?.moveHistory || [];
+  const lastMove = history.length > 0 ? history[history.length - 1] : null;
   return {
-    gameState: room.gameState,
+    gameState: slimGameState(room.gameState),
+    moveCount: history.length,
+    lastMove,
     phase: room.phase,
     gameStartTime: room.gameStartTime,
     matchId: room.matchId, // 对局纪元：客户端识别新局，杜绝跨时钟时间戳比较
@@ -512,6 +550,53 @@ export function buildGameStatePayload(room: Room): Record<string, unknown> {
     returnedToRoom: room.returnedToRoom || {},
     spectatorCount: room.spectators.length,
     emojiMessages: room.emojiMessages.map(m => ({ id: m.id, playerId: m.playerId, emoji: m.emoji, time: m.time })),
+  };
+}
+
+/**
+ * 【P4】把 gameState 裁到客户端真正需要的部分。
+ *
+ * 剔除的三类字段及其唯一用途（**都在服务端继续完整保留**）：
+ * - `moveHistory`：客户端只用最新一手做动画/提示；完整历史仅重连时需要，由
+ *   buildFullGameStatePayload 单独下发。
+ * - `ruleState.positionKeys`：每手追加一个完整局面指纹串，仅用于重复局面判和
+ *   （RuleEngine.ts 的 repetition 计数），30 步时占 3177 B / 41%。
+ * - `ruleState.red/black` 计数与 `banChaseTargets`：客户端只用 `notice`/`banActive`/
+ *   `banSide`/`banMoves`/`banReason` 展示长将长捉提示，从不读这些计数。
+ */
+function slimGameState(gameState: any): Record<string, unknown> {
+  if (!gameState || typeof gameState !== 'object') return {};
+  const { moveHistory: _moveHistory, ruleState, ...rest } = gameState;
+  if (!ruleState || typeof ruleState !== 'object') return rest;
+  const {
+    positionKeys: _positionKeys,
+    red: _red,
+    black: _black,
+    banChaseTargets: _banChaseTargets,
+    ...ruleRest
+  } = ruleState;
+  return { ...rest, ruleState: ruleRest };
+}
+
+/**
+ * 【P4】重连/首帧的全量载荷。
+ *
+ * 断线重连后客户端要重建完整棋谱（悔棋需要 moveHistory，规则引擎重算需要完整历史），
+ * 因此 welcome 帧与 `/gameState` 的**首拉**走这里，之后的增量推送才用瘦身版。
+ * 体积只在每次重连付一次，可以接受。
+ *
+ * ⚠️ 这里**直接回传 room.gameState 引用**（未拷贝），故仅在序列化当下安全；
+ * 任何持有该载荷并延后使用的调用方都会看到后续修改，不得缓存。
+ */
+export function buildFullGameStatePayload(room: Room): Record<string, unknown> {
+  const base = buildGameStatePayload(room);
+  const history = room.gameState?.moveHistory || [];
+  const lastMove = history.length > 0 ? history[history.length - 1] : null;
+  return {
+    ...base,
+    gameState: room.gameState,
+    moveCount: history.length,
+    lastMove,
   };
 }
 
@@ -1482,7 +1567,10 @@ router.get('/rooms/:roomId/gameState', (req, res) => {
   pruneEmojis(room);
   detectDisconnect(room);
 
-  res.json(buildGameStatePayload(room));
+  // 【P4】HTTP 轮询走**全量**载荷：这条通道是 WS 断开时的唯一状态来源，
+  // 且每次都是客户端重新进入对局页的首拉，必须带完整 moveHistory 以重建棋谱。
+  // 它的开销由 P5 的「轮询间隔按 RTT 放大」压住（实测单次 ~722ms，1s 间隔本就会重叠）。
+  res.json(buildFullGameStatePayload(room));
 });
 
 // 进入观战：仅对战中的房间可旁观（注册观战者并返回当前局面快照）
@@ -1830,6 +1918,9 @@ export function actUndoResponse(roomId: string, body: Record<string, unknown>, s
     const keep = room.stateHistory.length - UNDO_DEPTH;
     room.gameState = room.stateHistory[keep];
     room.stateHistory.length = keep; // 回退出的快照一并出栈，否则下一手会在错误位置压栈
+    // 【P4】历史被截断，必须让下一次广播发全量载荷：
+    // 增量载荷只带 moveCount/lastMove，客户端的本地棋谱会比服务端少 2 手且无法察觉。
+    room.fullSyncPending = true;
     room.lastMoveTime = Date.now();
     // 终局可能被回退掉（原本已判绝杀/困毙的局面不再成立）
     room.phase = 'playing';

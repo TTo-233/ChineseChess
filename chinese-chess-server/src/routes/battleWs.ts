@@ -3,6 +3,7 @@ import type { Server } from 'http';
 import {
   rooms,
   buildGameStatePayload,
+  buildFullGameStatePayload,
   registerRoomBroadcaster,
   pruneSpectators,
   actReady,
@@ -92,10 +93,17 @@ function rejectHandshake(ws: WebSocket, status: number, message: string): void {
 }
 
 // 向房间内所有活跃连接广播最新对局状态
+// 【P4】JSON 只序列化一次再复用给所有 socket；载荷本身已瘦身（去 moveHistory 全量与
+// ruleState.positionKeys），30 步局面约 1.8 KB，较原先的 7.7 KB 降约 4.3×。
+// room.fullSyncPending（悔棋截断历史后置位）时改发全量载荷，消费后清零。
 function broadcastRoom(room: Room): void {
   const socks = roomSockets.get(room.id);
   if (!socks || socks.size === 0) return;
-  const message = JSON.stringify({ type: 'state', data: buildGameStatePayload(room) });
+  const full = room.fullSyncPending === true;
+  const payload = full ? buildFullGameStatePayload(room) : buildGameStatePayload(room);
+  const message = JSON.stringify({ type: 'state', data: payload });
+  // 【P4】只有真正把全量帧送出去了才清标记：没有连接时留着，下次广播补上
+  if (full && [...socks].some(ws => ws.readyState === WebSocket.OPEN)) room.fullSyncPending = false;
   for (const ws of socks) {
     if (ws.readyState === WebSocket.OPEN) {
       try {
@@ -368,7 +376,9 @@ export function attachBattleWebSocket(server: Server): void {
       room.lastActivity = Date.now();
 
       // 下发初始状态快照，随后广播观众人数变化
-      sendJson(ws, { type: 'welcome', data: buildGameStatePayload(room) });
+      // 【P4】welcome 走**全量**载荷：观战者刚接入，必须拿到完整棋谱与 ruleState
+      //（其本地不重放对局，只靠服务端下发）
+      sendJson(ws, { type: 'welcome', data: buildFullGameStatePayload(room) });
       broadcastRoom(room);
     } else {
       // 玩家连接
@@ -412,7 +422,9 @@ export function attachBattleWebSocket(server: Server): void {
       room.lastActivity = Date.now();
 
       // 下发初始状态快照，随后广播连接状态变化
-      sendJson(ws, { type: 'welcome', data: buildGameStatePayload(room) });
+      // 【P4】welcome 走**全量**载荷：重连方（或首次进入）的客户端本地局面可能已过期，
+      // 必须拿到完整 moveHistory 才能重建棋谱（悔棋/复盘都依赖它）
+      sendJson(ws, { type: 'welcome', data: buildFullGameStatePayload(room) });
       broadcastRoom(room);
     }
 

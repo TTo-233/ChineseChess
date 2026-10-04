@@ -26782,7 +26782,7 @@ router.use((req, _res, next) => {
   next();
 });
 var DISCONNECT_TIMEOUT = 6e4;
-var HEARTBEAT_TIMEOUT = 1e4;
+var HEARTBEAT_TIMEOUT = 3e4;
 var HIDDEN_HEARTBEAT_GRACE = 9e4;
 var HIDDEN_MAX_DURATION = 18e4;
 var HIDDEN_SOCKET_IDLE_TIMEOUT = 9e4;
@@ -26971,8 +26971,12 @@ function detectClockTimeout(room) {
   return true;
 }
 function buildGameStatePayload(room) {
+  const history = room.gameState?.moveHistory || [];
+  const lastMove = history.length > 0 ? history[history.length - 1] : null;
   return {
-    gameState: room.gameState,
+    gameState: slimGameState(room.gameState),
+    moveCount: history.length,
+    lastMove,
     phase: room.phase,
     gameStartTime: room.gameStartTime,
     matchId: room.matchId,
@@ -27008,6 +27012,30 @@ function buildGameStatePayload(room) {
     returnedToRoom: room.returnedToRoom || {},
     spectatorCount: room.spectators.length,
     emojiMessages: room.emojiMessages.map((m) => ({ id: m.id, playerId: m.playerId, emoji: m.emoji, time: m.time }))
+  };
+}
+function slimGameState(gameState) {
+  if (!gameState || typeof gameState !== "object") return {};
+  const { moveHistory: _moveHistory, ruleState, ...rest } = gameState;
+  if (!ruleState || typeof ruleState !== "object") return rest;
+  const {
+    positionKeys: _positionKeys,
+    red: _red,
+    black: _black,
+    banChaseTargets: _banChaseTargets,
+    ...ruleRest
+  } = ruleState;
+  return { ...rest, ruleState: ruleRest };
+}
+function buildFullGameStatePayload(room) {
+  const base = buildGameStatePayload(room);
+  const history = room.gameState?.moveHistory || [];
+  const lastMove = history.length > 0 ? history[history.length - 1] : null;
+  return {
+    ...base,
+    gameState: room.gameState,
+    moveCount: history.length,
+    lastMove
   };
 }
 function transferHost(room) {
@@ -27755,7 +27783,7 @@ router.get("/rooms/:roomId/gameState", (req, res) => {
   pruneSpectators(room);
   pruneEmojis(room);
   detectDisconnect(room);
-  res.json(buildGameStatePayload(room));
+  res.json(buildFullGameStatePayload(room));
 });
 router.post("/rooms/:roomId/spectate", (req, res) => {
   const { roomId } = req.params;
@@ -27998,6 +28026,7 @@ function actUndoResponse(roomId, body, sessionToken) {
     const keep = room.stateHistory.length - UNDO_DEPTH;
     room.gameState = room.stateHistory[keep];
     room.stateHistory.length = keep;
+    room.fullSyncPending = true;
     room.lastMoveTime = Date.now();
     room.phase = "playing";
     room.winner = null;
@@ -28788,7 +28817,10 @@ function rejectHandshake(ws, status, message) {
 function broadcastRoom(room) {
   const socks = roomSockets.get(room.id);
   if (!socks || socks.size === 0) return;
-  const message = JSON.stringify({ type: "state", data: buildGameStatePayload(room) });
+  const full = room.fullSyncPending === true;
+  const payload = full ? buildFullGameStatePayload(room) : buildGameStatePayload(room);
+  const message = JSON.stringify({ type: "state", data: payload });
+  if (full && [...socks].some((ws) => ws.readyState === import_websocket.default.OPEN)) room.fullSyncPending = false;
   for (const ws of socks) {
     if (ws.readyState === import_websocket.default.OPEN) {
       try {
@@ -28999,7 +29031,7 @@ function attachBattleWebSocket(server2) {
         room.spectators.push({ id: spectatorId, name: "\u89C2\u4F17", lastSeen: Date.now() });
       }
       room.lastActivity = Date.now();
-      sendJson(ws, { type: "welcome", data: buildGameStatePayload(room) });
+      sendJson(ws, { type: "welcome", data: buildFullGameStatePayload(room) });
       broadcastRoom(room);
     } else {
       if (!playerId) {
@@ -29028,7 +29060,7 @@ function attachBattleWebSocket(server2) {
       player.hidden = false;
       player.hiddenSince = 0;
       room.lastActivity = Date.now();
-      sendJson(ws, { type: "welcome", data: buildGameStatePayload(room) });
+      sendJson(ws, { type: "welcome", data: buildFullGameStatePayload(room) });
       broadcastRoom(room);
     }
     ws.on("pong", () => {

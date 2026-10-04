@@ -126,6 +126,13 @@ const EMOJI_DISPLAY_MS = 4000;
 // 结算页「返回房间」兜底倒计时（秒）：双方互不干扰意味着都可能不点按钮，
 // 到点后本端自动回房间准备界面，避免结算页无限期停留
 const RETURN_ROOM_FALLBACK_SECONDS = 10;
+/**
+ * 【P5】没有实测 RTT 可用时的标定基数（毫秒）。
+ *
+ * 兜底轮询只在 WebSocket 断开时启用，此时 BattleSocket 拿不到 RTT 采样，
+ * 用实测值（串行 6 次 /gameState 共 4332ms → 每次约 722ms）取整为 800ms。
+ */
+const FALLBACK_RTT_MS = 800;
 
 // 当前正在展示的活跃表情（本地按首次接收时间计时，超时自动移除）
 interface ActiveEmoji {
@@ -857,6 +864,8 @@ export default function LanBattleScreen() {
     rematchFollowedFallback: () => returnFallbackFiredRef.current,
     serverTimeOffsetRef,
     lastMoveTimeRef,
+    // 【P5】把实测 RTT 交给同步 Hook，乐观保护窗口按线路标定而非写死 8 秒
+    rttMs: () => battleSocketRef.current?.rttMs || FALLBACK_RTT_MS,
     turnTimeLimitRef,
     byoyomiRef: roomByoyomiRef,
     clockSnapRef,
@@ -883,17 +892,17 @@ export default function LanBattleScreen() {
     setDisconnectCountdown,
     handlers: {
       // 局面已应用（未被乐观保护延迟）：同步最近一步光环、对手走棋特效与音效
-      onBoardApplied: ({ state, historyLen, prevHistoryLen }) => {
+      onBoardApplied: ({ state, historyLen, prevHistoryLen, lastMove }) => {
         // 最近一步光环：以服务端着法序列为准，仅在着法数变化时更新，避免无效重渲染
+        // 【P4】lastMove 由负载直接给出（增量载荷不再下发完整 moveHistory）
         if (historyLen !== prevHistoryLen) {
-          const lastRecord = historyLen > 0 ? state.moveHistory[historyLen - 1] : null;
           setLastMove(
-            lastRecord
+            lastMove
               ? {
-                  fromCol: lastRecord.fromCol,
-                  fromRow: lastRecord.fromRow,
-                  toCol: lastRecord.toCol,
-                  toRow: lastRecord.toRow,
+                  fromCol: lastMove.fromCol,
+                  fromRow: lastMove.fromRow,
+                  toCol: lastMove.toCol,
+                  toRow: lastMove.toRow,
                 }
               : null
           );
@@ -901,7 +910,8 @@ export default function LanBattleScreen() {
         // 对手走棋检测：着法数增加且最后一步是对方的棋子 → 触发吃子/将军特效
         // （自己走棋已在本地 handleMove 触发；悔棋使着法数减少，不满足条件）
         if (historyLen <= prevHistoryLen) return;
-        const last = state.moveHistory[historyLen - 1];
+        if (!lastMove) return;
+        const last = lastMove;
         const mySideTag = sideStringToTag(mySideRef.current);
         // pieceId 16-31 为红方、0-15 为黑方；与本方阵营不同即对手所走
         const isOpponentMove = mySideTag ? last.pieceId < 16 : last.pieceId >= 16;
@@ -1044,6 +1054,11 @@ export default function LanBattleScreen() {
       // 协议级失败（「观战者无法执行该操作」「未知消息类型」等）：此前被静默丢弃，
       // 表现为「点了没反应」。服务端文案本身就是面向用户的，直接透出。
       onError: message => showNotice(message),
+      // 【P5】被丢弃的动作帧数（连接重建时会补发队列；若整条队列都被挤出，
+      // 说明离线时间很长，此时提示用户而不是让着法静默消失）
+      onFramesDropped: count => {
+        showNotice(`${count} 条操作未能送达`, '连接刚刚恢复，最新的一手可能需要重走', 4000);
+      },
       // WS 建连时传入凭证读取器（【S-1 / §3.1】）：connect() 每次重连都重读，
       // 因此凭证刷新后无需重建 BattleSocket 也能带上新 token。
     }, 'player', () => sessionTokenRef.current || null);
@@ -1087,7 +1102,17 @@ export default function LanBattleScreen() {
     };
 
     poll();
-    pollRef.current = setInterval(poll, 1000);
+
+    // 【P5】轮询周期按实测 RTT 标定，而不是写死 1 秒。
+    //
+    // 原先固定 1000ms：实测本站线路一次 /gameState 往返约 722ms（串行 6 次总耗时 4332ms），
+    // 于是**每一轮定时器触发时上一次请求都还在路上**，pollInFlightRef 只能丢掉一半的轮询，
+    // 剩下的又因为周期短于 RTT 而永远追不上——纯粹是把带宽喂给隧道。
+    //
+    // 改为 max(2000, RTT×3)：既保证轮询之间不重叠（不再浪费一半请求），
+    // 又保持兜底通道的可见延迟在几秒内（它只是 WS 断线时的保底，不是主通道）。
+    const interval = Math.max(2000, Math.round((battleSocketRef.current?.rttMs || FALLBACK_RTT_MS) * 3));
+    pollRef.current = setInterval(poll, interval);
     return () => {
       if (pollRef.current) clearInterval(pollRef.current);
     };
@@ -1908,6 +1933,10 @@ export default function LanBattleScreen() {
     await sendBattleAction('surrender', {});
   };
 
+  // 【P5】服务端已走手数：增量载荷不再下发完整 moveHistory（见 buildGameStatePayload）。
+  // 悔棋入口的「不足 2 手不可悔」等判断改读这里。
+  const moveCount = gameState.moveHistory?.length ?? 0;
+
   // 悔棋（需对方同意）
   //
   // 【S-2】改造前本函数在本地 undoMove 两步后把「目标局面」随请求提交给服务端，
@@ -1916,7 +1945,7 @@ export default function LanBattleScreen() {
   // 走子前快照栈（stateHistory），对方同意时从自己的快照回退 2 步，客户端不再上传局面。
   // 本地仍保留同样的 2 步守卫，让"不足 2 手时不可悔棋"的规则在两端一致且即时反馈。
   const handleUndo = async () => {
-    if (!isMyTurn || gameState.moveHistory.length < 2 || undoPendingRef.current) return;
+    if (!isMyTurn || moveCount < 2 || undoPendingRef.current) return;
     if (undoBlockedRef.current) {
       showNotice('对方已连续拒绝 2 次，本局不能再发起悔棋');
       return;
@@ -1924,6 +1953,8 @@ export default function LanBattleScreen() {
 
     // 悔棋 = 回退对方一步 + 回退我方一步，回到我方走棋前。
     // 这里只用于守卫（不足两步不可悔棋），不再把结果发给服务端。
+    // 前提：本地 moveHistory 必须是**完整**的——undoMove 末尾会 recomputeRuleState
+    // 全量重放；增量载荷下由 useBattleStateSync 的 mergeHistory 负责补齐。
     const afterOpponent = undoMove(gameState);
     if (!afterOpponent || !undoMove(afterOpponent)) return;
 
@@ -2629,9 +2660,9 @@ export default function LanBattleScreen() {
               {phase === 'playing' && !jueShaVisible && (
                 <>
                   <TouchableOpacity
-                    style={[styles.actionButton, (!isMyTurn || gameState.moveHistory.length < 2 || undoPending || undoBlocked) && styles.actionButtonDisabled]}
+                    style={[styles.actionButton, (!isMyTurn || moveCount < 2 || undoPending || undoBlocked) && styles.actionButtonDisabled]}
                     onPress={handleUndo}
-                    disabled={!isMyTurn || gameState.moveHistory.length < 2 || undoPending || undoBlocked}
+                    disabled={!isMyTurn || moveCount < 2 || undoPending || undoBlocked}
                   >
                     <FontAwesome6 name="rotate-left" size={16} color={COLORS.textPrimary} />
                     <Text style={styles.actionButtonText}>

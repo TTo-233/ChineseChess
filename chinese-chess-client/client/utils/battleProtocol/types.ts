@@ -13,11 +13,13 @@
  * 与服务端源码的对应关系（【I-1】原先这里写的是 `dist/index.js` 的行号并自称
  * "dist 无源码，行号即真源"，但服务端源码早已在 `src/`，且 dist 每次构建内容都会变，
  * 行号既拿不到可编辑的源、也会过期）：
- * - 负载构造：buildGameStatePayload（`chinese-chess-server/src/routes/lanGame.ts:395`）
- * - 帧分发：handleMessage（`chinese-chess-server/src/routes/battleWs.ts:194`）
+ * - 增量载荷构造：buildGameStatePayload（`chinese-chess-server/src/routes/lanGame.ts:480`）
+ * - 全量载荷构造：buildFullGameStatePayload（welcome / HTTP /gameState / 悔棋后补推走这条）
+ * - 帧分发：handleMessage（`chinese-chess-server/src/routes/battleWs.ts:211`）
  */
 
 import type { GameState } from '@/utils/chess/GameEngine';
+import type { MoveRecord } from '@/utils/chess/types';
 
 /** 对局阶段（服务端 room.phase；'reveal' 为客户端本地展示态） */
 export type BattlePhase = 'waiting' | 'reveal' | 'playing' | 'ended';
@@ -113,6 +115,20 @@ export interface BattleClocks {
 export interface GameStatePayload {
   // ---- 局面与阶段 ----
   gameState?: GameState | null;
+  /**
+   * 【P4】服务端已走手数。
+   *
+   * 增量载荷不再下发完整 `gameState.moveHistory`（30 步局面实测 2381 B，占载荷 31%），
+   * 改由本字段 + `lastMove` 承载「走了多少手」与「最新一手」。
+   * 任何需要完整棋谱的路径（首次进入 / 重连 / 悔棋后）仍会下发含 moveHistory 的全量载荷，
+   * 此时 `gameState.moveHistory` 可用——但**不要依赖它**，统一读本字段。
+   */
+  moveCount?: number;
+  /**
+   * 【P4】最新一手着法（增量载荷的唯一着法来源；无着法时为 null）。
+   * 走子动画、着子音效、最后一步高亮都只用到这一条记录。
+   */
+  lastMove?: MoveRecord | null;
   phase?: BattlePhase | string;
   gameStartTime?: number | null;
   /** 对局纪元：重赛后自增，客户端据此拒绝「上一局的旧快照」把本端拉回对局中 */
