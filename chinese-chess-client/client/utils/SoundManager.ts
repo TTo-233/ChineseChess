@@ -62,12 +62,12 @@
  *
  * 四、本版（v3）的两个手段
  * ---------------------------------------------------------------------------
- * 1) 静音预热（治本，针对第二节）：每条音效在**真正播放之前**先做一整遍
- *    「音量 0 的完整播放」，把这条音轨的"首次入混"消耗在无声状态；此后用户
+ * 1) 静音预热（治本，针对第二节）：每条音效在**真正播放之前**先做一次
+ *    「音量 0 的起播探测」，把这条音轨的"首次入混"消耗在无声状态；此后用户
  *    听到的那一遍是这条音轨的第二次入混——实测第二次从未失败。
- *    音量 0 播放不会出声（原生 `getVolumeForDuckAndFocus` 直接给 0f），
- *    走完一整遍会收到 `didJustFinish` push 回调，据此判定这条音轨是否真的
- *    被混音器拉起来；没走完就重建播放器再预热（最多 3 次）。
+ *    音量 0 播放不会出声（原生 `getVolumeForDuckAndFocus` 直接给 0f）。
+ *    **【C-82】此处只探测"播放头是否推进"（≤560ms），不等整段播完**——
+ *    早期版本等整段播完，那正是"第一步音效慢一拍"的直接原因，见第六节。
  * 2) 进度自检（兜底，针对任何残余的卡死）：`positionMillis` 是原生真实播放头
  *    位置（`getExtraStatusFields` 直接取 `mSimpleExoPlayer.getCurrentPosition()`），
  *    卡死的音轨永远推不动。起播 260ms 后至少推进 20ms 才算出声，否则原地
@@ -89,7 +89,29 @@
  * F. 进入棋盘后的下滑手势 / 等待时长：8 次冷启动的 2×2 对照（有无下滑 × 800ms
  *    /3000ms）里 7 次有声，与这两个变量无关。
  *
- * 六、复测标准（重建 APK 后）
+ * 六、【C-82】"第一步音效慢一拍"（2026-10 实机）：不是混音竞态，是预热阻塞
+ * ---------------------------------------------------------------------------
+ * 现象：退出重进人机对战，我方先手第一步的走子音**总是**慢半拍；不退出、
+ * 局内重开则正常。
+ *
+ * 这不是第二节那个随机竞态（那个表现为"约 9% 无声"），而是一个**确定性阻塞**：
+ * `preloadSounds()` 在进入对局时就为四条常用音轨各起一次预热，而旧实现的预热
+ * 要**听完整个素材**才结束（go.mp3 470ms，最坏 470+800=1270ms）。玩家完全
+ * 可能在预热还在跑的时候走出第一步，于是 `playSound()` 里
+ * `await prepareSound('go')` 等的就是**那同一个尚未完成的预热 Promise**，
+ * 第一步音效要等 1 秒多才响——听起来正是"慢一拍"。
+ *
+ * "退出重进必现、局内重开不复现"是这个解释的推论：局内重开走 `useNewGame`
+ * 的纯状态重置，组件不卸载、`unloadAllSounds()` 不执行，预热早已跑完；
+ * 退出再进入则重新挂载，把整套预热从头再来一遍。
+ *
+ * 两条修法（在同一文件内，互为前提）：
+ *   a) 预热不再等整段播完，只探测播放头是否推进（≤560ms）——首次入混只需要
+ *      "被拉起来"这一刻，不需要听完；
+ *   b) `playSound` 不再无上限地等在途预热：只给 260ms 窗口，超时则让预热
+ *      **中止**、把音轨完整交给正式播放（串行让位，不是两者抢同一个播放头）。
+ *
+ * 七、复测标准（重建 APK 后）
  * ---------------------------------------------------------------------------
  * 用 `.dsh-work/reps3.ps1` + `an3.py` 统计：成功 = 没有任何一次播放出现
  * `AT::remove ... A 0x008 / G db=-inf / FrmRdy 不变 / Flushed>0`，且每次播放
@@ -126,8 +148,17 @@ const SOUND_VOLUME = 1.0;
 // 因此这一遍只走音轨入混流程，不会出声。
 const WARMUP_VOLUME = 0.0;
 
-// 预热等待余量：素材时长 + 该余量后仍未收到 didJustFinish，判为这条音轨没被拉起来。
-const WARMUP_SLACK_MS = 800;
+// 预热探测的等待上限。预热不再等整段播完，只等「播放头真的推进」这一下——
+// 这才是"首次入混已消耗"的充分判据（见文件头注释四、1 修订）。
+// 必须大于真机实测的 AudioTrack 起播抖动（线程写延迟 ave≈208ms）。
+const WARMUP_PROBE_DEADLINE_MS = 560;
+
+// 预热探测轮询间隔
+const WARMUP_POLL_MS = 40;
+
+// 首步音效最多为「后台预热」等待多久（毫秒）。超时则不再等，改用已加载的对象
+// 直接出声——播放头自检与重发仍然兜底，绝不能让界面等完整个预热。
+const FIRST_PLAY_MAX_WAIT_MS = 260;
 
 // 预热失败后重建播放器再预热的最大次数。
 const WARMUP_MAX_ATTEMPTS = 3;
@@ -225,6 +256,8 @@ async function getOrLoadSound(name: string): Promise<Audio.Sound | null> {
  */
 async function discardSound(name: string): Promise<void> {
   prepareCache.delete(name);
+  // 预热任务一并作废：正在跑的预热不该再往这个名字上登记后续任务
+  warmupTasks.delete(name);
   warmedNames.delete(name);
   const sound = soundCache.get(name);
   if (!sound) return;
@@ -248,26 +281,32 @@ async function readPosition(sound: Audio.Sound): Promise<number> {
 }
 
 /**
- * 静音预热：让这条 AudioTrack 在音量 0 下完整播一遍。
+ * 静音预热：让这条 AudioTrack 起来一下，把「首次入混」消耗在无声状态。
  *
  * 这是本版的核心修复（见文件头注释四、1）：真机实测"一条 AudioTrack 的首次
  * 入混"有约 9% 的概率被吞掉（音轨不消费任何数据、整段被 Flushed、HAL 无输出），
  * 而同一条音轨的第二次入混从未失败。所以把首次入混消耗在这里。
  *
- * 返回 true = 整段播完（收到 didJustFinish push 回调），说明音轨确实入了混。
+ * 【C-82】2026-10 实机回归：**只等播放头推进，不再等整段播完**。
+ * 原实现等到 didJustFinish（或播放头走到末尾），也就是必须听完整个素材
+ * （go.mp3 470ms、最坏 470+800=1270ms）。而 preloadSounds() 在进入对局时
+ * 就为四条常用音轨各起一次预热，玩家完全可能在预热还在跑的时候走出第一步，
+ * 于是 playSound() 只能 await 那同一个未完成的预热 Promise——第一步音效
+ * 就要等 1 秒多才响，正是用户报的"慢一拍"。退出重进必现、局内重开不复现，
+ * 也正好对上：局内重开不卸载组件、不重跑预热，预热早已完成。
+ *
+ * 现在改为：起播后只探测播放头是否推进（WARMUP_PROBE_DEADLINE_MS 内），
+ * 推进即判定"这条音轨确实入了混"，随即复位收尾。探测失败才重建播放器。
+ * 首次入混只需要"被拉起来"这一刻，并不需要听完整段。
+ *
+ * 返回 true = 这条音轨确实入了混。
  */
-async function warmUpTrack(name: string, sound: Audio.Sound): Promise<boolean> {
-  let finished = false;
-  const onStatus = (status: AVPlaybackStatus) => {
-    if (status.isLoaded && status.didJustFinish) finished = true;
-  };
-  sound.setOnPlaybackStatusUpdate(onStatus);
+async function warmUpTrack(
+  name: string,
+  sound: Audio.Sound,
+  isAborted: () => boolean
+): Promise<boolean> {
   try {
-    let durationMs = 0;
-    const status = await sound.getStatusAsync();
-    if (status.isLoaded && typeof status.durationMillis === 'number') {
-      durationMs = status.durationMillis;
-    }
     // 起播：与正式播放同样的三步（复位 → 回开头 → 起播），确保预热本身
     // 走的就是正式播放的路径，而不是另一条容易出问题的路径。
     await sound.pauseAsync();
@@ -275,33 +314,44 @@ async function warmUpTrack(name: string, sound: Audio.Sound): Promise<boolean> {
     await sound.setVolumeAsync(WARMUP_VOLUME);
     await sound.playAsync();
 
-    const deadline = Date.now() + Math.max(durationMs, 200) + WARMUP_SLACK_MS;
-    while (!finished && Date.now() < deadline) {
-      await sleep(50);
-      // 双保险：didJustFinish 之外，播放头走到素材末尾同样说明这一遍真的播完了
-      // （didJustFinish 只走 push 回调，pull 的 getStatusAsync 里永远没有这个字段）
-      if (!finished && durationMs > 0) {
-        const position = await readPosition(sound);
-        if (position >= durationMs - PROGRESS_MIN_ADVANCE_MS) finished = true;
-      }
+    // 探测播放头：只要它动过，就证明混音器真的在消费这条音轨的样本。
+    // 不设回调——didJustFinish 只走 push 回调，且此处要的本来不是"播完"而是"入混"。
+    const deadline = Date.now() + WARMUP_PROBE_DEADLINE_MS;
+    while (Date.now() < deadline) {
+      await sleep(WARMUP_POLL_MS);
+      // 每轮检查一次是否被正式播放放弃，最迟一个轮询周期就让出这条音轨
+      if (isAborted()) return false;
+      if (await readPosition(sound) > 0) return true;
     }
+    return false;
   } catch (e) {
     console.warn(`[SoundManager] 音效 '${name}' 静音预热异常:`, e);
+    return false;
   } finally {
-    sound.setOnPlaybackStatusUpdate(null);
     try {
-      await sound.pauseAsync();
-      await sound.setPositionAsync(0);
+      // 预热期间音量是 0，必须恢复，否则之后的正式播放会一直静音。
       await sound.setVolumeAsync(SOUND_VOLUME);
+      // 被放弃时不暂停/回卷：正式播放紧接着就自己做 pause → setPosition(0) → play，
+      // 这里再补一刀只会把刚起播的那一遍掐掉。
+      if (!isAborted()) {
+        await sound.pauseAsync();
+        await sound.setPositionAsync(0);
+      }
     } catch (e) {
       console.warn(`[SoundManager] 音效 '${name}' 预热后复位失败:`, e);
     }
   }
-  if (!finished) {
-    console.warn(`[SoundManager] 音效 '${name}' 静音预热未播完，判定这条音轨未被拉起`);
-  }
-  return finished;
 }
+
+// 正在进行的预热任务（音效名 → 任务）。用于让正式播放能中途"接管"一条音轨。
+type WarmupTask = {
+  promise: Promise<Audio.Sound | null>;
+  /** 正式播放放弃这次预热：预热循环尽快退出，且不再复位这条音轨 */
+  abort: () => void;
+  /** 是否已被放弃 */
+  aborted: () => boolean;
+};
+const warmupTasks = new Map<string, WarmupTask>();
 
 /**
  * 加载 + 静音预热。同名调用共用同一个 Promise，避免重复预热同一条音轨。
@@ -313,14 +363,20 @@ function prepareSound(name: string): Promise<Audio.Sound | null> {
   const running = prepareCache.get(name);
   if (running) return running;
 
+  let aborted = false;
   const task = (async () => {
     for (let attempt = 1; attempt <= WARMUP_MAX_ATTEMPTS; attempt++) {
       const sound = await getOrLoadSound(name);
       if (!sound) return null;
-      if (await warmUpTrack(name, sound)) {
+      // 【C-82】预热期间正式播放随时可能来接管这条音轨，等 getOrLoadSound 的
+      // 间隙里也要先看一眼：已经有人在用了就别再抢占。
+      if (aborted) return sound;
+      if (await warmUpTrack(name, sound, () => aborted)) {
         warmedNames.add(name);
         return sound;
       }
+      // 预热被正式播放接管时，这条音轨马上要被拿去出声，重建毫无意义（还会打断它）
+      if (aborted) return sound;
       console.warn(
         `[SoundManager] 音效 '${name}' 第 ${attempt}/${WARMUP_MAX_ATTEMPTS} 次静音预热未成功，重建播放器`
       );
@@ -330,6 +386,13 @@ function prepareSound(name: string): Promise<Audio.Sound | null> {
   })();
 
   prepareCache.set(name, task);
+  warmupTasks.set(name, {
+    promise: task,
+    abort: () => {
+      aborted = true;
+    },
+    aborted: () => aborted,
+  });
   return task;
 }
 
@@ -437,6 +500,59 @@ async function ensureAudibleVolume(
   }
 }
 
+/**
+ * 取得可立即出声的对象，尽量不等「后台预热」。
+ *
+ * 【C-82】预热在进入对局时就已在后台跑。若此刻预热还没结束，等待它等于让
+ * 第一步音效等完整个预热（最坏 1.27s），这正是用户报的"慢一拍"。因此这里
+ * 只给一个很短的等待窗口（FIRST_PLAY_MAX_WAIT_MS）：预热恰好在这段窗口内
+ * 结束就等它（免费），否则**让预热中止**、直接把已加载的对象交给正式播放。
+ *
+ * 为什么是"中止后交接"而不是"并行各玩各的"：同一条 Audio.Sound 只能有一个播放头。
+ * 并行跑的话，预热的收尾（pause + setPosition(0)）会把正式播放刚起播的那一遍掐掉，
+ * 表现为"又不出声"；更隐蔽的是**音量**：预热期间音量是 0，收尾才恢复，若不等它
+ * 收尾就起播，那一遍会**静音地播完**。
+ *
+ * 所以交接必须是有序的：先让预热退出循环，再等它把收尾做完（只是恢复音量，
+ * 不再动播放头），然后才把这条音轨交给正式播放。预热退出循环最多等一个轮询周期
+ * （WARMUP_POLL_MS=40ms），交接的代价远小于整段素材（go.mp3 470ms）。
+ *
+ * 放弃预热只意味着"这条音轨的首次入混没被成功预消费掉"——正式播放这一次会
+ * 自己承担首次入混，失败概率约 9%，由 playAndVerify 的播放头自检 + 重发兜底。
+ * 换来的是：第一步音效最多等 FIRST_PLAY_MAX_WAIT_MS + 一个轮询周期，
+ * 而不是等完整素材。
+ */
+async function getPlayableSound(name: string): Promise<Audio.Sound | null> {
+  const inFlight = warmupTasks.get(name);
+  // 没有在途预热（已预热完 / 从未预热）：直接要对象，必要时同步补一次预热。
+  if (!inFlight) return prepareSound(name);
+
+  // 已在加载中（对象还没建出来）：此时中止也没有对象可用，只能等，否则这遍必然无声。
+  if (!soundCache.has(name)) return inFlight.promise;
+
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const giveUp = new Promise<null>((resolve) => {
+    timer = setTimeout(() => resolve(null), FIRST_PLAY_MAX_WAIT_MS);
+  });
+  let prepared: Audio.Sound | null = null;
+  try {
+    prepared = await Promise.race([inFlight.promise, giveUp]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+  // 预热在这段窗口内正好结束：直接用它，无需任何让步
+  if (prepared) return prepared;
+
+  // ① 让预热中止：循环在下一个轮询周期退出，收尾只恢复音量、不再动播放头。
+  warmupTasks.delete(name);
+  inFlight.abort();
+  // ② 等它收尾做完（≤WARMUP_POLL_MS）——音量必须已经恢复，否则正式播放是静音的。
+  const handedOver = await inFlight.promise;
+  if (handedOver) return handedOver;
+  // ③ 预热期间对象被丢弃/重建了：退回到等待新的预热，此时无别的办法。
+  return prepareSound(name);
+}
+
 export async function playSound(name: string): Promise<void> {
   try {
     await ensureAudioMode();
@@ -446,8 +562,8 @@ export async function playSound(name: string): Promise<void> {
         // 对局已切换/退出：丢弃过期播放请求
         if (sessionId !== soundSessionId) return;
 
-        // 已预热过则立即返回同一个对象；未预热完则等它（预热是"首次入混"的保险）
-        const sound = await prepareSound(name);
+        // 尽量不等在途预热（【C-82】）；已预热完则立即返回同一个对象
+        const sound = await getPlayableSound(name);
         if (!sound) return;
 
         if (await playAndVerify(sound, name)) return;
@@ -508,6 +624,7 @@ export async function unloadAllSounds(): Promise<void> {
   soundCache.clear();
   prepareCache.clear();
   warmedNames.clear();
+  warmupTasks.clear();
   playQueues.clear();
   await Promise.all(promises);
 }
