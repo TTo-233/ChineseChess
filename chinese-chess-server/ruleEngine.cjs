@@ -831,7 +831,6 @@ function evaluateRuleAfterMove(beforeState, afterState, move) {
       hitSide = opponentSide;
     }
   }
-  const banName = (reason) => reason === "LONG_CHECK" ? "\u957F\u5C06" : reason === "LONG_CHASE" ? "\u957F\u6349" : "\u5C06\u6349\u4EA4\u66FF";
   if (hit) {
     rs.banActive = true;
     rs.banSide = hitSide;
@@ -874,18 +873,6 @@ function evaluateRuleAfterMove(beforeState, afterState, move) {
       if (seen === RULE_CONFIG.repetitionDraw - 2) {
         return { text: `\u672C\u5C40\u9762\u5DF2\u51FA\u73B0 ${seen + 1} \u6B21\uFF0C\u4E0B\u7740\u91CD\u590D\u5C06\u5224\u548C`, key: `rep-${seen + 1}` };
       }
-    }
-    const checkLimit = longCheckLimit(c.jiangPieceIds.length);
-    if (c.jiangCount >= checkLimit - 1 && c.jiangCount < checkLimit) {
-      return { text: `${banName("LONG_CHECK")}\u5DF2 ${c.jiangCount} \u7740\uFF0C\u4E0B\u7740\u5C06\u8D85\u9650\uFF0C\u8BF7\u5C3D\u5FEB\u53D8\u62DB`, key: `jiang-${c.jiangCount}` };
-    }
-    const zhuoMax = maxZhuoCount(c);
-    if (zhuoMax >= RULE_CONFIG.longChase - 1 && zhuoMax < RULE_CONFIG.longChase) {
-      return { text: `${banName("LONG_CHASE")}\u5DF2 ${zhuoMax} \u7740\uFF0C\u4E0B\u7740\u5C06\u8D85\u9650\uFF0C\u8BF7\u5C3D\u5FEB\u53D8\u62DB`, key: `zhuo-${zhuoMax}` };
-    }
-    const jzLimit = checkChaseLimit(c.jiangZhuoPieceIds.length);
-    if (c.jiangZhuoLoop >= jzLimit - 1 && c.jiangZhuoLoop < jzLimit) {
-      return { text: `${banName("CHECK_CHASE")}\u5DF2 ${c.jiangZhuoLoop} \u7740\uFF0C\u4E0B\u7740\u5C06\u8D85\u9650\uFF0C\u8BF7\u5C3D\u5FEB\u53D8\u62DB`, key: `jz-${c.jiangZhuoLoop}` };
     }
     return null;
   };

@@ -522,9 +522,9 @@ export default function LanBattleScreen() {
   // 现统一改为覆盖在棋盘上的 GameNotice（3s 自动淡出，不阻塞落子）。
   const [notice, setNotice] = useState<GameNoticeItem | null>(null);
   // key 由文案决定而非自增序号（【提示口径 2026-10】）：GameNotice 只在 key 变化时
-  // 重新计时，自增序号会把「每走一步都触发的规则预警」当成新提示反复重播，提示条
-  // 因此常驻刷屏。规则预警的文案自带累计数字（如「长将已 5 着…」），同类预警在
-  // 走子方交替时内容不变，于是整个过程只响一次。
+  // 重新计时，自增序号会把「每走一步都触发的提示」当成新提示反复重播，提示条
+  // 因此常驻刷屏。规则一的判和预警文案自带累计数字（如「已 119 步无吃子…」），
+  // 同类预警在走子方交替时内容不变，于是整个过程只响一次。
   // 同文案仍会重新出现的情形：上一条已淡出（notice 变 null），用户可能已经错过。
   const showNotice = useCallback((text: string, detail?: string, duration?: number) => {
     setNotice((prev) =>
@@ -1642,7 +1642,7 @@ export default function LanBattleScreen() {
       toRow,
     });
 
-    // 规则提示（接近阈值"请尽快变招"等，方案 10.3 / 12）
+    // 规则提示（规则一判和类的到点前一步预警，如「下着将满 120 步判和」）
     if (result.newState.ruleState?.notice) {
       showNotice(result.newState.ruleState.notice);
     }

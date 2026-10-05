@@ -730,7 +730,9 @@ describe('补充：超限不判负但禁着', () => {
       .toContain(lastReason);
   });
 
-  test('倒数第 2 着（长将第 5 着）给出「下着将超限，请尽快变招」提示', () => {
+  test('长将第 5 着（阈值前一步）不再出提示：规则二只保留禁着拦截提示', () => {
+    // 2026-10 口径：规则二取消「阈值前一步」预警，只保留点禁着时的拦截提示。
+    // 下方紧接的「规则二禁着拦截」用例仍断言第 6 将后第 7 手被禁、提示正确。
     // 黑将(4,0) 红车(3,3) 红帅(3,9)：车在 3/4 列交替将军 5 次
     let s = fen(LONG_CHECK_FEN);
     const seq: Array<[number, number, number]> = [
@@ -748,9 +750,9 @@ describe('补充：超限不判负但禁着', () => {
     const rs = s.ruleState!;
     expect(rs.red.jiangCount).toBe(5);
     expect(rs.banActive).toBe(false);   // 第 5 将尚未超限
-    expect(rs.notice).toBe('长将已 5 着，下着将超限，请尽快变招');
-    expect(rs.noticeKey).toBe('jiang-5');   // key 不含方别：红黑交替时不重播
-    // 提示只是预警文案：此刻尚未超限，红点为空，落子不受限
+    // 规则二不预警：notice/noticeKey 均不产生
+    expect(rs.notice).toBeNull();
+    expect(rs.noticeKey).toBeNull();
     expect(rs.banMoves).toEqual([]);
     // 第 6 将（下着）照常能走：车 (4,3)→(5,3) 仍会被将军，但**尚未超限**故不禁
     const next = play(s, 0, 5, 0);
@@ -767,7 +769,7 @@ describe('补充：超限不判负但禁着', () => {
     expect(getMoveBanReason(next2, 23, 4, 3)).toBe('LONG_CHECK');
   });
 
-  test('长捉倒数第 2 着（第 5 捉）同样提示下着将超限', () => {
+  test('长捉第 5 捉（阈值前一步）同样不再提示', () => {
     // 黑将(5,2) 黑炮(4,0) 红车(4,4) 红帅(3,9)：车在 3/4 列交替追捉无根炮
     let s = fen('4c4/9/5k3/9/4R4/9/9/9/9/3K5 w');
     const seq: Array<[number, number, number]> = [
@@ -781,8 +783,8 @@ describe('补充：超限不判负但禁着', () => {
     const rs = s.ruleState!;
     expect(rs.red.zhuoCounts['9']).toBe(5);
     expect(rs.banActive).toBe(false);
-    expect(rs.notice).toBe('长捉已 5 着，下着将超限，请尽快变招');
-    expect(rs.noticeKey).toBe('zhuo-5');     // key 不含方别：红黑交替时不重播
+    expect(rs.notice).toBeNull();            // 规则二不预警
+    expect(rs.noticeKey).toBeNull();
     expect(rs.banMoves).toEqual([]);
     // 第 6 捉（下着）照常能走：此刻尚未超限，继续追捉的车 (4,3)→(3,3) 合法可走
     const next = play(s, 9, 3, 0);
@@ -793,11 +795,13 @@ describe('补充：超限不判负但禁着', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 提示口径 2026-10：只在「阈值前一次」提示，绝不每步重播
+// 提示口径 2026-10：
+// - 规则一（判和类）：保留「阈值前一次」一次性提示；
+// - 规则二（强制变招）：**取消**阈值前一步预警，只保留点禁着时的拦截提示。
 // ---------------------------------------------------------------------------
 
-describe('提示收敛：阈值前一步一次性提示', () => {
-  test('超限后不再出提示条（超限期间 notice 恒为 null）', () => {
+describe('提示收敛：判和类预警保留，规则二不预警', () => {
+  test('长将第 5 着（阈值前一步）不产生任何 notice，超限后也恒为 null', () => {
     let s = fen(LONG_CHECK_FEN);
     // 连将到第 6 着（跨过阈值 → banActive）并让黑方应着，此后一直超限。
     // 注意：banMoves 是在「行棋方轮到被禁的那一方」时才枚举得到，所以
@@ -807,9 +811,9 @@ describe('提示收敛：阈值前一步一次性提示', () => {
       [23, 5, 3], [0, 4, 0],
       [23, 4, 3], [0, 5, 0],
       [23, 5, 3], [0, 4, 0],
-      [23, 4, 3],   // 将5 → 预警
+      [23, 4, 3],   // 将5 → 规则二不预警，notice 应为空
       [0, 5, 0],
-      [23, 5, 3],   // 将6 → 超限，notice 应清空
+      [23, 5, 3],   // 将6 → 超限，notice 仍应为空
       [0, 4, 0],    // 黑应着 → 回到红方行棋
       [23, 4, 3],   // 将7 → 超限期间继续走，notice 仍应为空
     ];
@@ -820,17 +824,16 @@ describe('提示收敛：阈值前一步一次性提示', () => {
       keys.push(s.ruleState?.noticeKey ?? null);
       banCounts.push(s.ruleState?.banMoves.length ?? 0);
     }
-    expect(keys[8]).toBe('jiang-5');               // 第 5 将预警一次
+    // 第 5 将那一步也不再预警：整段长将过程 noticeKey 全为 null
+    expect(keys[8]).toBeNull();
     expect(s.ruleState!.banActive).toBe(true);       // 第 6 将起超限
     expect(banCounts[11]).toBeGreaterThan(0);        // 黑应着后回到红方行棋，禁着表就位
-    // 跨过阈值的那一步及之后都不再提示
-    expect(keys[keys.length - 1]).toBeNull();
-    expect(keys[keys.length - 2]).toBeNull();
-    expect(keys[10]).toBeNull();
+    // 整段序列都没有规则二提示
+    expect(keys.every(k => k === null)).toBe(true);
     expect(s.ruleState!.notice).toBeNull();
   });
 
-  test('超限红点仍保留（AI 择优依赖 isMoveBanned，不能因为不展示就删）', () => {
+  test('禁着表仍保留（棋盘标红 + AI 择优 + 落子拦截都依赖它，不能因为不提示就删）', () => {
     let s = fen(LONG_CHECK_FEN);
     const seq: Array<[number, number, number]> = [
       [23, 4, 3], [0, 5, 0],
@@ -845,8 +848,8 @@ describe('提示收敛：阈值前一步一次性提示', () => {
     const rs = s.ruleState!;
     expect(rs.banActive).toBe(true);
     expect(rs.banMoves.length).toBeGreaterThan(0);
-    expect(rs.notice).toBeNull();                       // 不提示
-    expect(isMoveBanned(s, 23, 4, 3)).toBe(true);      // 但仍可供 AI 过滤
+    expect(rs.notice).toBeNull();                       // 规则二不预警
+    expect(isMoveBanned(s, 23, 4, 3)).toBe(true);      // 但仍可供 AI 过滤与落子拦截
     expect(isMoveBanned(s, 23, 5, 3)).toBe(false);     // 非将军的落点不受限
   });
 

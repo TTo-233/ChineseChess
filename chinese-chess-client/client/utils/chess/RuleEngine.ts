@@ -761,12 +761,6 @@ export function evaluateRuleAfterMove(
     }
   }
 
-  /**
-   * 超限名称（长将 / 长捉 / 将捉交替），用于提示文案
-   */
-  const banName = (reason: BanReason): string =>
-    reason === 'LONG_CHECK' ? '长将' : reason === 'LONG_CHASE' ? '长捉' : '将捉交替';
-
   if (hit) {
     // 超限：算出禁着表。**不判负**——规则二只要求变招，不作处罚。
     //
@@ -774,10 +768,9 @@ export function evaluateRuleAfterMove(
     // 「走子之前」的着法，而本函数是在走子之后才被调用的，此刻已经拦不住了。真正拦落子
     // 的是客户端 handleMove 与服务端 lanGame.ts，它们在 makeMove 之前先查 isMoveBanned。
     //
-    // 同样**不再出提示条**：这里每一步都会重写 notice，而 noticeKey 在超限期间恒为同一个
-    // 字符串，UI 却按自增序号当 key，于是超限后每走一步就重播一次「已超限，请尽快变招」
-    // ——实测刷屏。改为只在跨过阈值前一步提示一次（见下方 noticeFor），真正点禁着时
-    // 由拦截层弹「禁止长将/长捉，请变招」。判和条件仍会在到点前一步预警。
+    // 超限**也不再出预警提示条**（2026-10 口径，见下方 noticeFor 末尾的说明）：超限类
+    // 预警必然逐步步重写 notice，实测刷屏。规则二对外只保留「点禁着时弹
+    // 禁止长将/长捉，请变招」这一个出口，由拦截层负责。
     rs.banActive = true;
     rs.banSide = hitSide; // 标记该方「会继续长将/长捉」的落点
     rs.banReason = hit.reason;
@@ -791,7 +784,10 @@ export function evaluateRuleAfterMove(
     rs.banMoves = [];
   }
 
-  // 一次性预警（走子方优先，其次对方）：只在「下一着就会判和 / 就会超限」时响一次。
+  // 一次性预警（走子方优先，其次对方）：只在「下一着就会判和」时响一次。
+  //
+  // 【口径 2026-10】只保留**规则一（判和类）**的到点前一步提示；**规则二不预警**，
+  // 对外只留禁着拦截时的「禁止长将/长捉，请变招」提示（见下方末尾说明）。
   //
   // 【key 的口径】key 一律**不含方别**，只由「预警种类 + 累计数字」构成。GameNotice
   // 只在 key 变化时重新计时（见 components/Modal/GameNotice.tsx 的 useEffect），
@@ -844,19 +840,16 @@ export function evaluateRuleAfterMove(
       }
     }
 
-    // --- 规则二：超限类预警（到阈值前一步） ---
-    const checkLimit = longCheckLimit(c.jiangPieceIds.length);
-    if (c.jiangCount >= checkLimit - 1 && c.jiangCount < checkLimit) {
-      return { text: `${banName('LONG_CHECK')}已 ${c.jiangCount} 着，下着将超限，请尽快变招`, key: `jiang-${c.jiangCount}` };
-    }
-    const zhuoMax = maxZhuoCount(c);
-    if (zhuoMax >= RULE_CONFIG.longChase - 1 && zhuoMax < RULE_CONFIG.longChase) {
-      return { text: `${banName('LONG_CHASE')}已 ${zhuoMax} 着，下着将超限，请尽快变招`, key: `zhuo-${zhuoMax}` };
-    }
-    const jzLimit = checkChaseLimit(c.jiangZhuoPieceIds.length);
-    if (c.jiangZhuoLoop >= jzLimit - 1 && c.jiangZhuoLoop < jzLimit) {
-      return { text: `${banName('CHECK_CHASE')}已 ${c.jiangZhuoLoop} 着，下着将超限，请尽快变招`, key: `jz-${c.jiangZhuoLoop}` };
-    }
+    // 规则二**不预警**：按 2026-10 口径，规则二只保留「强制变招拦截 + 拦截时的提示」
+    // （禁止长将/长捉，请变招），不再在跨到阈值前一步时出提示条。
+    //
+    // 原因：这一类预警在实现上必然每步重写 notice（长将/长捉计数是连续累加的，
+    // 走到阈值前一步后双方每走一步都满足条件），而 noticeKey 在同一类预警中恒为
+    // 同一字符串，UI 却按自增序号当 key，于是变成「下着将超限，请尽快变招」逐步步
+    // 弹窗刷屏。取消后体验更干净：平时不打扰，真要点禁着时才由拦截层弹提示。
+    //
+    // 判和类（一.1~一.6）的阈值前一步提示保持不变——那些是一次性到达的边界，
+    // 不会重复触发。
     return null;
   };
   const notice = noticeFor(moverSide) ?? noticeFor(opponentSide);

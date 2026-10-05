@@ -117,9 +117,9 @@ export interface RuleState {
   banChaseTargets: number[];
   /** 禁着列表（仅对 banSide 的下一手有效，随状态下发；客户端与服务端据此拦截落子） */
   banMoves: BanMove[];
-  /** 本步产生的提示文案（阈值前一步预警） */
+  /** 规则一判和类的到点前一步预警文案（如「下着将满 120 步判和」）；规则二不预警 */
   notice: string | null;
-  /** 提示去重键（如 'jiang-5'，不含方别），UI 据此避免重复弹出 */
+  /** 提示去重键（如 'natural-119'，不含方别），UI 据此避免重复弹出 */
   noticeKey: string | null;
 }
 

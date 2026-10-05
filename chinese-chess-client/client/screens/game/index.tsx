@@ -474,7 +474,7 @@ export default function GameScreen() {
           aiMove.toRow
         );
 
-        // 规则提示（AI 走子触发，如"长将已 N 着，下着将超限"等待玩家应对的场景）
+        // 规则提示（AI 走子也可能撞到规则一的判和阈值，如「双方长将已达 5 次…」）
         if (newState.ruleState?.notice) {
           showRuleNotice(newState.ruleState.notice);
         }
@@ -688,7 +688,7 @@ export default function GameScreen() {
       gameState, pieceId, toCol, toRow
     );
 
-    // 规则提示（接近阈值"请尽快变招"等，方案 10.3 / 12）
+    // 规则提示（规则一判和类的到点前一步预警，如「下着将满 120 步判和」）
     if (newState.ruleState?.notice) {
       showRuleNotice(newState.ruleState.notice);
     }
