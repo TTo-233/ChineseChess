@@ -692,7 +692,7 @@ export default function SpectateScreen() {
             setInfoRowH((prev) => (prev === h ? prev : h));
           }}
         >
-          <Text style={styles.infoRowTitle} numberOfLines={1}>
+          <Text style={[styles.infoRowTitle, hasBackground && styles.textHalo]} numberOfLines={1}>
             {roomName || '在线对局'}
           </Text>
           <View style={styles.infoPill}>
@@ -703,7 +703,10 @@ export default function SpectateScreen() {
             <View style={[styles.turnDot, { backgroundColor: isRedTurn ? COLORS.redPiece : COLORS.blackPiece }]} />
             <Text style={styles.infoPillText}>{isRedTurn ? '红方行棋' : '黑方行棋'}</Text>
           </View>
-          <Text style={styles.infoPillText}>{spectatorCount} 人观看</Text>
+          {/* 人数这枚没有药丸托底（左两个 infoPill 才有），直接落在页面底色上 ⇒ 需要描边 */}
+          <Text style={[styles.infoPillText, hasBackground && styles.textHalo]}>
+            {spectatorCount} 人观看
+          </Text>
         </View>
 
         {/* 底部操作栏（与人机/在线对战共用 @/components/GameBottomBar，2026-10 第二轮改造）：
@@ -904,6 +907,24 @@ const styles = StyleSheet.create({
     fontSize: FONT.caption,
     fontWeight: '700',
     color: COLORS.textPrimary,
+  },
+  /**
+   * 整屏背景图下的文字外描边（浅色光晕）。
+   *
+   * 背景图可能是深色的（仙山夜月 / 朱阁红帐），而本页前景色一直是深棕。信息行里有几处文字
+   * 直接落在页面底色上（没有 infoPill 那样的不透明药丸托底），深色字压在深色图上会糊成一片。
+   *
+   * 之所以用 textShadow 而不是给药丸：textShadow **不参与布局测量**，
+   * 加在文字上不会改变 infoRow 那条 `height: 30`（与 BOARD_INFO_ROW_FLOW_HEIGHT = 32 常量绑定），
+   * 也不会有撑破纵向预算的风险。零偏移 + 圆角半径 = 对称外描边，对任意底色都成立。
+   *
+   * 颜色取应用卡片底色 #FFF8F0。未选背景图时页面底色本就是 #F5F0E8，两者几乎同色
+   * ⇒ 光晕不可见、观感零回归，所以只在 hasBackground 时挂载。
+   */
+  textHalo: {
+    textShadowColor: 'rgba(255, 248, 240, 0.92)',
+    textShadowOffset: { width: 0, height: 0 },
+    textShadowRadius: 4,
   },
   infoPill: {
     flexDirection: 'row',

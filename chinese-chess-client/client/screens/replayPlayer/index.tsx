@@ -255,7 +255,9 @@ export default function ReplayPlayerScreen() {
           ) : replay === null || !boardState ? (
             <View style={styles.loadingBox}>
               <FontAwesome6 name="circle-exclamation" size={36} color={COLORS.border} />
-              <Text style={styles.missingText}>对局不存在或已被删除</Text>
+              <Text style={[styles.missingText, hasBackground && styles.textHalo]}>
+                对局不存在或已被删除
+              </Text>
               <TouchableOpacity style={styles.missingBackButton} onPress={() => router.back()}>
                 <Text style={styles.missingBackText}>返回列表</Text>
               </TouchableOpacity>
@@ -294,10 +296,10 @@ export default function ReplayPlayerScreen() {
           <View style={[styles.controls, controlsWidthStyle, { marginTop: REPLAY_PROGRESS_GAP }]}>
             {/* 步数指示 */}
             <View style={styles.progressRow}>
-              <Text style={styles.progressText}>
+              <Text style={[styles.progressText, hasBackground && styles.textHalo]}>
                 第 {currentStep} / {totalSteps} 步
               </Text>
-              <Text style={styles.progressHint}>
+              <Text style={[styles.progressHint, hasBackground && styles.textHalo]}>
                 {currentStep === 0
                   ? '开局'
                   : currentStep === totalSteps
@@ -402,6 +404,26 @@ const styles = StyleSheet.create({
   progressHint: {
     fontSize: FONT.caption,
     color: COLORS.textMuted,
+  },
+  /**
+   * 整屏背景图下的文字外描边（浅色光晕）。
+   *
+   * 进度区（步数 + 回合提示）与「对局不存在」都在棋盘宿主之外，直接落在页面底色上 ——
+   * 没有任何不透明卡片托底。背景图可能是深色的（仙山夜月 / 朱阁红帐），
+   * 深棕前景压上去会糊成一片。
+   *
+   * 之所以用 textShadow 而不是加卡片：textShadow **不参与布局测量**，
+   * 不会改变 bottomSection 的实测高度（该高度经 onLayout 反馈给
+   * capHostHeightToViewport 的 belowHostHeight 参与棋盘纵向预算），
+   * 因此这条修复不会牵动棋盘尺寸。
+   *
+   * 颜色取应用卡片底色 #FFF8F0。未选背景图时页面底色本就是 #F5F0E8，两者几乎同色
+   * ⇒ 光晕不可见、观感零回归，所以只在 hasBackground 时挂载。
+   */
+  textHalo: {
+    textShadowColor: 'rgba(255, 248, 240, 0.92)',
+    textShadowOffset: { width: 0, height: 0 },
+    textShadowRadius: 4,
   },
   slider: {
     width: '100%',
