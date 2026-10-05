@@ -572,7 +572,7 @@ export function buildGameStatePayload(room: Room): Record<string, unknown> {
  * - `ruleState.positionKeys`：每手追加一个完整局面指纹串，仅用于重复局面判和
  *   （RuleEngine.ts 的 repetition 计数），30 步时占 3177 B / 41%。
  * - `ruleState.red/black` 计数与 `banChaseTargets`：客户端只用 `notice`/`banActive`/
- *   `banSide`/`banMoves`/`banReason` 展示长将长捉提示，从不读这些计数。
+ *   `banSide`/`banMoves`/`banReason` 展示长将长捉提示与禁着，从不读这些计数。
  */
 function slimGameState(gameState: any): Record<string, unknown> {
   if (!gameState || typeof gameState !== 'object') return {};
@@ -1510,9 +1510,15 @@ export function actMove(roomId: string, body: Record<string, unknown>, sessionTo
   if (!valid[toCol] || !valid[toCol][toRow]) {
     return actionFailure(400, '非法走法');
   }
+  // 长将长捉超限禁着（规则二）：一方达到阈值后，再走会继续长将/长捉的着法
+  // 预超过阈值 → 拒绝。客户端 handleMove 已先拦一层（省一次往返），这里是权威裁决：
+  // 直接 POST 也能被挡住，防止绕过客户端改状态。拦的是超限着法，变招始终合法。
+  // 提示文案与客户端同源（两端共用 ruleEngine.cjs），客户端据此弹「禁止长将，请变招」。
+  const banReason = ruleEngine.getMoveBanReason(state, pieceId, toCol, toRow);
+  if (banReason) {
+    return actionFailure(400, ruleEngine.banReasonNotice(banReason));
+  }
   // 服务端权威裁决：与客户端同一规则引擎执行走子（含长将长捉判定与终局）
-  // 长将长捉超限不再拦截落子、不再按违规次数判负（方案 10 娱乐向改造）：
-  // banMoves 仅用于客户端棋盘标红提示；双方僵持不下由自然限招/互长将互长捉判和收场。
   // 加固：历史上前身是直接注入 dist 的补丁，现已归位到源码（改这里即可，改完在 chinese-chess-server/ 下跑 node build.js）。
   const result = ruleEngine.makeMove(state, pieceId, toCol, toRow);
 

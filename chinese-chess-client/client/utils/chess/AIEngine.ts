@@ -1254,9 +1254,9 @@ export async function searchWithTimeBudget(
   let moves = generatePseudoMoves(state);
   if (moves.length === 0) return null;
 
-  // 长将长捉超限时的择着偏好（方案 10 娱乐向改造）：
-  // 超限只提示不判负，AI 仍应优先变招——根节点剔除会继续长将/长捉的着法，
-  // 避免把自己拖进僵局（最终由自然限招/互长将互长捉判和收场）
+  // 长将长捉超限时的择着偏好（规则二）：
+  // 禁着已由 handleMove / 服务端 lanGame.ts 拦截落子，AI 侧同样剔除会继续长将/长捉的
+  // 着法——它必须主动变招，否则整条搜索链都在推演一条会被规则拒绝的着法
   if (state.ruleState?.banActive && state.ruleState.banSide === state.sideTag) {
     const legal = moves.filter(m => !isMoveBanned(state, m.pieceId, m.toCol, m.toRow));
     // 全部着法被标红在规则上不可达（引擎 banMoves 仅覆盖将/捉着，必有变招着存在）；

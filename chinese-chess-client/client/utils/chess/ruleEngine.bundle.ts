@@ -6,7 +6,9 @@
  *
  * 联机对局走子协议改造（方案 P0「服务端权威裁决」）：客户端只发着法，
  * 服务端以与客户端完全相同的规则引擎（GameEngine + RuleEngine）进行
- * 走法校验与终局裁决（长将长捉只提示不判负，服务端不再二次拦截禁着）。
+ * 走法校验与终局裁决。规则二的禁着**两端都拦截**：客户端 handleMove 先拦一层
+ * （省一次往返、就地弹「禁止长将，请变招」），服务端在此做权威裁决（防伪造），
+ * 提示文案由同一份 banReasonNotice 产出，不会漂移。
  * 本文件与客户端共享同一份源码，编译产物随服务端部署包分发。
  *
  * ============================================================================
@@ -44,7 +46,9 @@ import {
 } from './GameEngine';
 
 export { makeMove, createInitialState, cloneGameState, applyHandicap };
-export { isMoveBanned } from './RuleEngine';
+// 规则二禁着：服务端 lanGame.ts 用 getMoveBanReason 判定、并取 banReasonNotice
+// 作为拒绝时的提示文案（与客户端弹的提示同源同字）。
+export { isMoveBanned, getMoveBanReason, banReasonNotice } from './RuleEngine';
 
 /**
  * 服务端权威「合法着法表」：走法形状合法 **且** 走后己方将/帅不被攻击。

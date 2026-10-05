@@ -27741,6 +27741,10 @@ function actMove(roomId, body, sessionToken) {
   if (!valid[toCol] || !valid[toCol][toRow]) {
     return actionFailure(400, "\u975E\u6CD5\u8D70\u6CD5");
   }
+  const banReason = ruleEngine.getMoveBanReason(state, pieceId, toCol, toRow);
+  if (banReason) {
+    return actionFailure(400, ruleEngine.banReasonNotice(banReason));
+  }
   const result = ruleEngine.makeMove(state, pieceId, toCol, toRow);
   room.stateHistory.push(state);
   if (room.stateHistory.length > STATE_HISTORY_MAX) {

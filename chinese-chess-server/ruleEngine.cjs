@@ -21,8 +21,10 @@ var __toCommonJS = (mod) => __copyProps(__defProp({}, "__esModule", { value: tru
 var ruleEngine_bundle_exports = {};
 __export(ruleEngine_bundle_exports, {
   applyHandicap: () => applyHandicap,
+  banReasonNotice: () => banReasonNotice,
   cloneGameState: () => cloneGameState,
   createInitialState: () => createInitialState,
+  getMoveBanReason: () => getMoveBanReason,
   getSelectableMovesForParity: () => getSelectableMovesForParity,
   getValidMoves: () => getValidMoves2,
   isMoveBanned: () => isMoveBanned,
@@ -669,6 +671,23 @@ function isMoveBanned(state, pieceId, toCol, toRow) {
   if (state.sideTag !== rs.banSide) return false;
   return rs.banMoves.some((m) => m.pieceId === pieceId && m.toCol === toCol && m.toRow === toRow);
 }
+function getMoveBanReason(state, pieceId, toCol, toRow) {
+  const rs = state.ruleState;
+  if (!rs || !rs.banActive || rs.banReason == null) return null;
+  if (state.sideTag !== rs.banSide) return null;
+  const hit = rs.banMoves.find((m) => m.pieceId === pieceId && m.toCol === toCol && m.toRow === toRow);
+  return hit ? hit.reason : null;
+}
+function banReasonNotice(reason) {
+  switch (reason) {
+    case "LONG_CHECK":
+      return "\u7981\u6B62\u957F\u5C06\uFF0C\u8BF7\u53D8\u62DB";
+    case "LONG_CHASE":
+      return "\u7981\u6B62\u957F\u6349\uFF0C\u8BF7\u53D8\u62DB";
+    default:
+      return "\u7981\u6B62\u5C06\u519B\u6216\u957F\u6349\uFF0C\u8BF7\u53D8\u62DB";
+  }
+}
 function maxZhuoCount(s) {
   let max = 0;
   for (const k of Object.keys(s.zhuoCounts)) {
@@ -1128,8 +1147,10 @@ var getSelectableMovesForParity = getValidMoves;
 // Annotate the CommonJS export names for ESM import in node:
 0 && (module.exports = {
   applyHandicap,
+  banReasonNotice,
   cloneGameState,
   createInitialState,
+  getMoveBanReason,
   getSelectableMovesForParity,
   getValidMoves,
   isMoveBanned,

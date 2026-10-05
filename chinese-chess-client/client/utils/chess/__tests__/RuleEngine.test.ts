@@ -11,7 +11,7 @@ import {
   createInitialState, createFromFen, makeMove, type GameState,
 } from '../GameEngine';
 import {
-  RULE_CONFIG, detectZhuo, isMoveBanned, positionKey,
+  RULE_CONFIG, detectZhuo, isMoveBanned, getMoveBanReason, banReasonNotice, positionKey,
   type RuleState,
 } from '../RuleEngine';
 import { getValidMoves } from '../GameEngine';
@@ -82,7 +82,7 @@ describe('方案14 用例1：一子长将 6 着 → 第 7 着禁着', () => {
     expect(isMoveBanned(s, 23, 0, 3)).toBe(false);
   });
 
-  test('超限后连续长将不判负、不拦截（娱乐向改造：仅红点警示）', () => {
+  test('超限后连续长将不判负；引擎仍可算，超限着法由上层拦截', () => {
     let s = fen(LONG_CHECK_FEN);
     const seq: Array<[number, number, number]> = [
       [23, 4, 3], [0, 5, 0], [23, 5, 3], [0, 4, 0],
@@ -90,11 +90,15 @@ describe('方案14 用例1：一子长将 6 着 → 第 7 着禁着', () => {
       [23, 4, 3], [0, 5, 0], [23, 5, 3], [0, 4, 0],
     ];
     for (const [p, c, r] of seq) s = play(s, p, c, r);
-    // 第 7/8/9 将继续长将：红点仍在，但**不判负、不终局**
+    // 第 7/8/9 将继续长将：banActive 仍在，但**不判负、不终局**
     expect(s.ruleState!.banActive).toBe(true);
     expect(s.gameStatus).toBe('playing');
-    // 超限着法本身就是合法走法（棋子走法内即可落子，不被禁着层拦截）
+    // 规则引擎本身照常算得出这一步（makeMove 是纯引擎，不含拦截），
+    // 拦截发生在 handleMove / 服务端 lanGame.ts：见下方「规则二禁着拦截」用例
     expect(getValidMoves(s, 23)[4][3]).toBe(true);
+    // 但谓词明确报告它被禁：客户端/服务端正是据此拒绝
+    expect(isMoveBanned(s, 23, 4, 3)).toBe(true);
+    expect(getMoveBanReason(s, 23, 4, 3)).toBe('LONG_CHECK');
   });
 });
 
@@ -618,11 +622,12 @@ describe('方案14 用例24：一方长将一方长捉 → 长将方禁招', () 
     expect(rs.banActive).toBe(true);
     expect(rs.banSide).toBe(RED);          // 长将方（红）被禁
     expect(rs.banReason).toBe('LONG_CHECK');
-    // 黑方应将后（轮红），红方第 7 将落点被标红为「超限」警示
+    // 黑方应将后（轮红），红方第 7 将落点被标红为「超限」
     newState = play(newState, 0, 5, 1);
     expect(isMoveBanned(newState, 23, 5, 3)).toBe(true);
-    // 标红只是警示：走法矩阵不受影响，getValidMoves 仍放行（不拦截落子）
+    // 引擎照常算得出这一步（走法矩阵不受禁着影响）；拦截由 handleMove / lanGame.ts 负责
     expect(getValidMoves(newState, 23)[5][3]).toBe(true);
+    expect(getMoveBanReason(newState, 23, 5, 3)).toBe('LONG_CHECK');
   });
 });
 
@@ -692,10 +697,10 @@ describe('规则二.2：一方长将一方长捉 → 长将方禁招', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 补充：超限不判负（方案 10 娱乐向改造 —— 废除「连续 3 次坚持禁着判负」）
+// 补充：超限不判负（废除「连续 3 次坚持禁着判负」；但超限着法会被禁 —— 规则二）
 // ---------------------------------------------------------------------------
 
-describe('补充：超限仅提示不判负', () => {
+describe('补充：超限不判负但禁着', () => {
   test('banViolations 计数字段已废除，RuleState 不再包含违规次数', () => {
     const rs: RuleState = {
       red: emptyCounters(), black: emptyCounters(),
@@ -745,13 +750,21 @@ describe('补充：超限仅提示不判负', () => {
     expect(rs.banActive).toBe(false);   // 第 5 将尚未超限
     expect(rs.notice).toBe('长将已 5 着，下着将超限，请尽快变招');
     expect(rs.noticeKey).toBe('jiang-5');   // key 不含方别：红黑交替时不重播
-    // 提示只是文案：不拦截落子，红点为空
+    // 提示只是预警文案：此刻尚未超限，红点为空，落子不受限
     expect(rs.banMoves).toEqual([]);
-    // 第 6 将（下着）照常能走：车 (4,3)→(5,3) 仍会被将军，只被标红为超限
+    // 第 6 将（下着）照常能走：车 (4,3)→(5,3) 仍会被将军，但**尚未超限**故不禁
     const next = play(s, 0, 5, 0);
     expect(next.ruleState!.red.jiangCount).toBe(5);
     expect(getValidMoves(next, 23)[5][3]).toBe(true);
-    expect(getValidMoves(next, 23)[5][3]).toBe(true);
+    expect(getMoveBanReason(next, 23, 5, 3)).toBeNull();
+    // 真正禁住的是再下一手：第 6 将达阈值（此刻轮到黑，banSide=红），
+    // 黑方应将后轮回红方，第 7 将继续将军才被禁。
+    // 车在 4/5 列交替将 → 第 6 将落在 (5,3)，故应将走 (4,0)，下一手 (5,3)→(4,3)。
+    const after6 = play(next, 23, 5, 3);
+    expect(after6.ruleState!.red.jiangCount).toBe(6);
+    expect(after6.ruleState!.banActive).toBe(true);
+    const next2 = play(after6, 0, 4, 0);
+    expect(getMoveBanReason(next2, 23, 4, 3)).toBe('LONG_CHECK');
   });
 
   test('长捉倒数第 2 着（第 5 捉）同样提示下着将超限', () => {
@@ -956,5 +969,89 @@ describe('回归：标准开局走子', () => {
     s = play(s, 10, 4, 2); // 黑炮 (7,2)→(4,2) 炮8平5
     expect(s.gameStatus).toBe('playing');
     expect(s.ruleState!.banActive).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 规则二禁着拦截：getMoveBanReason / banReasonNotice
+// 客户端 screens/game、screens/lanBattle 与服务端 lanGame.ts 都靠这两个函数拦落子，
+// 故必须是规则引擎的一等出口（且经 ruleEngine.bundle.ts 导出给服务端）。
+// ---------------------------------------------------------------------------
+
+describe('规则二禁着拦截：getMoveBanReason / banReasonNotice', () => {
+  test('一子长将满 6 后，第 7 手继续长将被禁并提示「禁止长将，请变招」', () => {
+    // 用户给出的范例场景：满 6 回合后再走第 7 手 → 禁着 + 提示
+    let s = fen(LONG_CHECK_FEN); // 黑将(4,0) 红车(3,3) 红帅(3,9)
+    const seq: Array<[number, number, number]> = [
+      [23, 4, 3], [0, 5, 0], // 将1；将躲到 (5,0)
+      [23, 5, 3], [0, 4, 0], // 将2
+      [23, 4, 3], [0, 5, 0], // 将3
+      [23, 5, 3], [0, 4, 0], // 将4
+      [23, 4, 3], [0, 5, 0], // 将5
+      [23, 5, 3],             // 将6 —— 达到阈值
+    ];
+    for (const [p, c, r] of seq) s = play(s, p, c, r);
+    expect(s.ruleState!.red.jiangCount).toBe(6);
+    expect(s.ruleState!.banActive).toBe(true);
+    expect(s.ruleState!.banReason).toBe('LONG_CHECK');
+
+    const after6 = play(s, 0, 4, 0); // 黑将应将，轮回红方
+    expect(after6.sideTag).toBe(RED);
+    // 第 7 手：车 (5,3)→(4,3) 继续将军 → 被禁
+    expect(getMoveBanReason(after6, 23, 4, 3)).toBe('LONG_CHECK');
+    expect(banReasonNotice('LONG_CHECK')).toBe('禁止长将，请变招');
+    // 变招（车走开，非将军着）始终合法
+    expect(getMoveBanReason(after6, 23, 3, 3)).toBeNull();
+  });
+
+  test('长捉超限给出「禁止长捉，请变招」', () => {
+    // 黑将(5,2) 黑炮(4,0) 红车(4,4) 红帅(3,9)：红车追捉无根炮
+    // 预置已捉 5 次，第 6 捉达阈值 → 红方被禁着
+    const s = fen('4c4/9/5k3/9/4R4/9/9/9/9/3K5 w');
+    preset(s, rs => { rs.red.zhuoCounts = { '9': 5 }; rs.red.jiangZhuoPieceIds = [23]; });
+    const after6 = play(s, 23, 4, 3);          // 红车 (4,4)→(4,3) 第 6 捉
+    expect(after6.ruleState!.red.zhuoCounts['9']).toBe(6);
+    expect(after6.ruleState!.banActive).toBe(true);
+    expect(after6.ruleState!.banReason).toBe('LONG_CHASE');
+    expect(after6.ruleState!.banSide).toBe(RED);
+    // 黑炮逃到 (3,0) → 轮回红方；红车再吃回 (4,0) 即第 7 捉，被禁
+    const next = play(after6, 9, 3, 0);
+    expect(next.sideTag).toBe(RED);
+    expect(getMoveBanReason(next, 23, 4, 0)).toBe('LONG_CHASE');
+    expect(banReasonNotice('LONG_CHASE')).toBe('禁止长捉，请变招');
+    // 变招（车不追炮）合法
+    expect(getMoveBanReason(next, 23, 2, 3)).toBeNull();
+  });
+
+  test('将捉交替（CHECK_CHASE）超限给出合并提示', () => {
+    const s = preset(fen(LONG_CHECK_FEN), rs => {
+      rs.red.jiangZhuoLoop = 18; // 三子及以上阈值 18
+      rs.red.jiangZhuoPieceIds = [23, 25, 27];
+    });
+    const mv = makeMove(s, 23, 4, 3);
+    const after = mv.newState;
+    expect(after.ruleState!.banActive).toBe(true);
+    expect(after.ruleState!.banReason).toBe('CHECK_CHASE');
+    expect(banReasonNotice('CHECK_CHASE')).toBe('禁止将军或长捉，请变招');
+  });
+
+  test('未超限时任何着法都不被禁（getMoveBanReason 返回 null）', () => {
+    const s = fen(LONG_CHECK_FEN);
+    expect(getMoveBanReason(s, 23, 4, 3)).toBeNull();
+    expect(getMoveBanReason(s, 23, 0, 3)).toBeNull();
+  });
+
+  test('非 banSide 方不受限（禁着只约束下一手继续长将/长捉的那一方）', () => {
+    const s = fen(LONG_CHECK_FEN);
+    preset(s, rs => { rs.red.jiangCount = 6; rs.red.jiangPieceIds = [23]; });
+    const after = play(s, 0, 5, 0); // 黑将先走 → 轮回红方
+    expect(after.ruleState!.banSide).toBe(RED);
+    expect(getMoveBanReason(after, 0, 4, 0)).toBeNull(); // 若轮到黑，黑将照走
+  });
+
+  test('banReasonNotice 覆盖全部 BanReason 取值（两端文案不会漂移）', () => {
+    expect(banReasonNotice('LONG_CHECK')).toBe('禁止长将，请变招');
+    expect(banReasonNotice('LONG_CHASE')).toBe('禁止长捉，请变招');
+    expect(banReasonNotice('CHECK_CHASE')).toBe('禁止将军或长捉，请变招');
   });
 });

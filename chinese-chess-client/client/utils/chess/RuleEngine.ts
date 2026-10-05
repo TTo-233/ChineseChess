@@ -6,9 +6,9 @@
  * - 每步走子后的判定流程（方案 5）：将军检测 → 捉子检测 → 计数更新 → 重复检测 → 阈值检查
  * - 捉子检测（方案 7）：走子后能够造成下一着吃掉对方无根子（假根视为无根），
  *   带特殊子力豁免（兵卒将帅长捉允许、未过河兵卒不算、单/双炮捉车不算、同类互献不算）
- * - 长将长捉超限（规则二）：达到阈值后**不拦截落子、不判负**，
- *   仅生成 banMoves 红点警示并在提示条中提醒「请尽快变招」；双方僵持不下由
- *   判和体系收场
+ * - 长将长捉超限（规则二）：一方达到阈值后，再走会继续长将/长捉的着法即被**禁着**
+ *   （拦截落子 + GameNotice 提示「禁止长将/长捉，请变招」），客户端与服务端同口径；
+ *   拦截只针对超限着法，变招始终合法。提示另在阈值前一步给一次预警
  * - 判和体系（规则一.1~一.6）：无进攻子力 / 非将非应将非捉非应捉重复 5 次 /
  *   互长将 6 次 / 互长捉 6 次 / 无吃子 120 步（单方将军累计上限 10）/ 总步数 400 步，
  *   其中无吃子与总步数两项在「末步绝杀或困毙」时判胜不判和
@@ -414,7 +414,7 @@ function resetSideCounters(s: SideRuleCounters) {
 }
 
 // ---------------------------------------------------------------------------
-// 禁着（娱乐向改造：仅红点警示，不拦截、不判负）
+// 禁着（规则二：达到阈值后再走子即禁着，拦截落子并提示变招）
 // ---------------------------------------------------------------------------
 
 /** 长将允许回合数（按参与长将的子力数量：1 子 6 / 2 子 12 / 3 子及以上 18，规则二.3） */
@@ -435,8 +435,9 @@ function checkChaseLimit(pieceCount: number): number {
  * - LONG_CHASE：模拟后捉到触发阈值目标子的着法
  * - CHECK_CHASE：模拟后构成将军或有效捉的着法（将捉组合）
  *
- * ⚠️ 娱乐向改造：这些点**仅用于棋盘标红警示**，不再阻止落子、不计入违规、
- * 不会导致判负。它们是「你走这里就会继续长将/长捉」的预告，不是禁止标记。
+ * ⚠️ 这些点是**真正被禁**的着法（规则二：达到阈值后再走子即预超过阈值）：
+ * 客户端 handleMove 拦下落子并弹「禁止长将/长捉，请变招」，服务端 lanGame.ts
+ * 同步拒绝上报。拦的是「继续长将/长捉的落点」，变招始终合法。
  */
 function buildBanMoves(state: GameState, banSide: SideTag, banReason: BanReason, chaseTargets: number[]): BanMove[] {
   const bans: BanMove[] = [];
@@ -458,14 +459,56 @@ function buildBanMoves(state: GameState, banSide: SideTag, banReason: BanReason,
 /**
  * 指定着法当前是否被标红为「超限着法」（超限时枚举出该方全部会继续长将/长捉的落点）。
  *
- * ⚠️ 娱乐向改造：本函数**不再用于拦截落子**，只保留给 UI 查询「某点是否已被标红」
- * 与 AI 的可选提示用。落子是否合法一律以 getValidMoves（棋子自身走法）为准。
+ * 【2026-10 起本函数同时也是落子拦截的判据】达到阈值后再走子即预超过阈值，该着法
+ * 被禁：客户端在 handleMove 里据此拦下落子并弹提示，服务端在 lanGame.ts 里据此拒绝
+ * 上报（两端共用 ruleEngine.cjs 同源产物，getMoveBanReason 可取到理由用于文案）。
+ *
+ * 注意拦的是「超限着法」本身，而不是该方全部着法——变招（走一个不会继续长将/长捉的
+ * 落点）始终合法。AI 也用本函数过滤，避免主动走进僵局。
  */
 export function isMoveBanned(state: GameState, pieceId: number, toCol: number, toRow: number): boolean {
   const rs = state.ruleState;
   if (!rs || !rs.banActive || rs.banReason == null) return false;
   if (state.sideTag !== rs.banSide) return false;
   return rs.banMoves.some(m => m.pieceId === pieceId && m.toCol === toCol && m.toRow === toRow);
+}
+
+/**
+ * 指定着法超限的**理由**（LONG_CHECK / LONG_CHASE / CHECK_CHASE），未超限返回 null。
+ *
+ * 与 isMoveBanned 同源（同一份 banMoves），但返回理由而非布尔值：拦截落子时需要
+ * 按理由给出不同的提示文案（「禁止长将，请变招」/「禁止长捉，请变招」/
+ * 「禁止将军或长捉，请变招」）。服务端 lanGame.ts 也用它做权威裁决，
+ * 保证两端文案与拦截口径完全一致（两端共用 ruleEngine.cjs 同源产物）。
+ */
+export function getMoveBanReason(
+  state: GameState,
+  pieceId: number,
+  toCol: number,
+  toRow: number
+): BanReason | null {
+  const rs = state.ruleState;
+  if (!rs || !rs.banActive || rs.banReason == null) return null;
+  if (state.sideTag !== rs.banSide) return null;
+  const hit = rs.banMoves.find(m => m.pieceId === pieceId && m.toCol === toCol && m.toRow === toRow);
+  return hit ? hit.reason : null;
+}
+
+/**
+ * 禁着拦截提示文案（规则二：达到阈值后再走子预超过阈值即禁着）。
+ *
+ * 按超限理由区分，三种理由各有专属措辞，避免玩家只看到笼统的「请变招」而不知道
+ * 该变的是将军还是长捉。服务端 lanGame.ts 复用本函数，两端文案不会漂移。
+ */
+export function banReasonNotice(reason: BanReason): string {
+  switch (reason) {
+    case 'LONG_CHECK':
+      return '禁止长将，请变招';
+    case 'LONG_CHASE':
+      return '禁止长捉，请变招';
+    default:
+      return '禁止将军或长捉，请变招';
+  }
 }
 
 /**
@@ -542,8 +585,8 @@ export function evaluateRuleAfterMove(
   const opponent = rs[sideKey(opponentSide)];
 
   // --- 计数更新（方案 3） ---
-  // 娱乐向改造下「变招」不再有拦截层兜底，改由下面的计数分支自然完成：
-  // 走一着不将不捉（或吃子）即 resetSideCounters(mover) → 红点随之消失。
+  // 「变招」由下面的计数分支自然完成：走一着不将不捉（或吃子）即
+  // resetSideCounters(mover) → 该方不再超限、禁着随之消失。
   const zhuoList = isCheck ? [] : detectZhuo(afterState, moverSide);
 
   if (move.captured !== -1) {
@@ -659,8 +702,9 @@ export function evaluateRuleAfterMove(
     return finish(rs, true, 'changjiang', moverSide);
   }
 
-  // --- 长将长捉超限判定（规则二.1~二.4，娱乐向改造：仅提示 + 红点，不拦截不判负） ---
-  // 对双方分别检查阈值：对方超限时其红点必须保留——对方上一步触发的超限
+  // --- 长将长捉超限判定（规则二.1~二.4） ---
+  // 一方达到阈值后，再走会继续长将/长捉的着法即禁着（拦落子 + 提示变招）。
+  // 对双方分别检查阈值：对方超限时其禁着必须保留——对方上一步触发的超限
   // 不应因本方闲着而消失（直到对方变招清零计数）。
   // 各方的命中理由须**分开**求出（而非取首个满足的阈值），才能在规则二.2
   // 「一方长将、一方长捉 → 长将方禁招」时跨方比较。
@@ -724,14 +768,16 @@ export function evaluateRuleAfterMove(
     reason === 'LONG_CHECK' ? '长将' : reason === 'LONG_CHASE' ? '长捉' : '将捉交替';
 
   if (hit) {
-    // 超限：**不拦截落子、不判负**，红点/禁着表仍然算出——它同时是 AI 择优的
-    // 过滤依据（AIEngine / aiDispatcher / 人机页兜底都读 isMoveBanned），
-    // 不能因为「不展示了」就删掉，否则 AI 会主动往僵局里走。
+    // 超限：算出禁着表。**不判负**——规则二只要求变招，不作处罚。
     //
-    // 但**不再出提示条**：这里每一步都会重写 notice，而 noticeKey 在超限期间
-    // 恒为同一个字符串，UI 却按自增序号当 key，于是超限后每走一步就重播一次
-    // 「已超限，请尽快变招」——实测刷屏。改为只在跨过阈值前一步提示一次
-    // （见下方 noticeFor）。判和条件仍会在到点前一步预警。
+    // 落子拦截不在这里做（见 getMoveBanReason / isMoveBanned 的调用方）：禁着要拦的是
+    // 「走子之前」的着法，而本函数是在走子之后才被调用的，此刻已经拦不住了。真正拦落子
+    // 的是客户端 handleMove 与服务端 lanGame.ts，它们在 makeMove 之前先查 isMoveBanned。
+    //
+    // 同样**不再出提示条**：这里每一步都会重写 notice，而 noticeKey 在超限期间恒为同一个
+    // 字符串，UI 却按自增序号当 key，于是超限后每走一步就重播一次「已超限，请尽快变招」
+    // ——实测刷屏。改为只在跨过阈值前一步提示一次（见下方 noticeFor），真正点禁着时
+    // 由拦截层弹「禁止长将/长捉，请变招」。判和条件仍会在到点前一步预警。
     rs.banActive = true;
     rs.banSide = hitSide; // 标记该方「会继续长将/长捉」的落点
     rs.banReason = hit.reason;

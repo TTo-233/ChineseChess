@@ -108,18 +108,18 @@ export interface RuleState {
   positionKeys: string[];
   /** 自最后一次吃子起双方累计着数（自然限招） */
   naturalMoveCounter: number;
-  /** 禁着是否激活（娱乐向改造：仅表示「存在超限红点警示」，不再拦截落子、不判负） */
+  /** 禁着是否激活（规则二：存在超限方，其继续长将/长捉的着法被禁） */
   banActive: boolean;
-  /** 被标红方（下一手会继续长将/长捉的一方） */
+  /** 被禁着方（下一手会继续长将/长捉的一方） */
   banSide: SideTag | null;
   banReason: BanReason | null;
   /** 长捉禁着的目标子（触发阈值时被连续捉的子） */
   banChaseTargets: number[];
-  /** 禁着列表（仅对 banSide 的下一手有效，随状态下发；仅用于棋盘标红，不拦截落子） */
+  /** 禁着列表（仅对 banSide 的下一手有效，随状态下发；客户端与服务端据此拦截落子） */
   banMoves: BanMove[];
-  /** 本步产生的提示文案（接近阈值/达到阈值） */
+  /** 本步产生的提示文案（阈值前一步预警） */
   notice: string | null;
-  /** 提示去重键（如 'red-jiang-5'），UI 据此避免重复弹出 */
+  /** 提示去重键（如 'jiang-5'，不含方别），UI 据此避免重复弹出 */
   noticeKey: string | null;
 }
 

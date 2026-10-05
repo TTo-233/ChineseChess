@@ -25,6 +25,7 @@ import { useNavigation, usePreventRemove, type NavigationProp } from '@react-nav
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { FontAwesome6 } from '@expo/vector-icons';
 import { createInitialState, applyHandicap, cloneGameState, getSelectableMoves, getValidMoves, isMoveKingSafe, makeMove, undoMove, getWinnerSideTag, type GameState } from '@/utils/chess/GameEngine';
+import { getMoveBanReason, banReasonNotice } from '@/utils/chess/RuleEngine';
 import { HandicapBoard } from '@/components/HandicapBoard';
 import { RED_SIDE, BLACK_SIDE, type SideTag } from '@/utils/chess/types';
 import ChessBoard, { CapturedPiecesDrawer } from '@/components/ChessBoard';
@@ -1601,10 +1602,18 @@ export default function LanBattleScreen() {
       return;
     }
 
-    // 长将长捉超限（方案 10 娱乐向改造）：**不拦截落子、不判负**。
-    // banMoves 仅用于棋盘标红「走这里会继续长将/长捉」，落子照常进行；
-    // 服务端（`chinese-chess-server/src/routes/lanGame.ts:1273-1281` 的
-    // ruleEngine.getValidMoves/makeMove）同样不再拦截禁着。
+    // 长将长捉超限禁着（规则二）：一方达到阈值后，再走会继续长将/长捉的着法
+    // 预超过阈值，该落点被禁——拦下落子（不上报服务端）并按理由提示变招。
+    // 拦的是超限着法本身，变招始终合法。
+    //
+    // 必须拦在本地这一层：服务端 lanGame.ts 虽也会拒绝（权威裁决，防客户端伪造），
+    // 但那时已经发过网络请求，白跑一趟且要等回执才知道被拒。
+    // 同送将拦截：**不清选中态**，玩家直接改点另一个落点。
+    const banReason = getMoveBanReason(gameState, selectedPieceId, toCol, toRow);
+    if (banReason) {
+      showNotice(banReasonNotice(banReason));
+      return;
+    }
 
     const result = makeMove(gameState, selectedPieceId, toCol, toRow);
 

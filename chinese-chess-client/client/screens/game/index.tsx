@@ -43,7 +43,7 @@ import {
 } from '@/utils/chess/GameEngine';
 import { getBestMoveAsync, precomputeHint, cancelHintPonder, recordHistoryHash, clearHistoryHash, computeZobristHash } from '@/utils/chess/AIEngine';
 import { getHybridBestMove, getHybridHintMove, getOnlineAiStatus, isOnlineAiBusyRetrying, getOnlineAiInvalidReason, getOnlineAiLongGameNotice, subscribeOnlineAiStatus, type AISource, type HybridMoveResult, type OnlineAiStatus } from '@/utils/chess/aiDispatcher';
-import { isMoveBanned, enumerateLegalMoves } from '@/utils/chess/RuleEngine';
+import { isMoveBanned, enumerateLegalMoves, getMoveBanReason, banReasonNotice } from '@/utils/chess/RuleEngine';
 import { playSound, playJiangJunSound, unloadAllSounds, preloadSounds, preloadGameEndSounds } from '@/utils/SoundManager';
 import { RED_SIDE, BLACK_SIDE } from '@/utils/chess/types';
 import { saveGame, loadGame, deleteSave, type GameSave } from '@/utils/GameSave';
@@ -667,10 +667,21 @@ export default function GameScreen() {
       return;
     }
 
-    // 长将长捉超限（方案 10 娱乐向改造）：**不拦截落子、不判负**。
-    // 达到长将 6/12/18 或长捉 6 着后，仅由 banMoves 在棋盘上标红提示
-    // 「走这里会继续长将/长捉」，同时提示条提醒尽快变招；
-    // 双方僵持不下由自然限招（120 着）与互长将/互长捉判和收场。
+    // 长将长捉超限禁着（规则二）：一方达到阈值后，再走会继续长将/长捉的着法
+    // 预超过阈值，该落点被禁——拦下落子并按理由提示「禁止长将/长捉，请变招」。
+    // 拦的是超限着法本身，变招（不继续长将/长捉的落点）始终合法。
+    //
+    // 与送将拦截一致：**不清选中态**，被拦的只是这一个落点，该子的其他落点和换子
+    // 重选都还合法，玩家直接改点另一个落点即可。
+    //
+    // AI 侧另有同一道过滤（AIEngine.ts / aiDispatcher.ts 读 isMoveBanned），
+    // 因此这里拦的是人的落子，不会出现「AI 走禁着」的不一致局面。
+    const banReason = getMoveBanReason(gameState, pieceId, toCol, toRow);
+    if (banReason) {
+      showRuleNotice(banReasonNotice(banReason));
+      return;
+    }
+
     clearHint(); // 走子后提示失效
     cancelHintPonder(); // 玩家走棋：立即中止后台提示预计算，算力让给 AI 思考
     const { newState, captured, isCheck, isGameOver, gameOverReason } = makeMove(
