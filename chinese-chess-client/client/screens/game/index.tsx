@@ -51,6 +51,7 @@ import { RED_SIDE, BLACK_SIDE } from '@/utils/chess/types';
 import { saveGame, loadGame, deleteSave, type GameSave } from '@/utils/GameSave';
 import { saveReplay } from '@/utils/replayStorage';
 import { BUILTIN_ENDGAMES } from '@/utils/chess/endgames';
+import { useBackgroundStyle } from '@/utils/chess/backgroundStyleStore';
 import {
   markLevelCompleted,
   markCustomCompleted,
@@ -189,6 +190,10 @@ export default function GameScreen() {
   // （screenWidth / windowHeight / dynamicGap 改由 useGameBoardLayout 内的
   //  useWindowDimensions 提供，第 3 批顺带修掉转屏后不再重算的旧问题）
   const insets = useSafeAreaInsets();
+
+  // 整屏背景（首页「样式设置 → 背景」所选）。未选背景图时不产生任何视觉变化。
+  const background = useBackgroundStyle();
+  const hasBackground = background.image != null;
 
   // 游戏结束状态（声明提前，handleFlip 需要引用）
   const [gameOverReason, setGameOverReason] = useState<string | null>(null);
@@ -1107,8 +1112,13 @@ export default function GameScreen() {
     // 【2026-10】去掉 'bottom' 安全区：底部操作栏改为主容器最后一个子节点（固定通栏），
     // 它自己用 insets.bottom 撑开内边距。Screen 再补一次底部安全区会让底栏悬在
     // Home Indicator 之上，底色断在半空。
-    <Screen safeAreaEdges={['top', 'left', 'right']}>
-      <View style={styles.container} ref={containerRef}>
+    <Screen
+      safeAreaEdges={['top', 'left', 'right']}
+      backgroundImage={background.image}
+      // 深色背景图（仙山/朱阁）下黑色状态栏图标看不清，切成浅色
+      statusBarStyle={background.tone === 'dark' ? 'light' : 'dark'}
+    >
+      <View style={[styles.container, hasBackground && styles.containerTransparent]} ref={containerRef}>
         {/* 棋盘区域 + 底部操作栏。
             【2026-10 布局改造】顶部标题栏（含返回键、局名/回合信息、回合指示）整体下线：
             返回入口移到残局模式底栏的「返回」，人机模式移到「菜单」弹出列表；回合信息不再需要，
@@ -1318,6 +1328,13 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: COLORS.bg,
     alignItems: 'center',
+  },
+  /**
+   * 选中整屏背景图时容器必须让位：容器是 Screen 背景图之后的兄弟节点，
+   * 实色底会整块盖住背景图。未选背景图时不加此样式 ⇒ 观感与改造前一致。
+   */
+  containerTransparent: {
+    backgroundColor: 'transparent',
   },
   aiNameRow: {
     flexDirection: 'row',

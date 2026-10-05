@@ -38,6 +38,7 @@ import { getReplay, type ReplayGame } from '@/utils/replayStorage';
 import { useBoardLayoutBudget, capHostHeightToViewport } from '@/utils/chess/boardLayoutBudget';
 import { boardAlignedRowStyle } from '@/utils/chess/boardContentWidth';
 import { useBoardStyle } from '@/utils/chess/boardStyleStore';
+import { useBackgroundStyle } from '@/utils/chess/backgroundStyleStore';
 import { playSound, playJiangJunSound, preloadSounds, unloadAllSounds } from '@/utils/SoundManager';
 import { FONT } from '@/utils/typography';
 
@@ -90,6 +91,9 @@ export default function ReplayPlayerScreen() {
   const insets = useSafeAreaInsets();
   // 当前棋盘样式：控制区宽度需按样式几何换算棋盘本体宽度（用户可在首页设置中切换样式）
   const boardStyle = useBoardStyle();
+  // 整屏背景（首页「样式设置 → 背景」所选）。未选背景图时不产生任何视觉变化。
+  const background = useBackgroundStyle();
+  const hasBackground = background.image != null;
 
   const [replay, setReplay] = useState<ReplayGame | null | undefined>(undefined); // undefined=加载中
   const [step, setStep] = useState(0);
@@ -227,8 +231,13 @@ export default function ReplayPlayerScreen() {
   return (
     // 【2026-10】去掉 'bottom' 安全区：底部操作栏是主容器的最后一个子节点（固定通栏），
     // 自己用 insets.bottom 撑开内边距，避免 Screen 的底部安全区把透明黑底截断在半空。
-    <Screen safeAreaEdges={['top', 'left', 'right']}>
-      <View style={styles.container}>
+    <Screen
+      safeAreaEdges={['top', 'left', 'right']}
+      backgroundImage={background.image}
+      // 深色背景图（仙山/朱阁）下黑色状态栏图标看不清，切成浅色
+      statusBarStyle={background.tone === 'dark' ? 'light' : 'dark'}
+    >
+      <View style={[styles.container, hasBackground && styles.containerTransparent]}>
         {/* 顶部标题栏已于 2026-10 下线；底部信息行（对局标题 / 时间 / 结果芯片）
             也在 2026-10 第三轮改造中整行删除 —— 列表页已逐条展示这些信息，播放页重复属冗余。 */}
         {/* 棋盘（整体居中；进度区与底栏都在棋盘宿主之外，固定在页面最底端） */}
@@ -330,6 +339,13 @@ const styles = StyleSheet.create({
   container: {
     flex: 1,
     backgroundColor: COLORS.bg,
+  },
+  /**
+   * 选中整屏背景图时容器必须让位：容器是 Screen 背景图之后的兄弟节点，
+   * 实色底会整块盖住背景图。未选背景图时不加此样式 ⇒ 观感与改造前一致。
+   */
+  containerTransparent: {
+    backgroundColor: 'transparent',
   },
   // 顶栏已下线（原 topBar / topBarSide / topBarRight / backButtonInner / topBarCenter /
 // topBarTitle / topBarSubtitle 全部删除）。

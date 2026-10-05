@@ -12,7 +12,7 @@ import {
   ScrollView,
 } from 'react-native';
 import { Screen } from '@/components/Screen';
-import BoardStyleModal from '@/components/BoardStyleModal';
+import StyleSettingsModal from '@/components/StyleSettingsModal';
 import { useSafeRouter } from '@/hooks/useSafeRouter';
 import { useFocusEffect } from 'expo-router';
 import { FontAwesome6 } from '@expo/vector-icons';
@@ -105,10 +105,11 @@ export default function HomeScreen() {
             style={styles.replayEntry}
             onPress={() => setStyleModalVisible(true)}
             activeOpacity={0.8}
-            accessibilityLabel="棋盘样式"
+            accessibilityLabel="样式设置"
           >
-            {/* 2026-10 由 gear 改为 chess-board：该入口打开的是「棋盘样式选择」
-                （BoardStyleModal），齿轮图标与实际功能不符 */}
+            {/* 2026-10 由 gear 改为 chess-board：该入口打开的是样式设置弹窗
+                （StyleSettingsModal，含「棋盘」「背景」两个分页），
+                齿轮图标与实际功能不符 */}
             <FontAwesome6 name="chess-board" size={17} color={COLORS.primary} />
           </TouchableOpacity>
         </View>
@@ -186,8 +187,8 @@ export default function HomeScreen() {
           </View>
         </ScrollView>
 
-        {/* 棋盘样式设置弹窗 */}
-        <BoardStyleModal
+        {/* 样式设置弹窗（棋盘 / 背景） */}
+        <StyleSettingsModal
           visible={styleModalVisible}
           onClose={() => setStyleModalVisible(false)}
         />

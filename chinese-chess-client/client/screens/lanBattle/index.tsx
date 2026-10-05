@@ -50,6 +50,7 @@ import { saveReplay } from '@/utils/replayStorage';
 import { useBoardLayoutBudget, capHostHeightToViewport } from '@/utils/chess/boardLayoutBudget';
 import { boardAlignedRowStyle } from '@/utils/chess/boardContentWidth';
 import { useBoardStyle } from '@/utils/chess/boardStyleStore';
+import { useBackgroundStyle } from '@/utils/chess/backgroundStyleStore';
 import {
   SettingSelect,
   formStyles,
@@ -187,6 +188,9 @@ export default function LanBattleScreen() {
   const router = useSafeRouter();
   // 安全区：Screen 已在内容之外施加顶部/底部安全区，预算封顶时需据此扣减可用高度
   const insets = useSafeAreaInsets();
+  // 整屏背景（首页「样式设置 → 背景」所选）。未选背景图时不产生任何视觉变化。
+  const background = useBackgroundStyle();
+  const hasBackground = background.image != null;
   // 返回大厅：优先 back 回到栈中已有的大厅页（replace 只是替换栈顶，会在旧大厅之上
   // 再叠一个新大厅，导致用户在大厅点返回时"又回到了大厅"）；Web 刷新等无栈场景兜底 replace
   const exitToLobby = useCallback(() => {
@@ -2597,8 +2601,13 @@ export default function LanBattleScreen() {
     // 【2026-10】去掉 'bottom' 安全区：底部操作栏是主容器的最后一个子节点（固定通栏），
     // 自己用 insets.bottom 撑开内边距。Screen 再补一次底部安全区会让底栏悬在
     // Home Indicator 之上，透明黑底断在半空。
-    <Screen safeAreaEdges={['top', 'left', 'right']}>
-      <View style={styles.container} ref={containerRef}>
+    <Screen
+      safeAreaEdges={['top', 'left', 'right']}
+      backgroundImage={background.image}
+      // 深色背景图（仙山/朱阁）下黑色状态栏图标看不清，切成浅色
+      statusBarStyle={background.tone === 'dark' ? 'light' : 'dark'}
+    >
+      <View style={[styles.container, hasBackground && styles.containerTransparent]} ref={containerRef}>
         {/* 棋盘内容宿主（相对定位；2026-10 起顶部标题栏下线，宿主直接顶到安全区下方） */}
         <View
           style={styles.boardHost}
@@ -3213,6 +3222,13 @@ const styles = StyleSheet.create({
   container: {
     flex: 1,
     backgroundColor: COLORS.background,
+  },
+  /**
+   * 选中整屏背景图时容器必须让位：容器是 Screen 背景图之后的兄弟节点，
+   * 实色底会整块盖住背景图。未选背景图时不加此样式 ⇒ 观感与改造前一致。
+   */
+  containerTransparent: {
+    backgroundColor: 'transparent',
   },
   // 棋盘 + 底部操作栏内容宿主（2026-10 起顶部标题栏下线，宿主直接顶到安全区下方）
   boardHost: {

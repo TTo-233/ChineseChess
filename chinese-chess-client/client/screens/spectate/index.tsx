@@ -30,6 +30,7 @@ import { type BattlePlayer } from '@/utils/battleProtocol';
 import { useBoardLayoutBudget, capHostHeightToViewport } from '@/utils/chess/boardLayoutBudget';
 import { boardAlignedRowStyle } from '@/utils/chess/boardContentWidth';
 import { useBoardStyle } from '@/utils/chess/boardStyleStore';
+import { useBackgroundStyle } from '@/utils/chess/backgroundStyleStore';
 import { Z_INDEX, ELEVATION } from '@/constants/modal';
 import { FONT } from '@/utils/typography';
 
@@ -109,6 +110,9 @@ export default function SpectateScreen() {
   const router = useSafeRouter();
   // 安全区：Screen 已在内容之外施加，预算封顶时需据此扣减可用高度
   const insets = useSafeAreaInsets();
+  // 整屏背景（首页「样式设置 → 背景」所选）。未选背景图时不产生任何视觉变化。
+  const background = useBackgroundStyle();
+  const hasBackground = background.image != null;
   const params = useSafeSearchParams<{ roomId: string; roomName?: string }>();
   const roomId = params.roomId || '';
   const roomName = params.roomName || '';
@@ -624,8 +628,13 @@ export default function SpectateScreen() {
   return (
     // 【2026-10】去掉 'bottom' 安全区：底部操作栏是主容器的最后一个子节点（固定通栏），
     // 自己用 insets.bottom 撑开内边距，避免 Screen 的底部安全区把透明黑底截断在半空。
-    <Screen safeAreaEdges={['top', 'left', 'right']}>
-      <View style={styles.container}>
+    <Screen
+      safeAreaEdges={['top', 'left', 'right']}
+      backgroundImage={background.image}
+      // 深色背景图（仙山/朱阁）下黑色状态栏图标看不清，切成浅色
+      statusBarStyle={background.tone === 'dark' ? 'light' : 'dark'}
+    >
+      <View style={[styles.container, hasBackground && styles.containerTransparent]}>
         {/* 顶部信息栏已于 2026-10 下线：返回与翻转棋盘移入底部操作栏的「菜单」弹出列表，
             房间名 / 观众数移到底部信息行（棋盘下方、底栏之上），保持信息不丢失。 */}
         {/* 棋盘区域 */}
@@ -771,6 +780,13 @@ const styles = StyleSheet.create({
   container: {
     flex: 1,
     backgroundColor: COLORS.background,
+  },
+  /**
+   * 选中整屏背景图时容器必须让位：容器是 Screen 背景图之后的兄弟节点，
+   * 实色底会整块盖住背景图。未选背景图时不加此样式 ⇒ 观感与改造前一致。
+   */
+  containerTransparent: {
+    backgroundColor: 'transparent',
   },
   // 顶栏已下线（原 topBar / backBtnZone / backBtn / gameInfo / gameTitle / gameSubtitle）
   boardHost: {

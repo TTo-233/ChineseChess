@@ -10,6 +10,9 @@ import {
   FlatList,
   SectionList,
   Modal,
+  Image,
+  ImageSourcePropType,
+  ImageResizeMode,
 } from 'react-native';
 import { withUniwind } from 'uniwind';
 import { useSafeAreaInsets, Edge } from 'react-native-safe-area-context';
@@ -78,6 +81,23 @@ interface ScreenProps {
   safeAreaEdges?: Edge[];
   /** 自定义容器样式 */
   style?: ViewStyle;
+  /**
+   * 整屏背景图（可选）。
+   *
+   * 传 `null` / 不传 = 无背景图，观感与传入前完全一致。
+   *
+   * ## 为什么由 Screen 渲染，而不是页面自己放一个绝对定位的 Image
+   *
+   * 背景图必须铺满**物理整屏**（含状态栏那条 `insets.top` 高的区域，否则深色背景图
+   * 上方会留出一条米黄色横条）。而页面的根节点位于 `wrapperStyle` 的内边距之内，
+   * 且当子树不含纵向滚动容器时还会再被包一层 `KeyboardAwareScrollView` ——
+   * ScrollView 会把越界内容裁掉，页面内任何 `top: -insets.top` 的绝对定位都会在
+   * 状态栏边缘被切平。所以背景图必须挂在 `wrapperStyle` 这一层（它的盒子本来就是整屏），
+   * 作为**第一个子节点**渲染：绝对定位铺满并向外扩出安全区，位于所有内容之下。
+   */
+  backgroundImage?: ImageSourcePropType | null;
+  /** 背景图缩放模式，默认 'cover'（居中裁切，不变形） */
+  backgroundResizeMode?: ImageResizeMode;
 }
 
 type KeyboardAwareProps = {
@@ -149,6 +169,8 @@ const RawScreen = ({
   statusBarColor = 'transparent',
   safeAreaEdges = ['top', 'left', 'right', 'bottom'],
   style,
+  backgroundImage,
+  backgroundResizeMode = 'cover',
 }: ScreenProps) => {
   const insets = useSafeAreaInsets();
   const [keyboardShown, setKeyboardShown] = React.useState(false);
@@ -275,6 +297,40 @@ const RawScreen = ({
   return (
     // 核心原则：严禁使用 SafeAreaView，统一使用 View + padding 手动管理
     <View style={wrapperStyle}>
+      {/*
+        整屏背景图：第一个子节点 ⇒ 压在所有内容之下。
+        用负的安全区偏移把盒子撑到物理整屏（wrapperStyle 的内边距会把普通子节点推离边缘，
+        绝对定位在 padding box 内也会被推离，两处都靠负偏移抵消）。
+
+        为什么外面还要套一层 View：【C-80】的教训在这里有两层 ——
+        ① `pointerEvents` 写进 style 会被 RN 静默忽略，必须写成 JSX prop；
+        ② 但 RN 的类型里**只有 View 声明了 `pointerEvents`，ImageProps 没有**
+           （RN 0.81 `Libraries/Components/View/ViewPropTypes.d.ts:199-200` 明确说明
+           "we opt to not include pointerEvents on style"，而 ImageProps 连 prop 都没有）。
+           把 `pointerEvents` 直接写在 Image 上 tsc 会报 TS2769，绕过去也只会被丢掉，
+           于是全屏图会吃掉棋盘上的所有点击。所以由这层 View 承担 pointerEvents。
+      */}
+      {backgroundImage ? (
+        <View
+          pointerEvents="none"
+          style={[
+            styles.background,
+            {
+              top: -insets.top,
+              left: -insets.left,
+              right: -insets.right,
+              bottom: -insets.bottom,
+            },
+          ]}
+        >
+          <Image
+            source={backgroundImage}
+            resizeMode={backgroundResizeMode}
+            style={styles.backgroundImage}
+          />
+        </View>
+      ) : null}
+
       {/* 状态栏配置：强制透明背景 + 沉浸式，以支持背景图延伸 */}
       <StatusBar
         style={statusBarStyle}
@@ -312,6 +368,12 @@ const styles = StyleSheet.create({
     flex: 1,
     // 确保内部容器透明，避免背景色遮挡
     backgroundColor: 'transparent',
+  },
+  background: {
+    position: 'absolute',
+  },
+  backgroundImage: {
+    ...StyleSheet.absoluteFillObject,
   },
 });
 
