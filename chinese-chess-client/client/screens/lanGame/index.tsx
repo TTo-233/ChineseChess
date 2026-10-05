@@ -39,6 +39,11 @@ import {
   BYOYOMI_OPTIONS,
 } from '@/components/RoomSettingsControls';
 import { FONT } from '@/utils/typography';
+import {
+  TITLE_BAR_PADDING_HORIZONTAL,
+  TITLE_BAR_PADDING_VERTICAL,
+  BACK_BUTTON_SIZE,
+} from '@/constants/chrome';
 
 const COLORS = {
   background: '#F5F0E8',
@@ -1060,15 +1065,28 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: COLORS.background,
   },
+  /**
+   * 顶部标题栏：几何收敛到 `@/constants/chrome`，与其余各屏一致。
+   *
+   * 2026-10 改造前这里是 `padding: 16` + `paddingBottom: 8`（上下不对称，合计 24 ⇒ 栏高 64），
+   * 比其余各屏（56 / 60）都高。现统一为 `paddingHorizontal 16 / paddingVertical 8`（栏高 56）。
+   *
+   * 注意本栏**故意没有** `borderBottom`（其余各屏有）：紧随其后的 `serverStatusBar`
+   * 与本栏同底色、视觉上连为一体（见该样式注释），在本栏底部画一条分隔线会把这一整块
+   * 从中间切断。该"头部区"真正的底边线由 `serverStatusBar` 的 `borderBottom` 承担，位置正确。
+   */
   topBar: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    padding: 16,
-    paddingBottom: 8,
+    paddingHorizontal: TITLE_BAR_PADDING_HORIZONTAL,
+    paddingVertical: TITLE_BAR_PADDING_VERTICAL,
     backgroundColor: COLORS.card,
   },
-  // 服务器连接状态条（顶部标题下方，与顶栏视觉连为一体）
+  /**
+   * 服务器连接状态条：与上方 `topBar` 同底色、视觉上连为一体，因此 `topBar` 不画底边框
+   * （见 `topBar` 注释）。整个"头部区"真正的底边线由本条的 `borderBottom` 承担。
+   */
   serverStatusBar: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -1080,10 +1098,10 @@ const styles = StyleSheet.create({
     borderBottomWidth: 1,
     borderBottomColor: COLORS.border,
   },
-  /** 返回按钮：与人机对战/残局闯关/对局页统一的 40×40 圆角卡片样式 */
+  /** 返回按钮：与人机难度/残局闯关/复盘列表统一的 40×40 圆角卡片样式 */
   backBtn: {
-    width: 40,
-    height: 40,
+    width: BACK_BUTTON_SIZE,
+    height: BACK_BUTTON_SIZE,
     justifyContent: 'center',
     alignItems: 'center',
     borderRadius: 12,

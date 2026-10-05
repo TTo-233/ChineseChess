@@ -17,6 +17,11 @@ import { useFocusEffect } from 'expo-router';
 import { FontAwesome6 } from '@expo/vector-icons';
 import { hasSave, loadGame, deleteSave, resolveFirstMover } from '@/utils/GameSave';
 import { FONT } from '@/utils/typography';
+import {
+  TITLE_BAR_PADDING_HORIZONTAL,
+  TITLE_BAR_PADDING_VERTICAL,
+  BACK_BUTTON_SIZE,
+} from '@/constants/chrome';
 
 const COLORS = {
   primary: '#8B6914',
@@ -115,7 +120,7 @@ export default function PveSetupScreen() {
           <FontAwesome6 name="chevron-left" size={20} color={COLORS.text} />
         </TouchableOpacity>
         <Text style={styles.topTitle} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.75}>人机对战</Text>
-        <View style={{ width: 40 }} />
+        <View style={{ width: BACK_BUTTON_SIZE }} />
       </View>
 
       <ScrollView
@@ -254,16 +259,16 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    paddingHorizontal: 16,
-    paddingVertical: 12,
+    paddingHorizontal: TITLE_BAR_PADDING_HORIZONTAL,
+    paddingVertical: TITLE_BAR_PADDING_VERTICAL,
     backgroundColor: COLORS.bgCard,
     borderBottomWidth: 1,
     borderBottomColor: COLORS.border,
   },
-  /** 返回按钮：与残局闯关/在线对局/对局页统一的 40×40 圆角卡片样式 */
+  /** 返回按钮：与残局闯关/在线对局/复盘列表统一的 40×40 圆角卡片样式 */
   backButton: {
-    width: 40,
-    height: 40,
+    width: BACK_BUTTON_SIZE,
+    height: BACK_BUTTON_SIZE,
     borderRadius: 12,
     backgroundColor: COLORS.bgCard,
     borderWidth: 1,

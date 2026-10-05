@@ -43,6 +43,11 @@ import {
   type EndgameLaunchParams,
 } from '@/utils/EndgameProgress';
 import { FONT } from '@/utils/typography';
+import {
+  TITLE_BAR_PADDING_HORIZONTAL,
+  TITLE_BAR_PADDING_VERTICAL,
+  BACK_BUTTON_SIZE,
+} from '@/constants/chrome';
 
 // 主题色 - 浅色复古系（与首页一致）
 const COLORS = {
@@ -626,15 +631,15 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    paddingHorizontal: 16,
-    paddingVertical: 10,
+    paddingHorizontal: TITLE_BAR_PADDING_HORIZONTAL,
+    paddingVertical: TITLE_BAR_PADDING_VERTICAL,
     backgroundColor: COLORS.bgCard,
     borderBottomWidth: 1,
     borderBottomColor: COLORS.border,
   },
   backButton: {
-    width: 40,
-    height: 40,
+    width: BACK_BUTTON_SIZE,
+    height: BACK_BUTTON_SIZE,
     justifyContent: 'center',
     alignItems: 'center',
     borderRadius: 12,
