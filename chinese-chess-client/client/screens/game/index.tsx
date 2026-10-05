@@ -8,6 +8,7 @@ import {
   View,
   Text,
   TouchableOpacity,
+  Pressable,
   StyleSheet,
   useWindowDimensions,
   Animated,
@@ -19,7 +20,8 @@ import { AppDialog, GameNotice, type GameNoticeItem } from '@/components/Modal';
 import { useSafeRouter, useSafeSearchParams } from '@/hooks/useSafeRouter';
 import { useNavigation } from 'expo-router';
 import { FontAwesome6 } from '@expo/vector-icons';
-import ChessBoard, { CapturedPiecesDrawer } from '@/components/ChessBoard';
+import ChessBoard from '@/components/ChessBoard';
+import GameBottomBar, { type GameBottomBarActionInput, type GameMenuItem } from '@/components/GameBottomBar';
 import JueShaOverlay from '@/components/JueShaOverlay';
 import { useMoveEffect } from '@/hooks/useMoveEffect';
 import { useGameBoardLayout } from '@/hooks/useGameBoardLayout';
@@ -220,29 +222,6 @@ export default function GameScreen() {
   // 吃子/将军特效（含连续将军节流策略）
   const { moveEffect, triggerMoveEffect } = useMoveEffect();
 
-  // 计算被吃掉的棋子
-  //
-  // 【P4】改为 useMemo：原来是每次渲染都重新遍历 32 个棋子并新建两个数组，
-  // 但 gameState.pieces 这个数组只在局面变化时才换引用，所以只要依赖不变
-  // 拿到的就是同一份结果——没有任何理由在每次渲染时重算。
-  const { capturedByRed, capturedByBlack } = useMemo(() => {
-    const byRed: number[] = []; // 红方吃掉的（黑方棋子）
-    const byBlack: number[] = []; // 黑方吃掉的（红方棋子）
-
-    gameState.pieces.forEach(piece => {
-      if (!piece.alive) {
-        // 棋子ID 0-15 是黑方，16-31 是红方
-        if (piece.id < 16) {
-          byRed.push(piece.id); // 黑方棋子被红方吃掉
-        } else {
-          byBlack.push(piece.id); // 红方棋子被黑方吃掉
-        }
-      }
-    });
-
-    return { capturedByRed: byRed, capturedByBlack: byBlack };
-  }, [gameState.pieces]);
-
   // 加载存档；并在进入对局时预加载常用音效、预热音频模式
   // （预加载会为每条音轨做一次静音预热，消除首步音效的按需加载延迟与
   //   音轨首次入混的竞态；成因与对策详见 utils/SoundManager 头注释）
@@ -325,13 +304,10 @@ export default function GameScreen() {
     setEndgameUndoLeft,
     setBoardKey,
   });
-  // 被吃棋子明细抽屉展开的一侧（null=收起），抽屉渲染在顶部标题行正下方
-  const [capturedDrawerSide, setCapturedDrawerSide] = useState<'opponent' | 'mine' | null>(null);
-  // 棋盘可用纵向空间实测（宽屏/纵向空间不足时限制棋盘尺寸，避免挤占标题行与底部操作栏）
+  // 棋盘可用纵向空间实测（宽屏/纵向空间不足时限制棋盘尺寸，避免挤占底部操作栏）
   const [boardAreaH, setBoardAreaH] = useState(0);
-  const [bottomBarH, setBottomBarH] = useState(0);
-  // 棋盘内容宿主顶边相对页面内容顶边的 Y（含顶部栏与顶部安全区）：预算封顶时用于推算可用高度
-  const [drawerHostY, setDrawerHostY] = useState(0);
+  // 棋盘内容宿主顶边相对页面内容顶边的 Y（含顶部安全区）：预算封顶时用于推算可用高度
+  const [boardHostY, setBoardHostY] = useState(0);
 
   // 长将长捉/判和规则提示（阈值前一步的一次性预警，【提示口径 2026-10】）：
   // 与联机对战一致，统一用覆盖在棋盘中央的 GameNotice 横幅
@@ -367,8 +343,7 @@ export default function GameScreen() {
     boardRef,
   } = useGameBoardLayout({
     boardAreaH,
-    bottomBarH,
-    drawerHostY,
+    boardHostY,
     insetsTop: insets.top,
     insetsBottom: insets.bottom,
     jueshaVisible: jueShaVisible,
@@ -1070,83 +1045,104 @@ export default function GameScreen() {
         .filter(Boolean)
         .join('·');
 
+  // ===== 底部操作栏配置（2026-10 改造：三模式从左到右的按键集合）=====
+  // 人机对战：菜单 / 提示 / 悔棋 / 重开（"翻转"按用户要求移入「菜单」弹出列表）
+  // 残局闯关：返回 / 提示 / 悔棋 / 重开（残局不允许翻转，故无翻转；说明入口随标题栏下线）
+  const pveBarActions: GameBottomBarActionInput[] = useMemo(
+    () => [
+      { key: 'menu', icon: 'bars', label: '菜单' },
+      { key: 'hint', icon: 'lightbulb', label: '提示', disabled: !canHint, onPress: handleHint },
+      {
+        key: 'undo',
+        icon: 'rotate-left',
+        label: '悔棋',
+        disabled: gameState.moveHistory.length < 2 || aiThinking,
+        onPress: handleUndo,
+      },
+      { key: 'restart', icon: 'rotate-right', label: '重开', onPress: handleRestart },
+    ],
+    [canHint, handleHint, gameState.moveHistory.length, aiThinking, handleUndo, handleRestart]
+  );
+  const pveMenuItems: GameMenuItem[] = useMemo(
+    () => [
+      { key: 'flip', icon: 'arrows-rotate', label: '翻转棋盘', onPress: handleFlip },
+      { key: 'exit', icon: 'door-open', label: '退出对局', onPress: handleBack },
+    ],
+    [handleFlip, handleBack]
+  );
+  const endgameBarActions: GameBottomBarActionInput[] = useMemo(
+    () => [
+      { key: 'back', icon: 'arrow-left', label: '返回', onPress: handleBack },
+      {
+        key: 'hint',
+        icon: 'lightbulb',
+        label: '提示',
+        disabled: !canEndgameHint,
+        badge: endgameHintLeft,
+        onPress: handleHint,
+      },
+      {
+        key: 'undo',
+        icon: 'rotate-left',
+        label: '悔棋',
+        disabled: !canEndgameUndo,
+        badge: endgameUndoLeft,
+        onPress: handleUndo,
+      },
+      { key: 'restart', icon: 'rotate-right', label: '重开', onPress: handleRestart },
+    ],
+    [
+      handleBack,
+      handleHint,
+      canEndgameHint,
+      endgameHintLeft,
+      handleUndo,
+      canEndgameUndo,
+      endgameUndoLeft,
+      handleRestart,
+    ]
+  );
+
   return (
-    <Screen>
+    // 【2026-10】去掉 'bottom' 安全区：底部操作栏改为主容器最后一个子节点（固定通栏），
+    // 它自己用 insets.bottom 撑开内边距。Screen 再补一次底部安全区会让底栏悬在
+    // Home Indicator 之上，底色断在半空。
+    <Screen safeAreaEdges={['top', 'left', 'right']}>
       <View style={styles.container} ref={containerRef}>
-        {/* 顶部信息栏 */}
-        <View style={styles.topBar}>
-          <View style={styles.backButton}>
-            <TouchableOpacity onPress={handleBack} style={styles.backButtonInner}>
-              <FontAwesome6 name="chevron-left" size={20} color={COLORS.text} />
-            </TouchableOpacity>
-          </View>
-
-          <View style={styles.gameInfo}>
-            {/* 标题行：标题 + 标题右侧紧邻的玩法说明标识（残局闯关专用，样式与选关页标题行一致） */}
-            <View style={styles.gameTitleRow}>
-              <Text style={styles.gameTitle} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.75}>
-                {isEndgame && currentEndgame
-                  ? (currentEndgame.levelIndex >= 0 ? `残局闯关 · 第${currentEndgame.levelIndex + 1}关` : '残局闯关 · 自定义')
-                  : '人机对战'}
-              </Text>
-              {isEndgame && currentEndgame && (
-                <TouchableOpacity
-                  onPress={() => setEndgameInfoVisible(true)}
-                  accessibilityLabel="玩法说明"
-                  accessibilityRole="button"
-                  hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
-                >
-                  <FontAwesome6 name="circle-info" size={14} color={COLORS.primary} />
-                </TouchableOpacity>
-              )}
-            </View>
-            <Text style={styles.gameSubtitle}>
-              {isEndgame && currentEndgame
-                ? `${currentEndgame.name}${currentEndgame.tier ? ` · ${currentEndgame.tier}` : ''} · 大师难度\n第 ${Math.ceil(moveCount / 2) + 1} 回合`
-                : `${difficultyLabel} · 执${currentPlayerSide === 'red' ? '红' : '黑'}${aiFirst ? '后手' : '先手'}\n第 ${Math.ceil(moveCount / 2) + 1} 回合`}
-            </Text>
-          </View>
-
-          <View style={styles.turnIndicator}>
-            <View style={[
-              styles.turnDot,
-              // 圆点跟随"当前走棋方"的棋子颜色（红方走=红、黑方走=黑），
-              // 翻转换边后仍与棋盘上一致；不能按 isPlayerTurn 取色（执黑时会反色）
-              { backgroundColor: gameState.sideTag === RED_SIDE ? COLORS.redPiece : COLORS.blackPiece },
-            ]} />
-            <Text style={styles.turnText}>
-              {aiThinking ? 'AI思考中' : (isPlayerTurn ? '你的回合' : 'AI回合')}
-            </Text>
-          </View>
-        </View>
-
-        {/* 标题行下方内容宿主（相对定位，被吃棋子抽屉锚定于此 = 标题行正下方） */}
+        {/* 棋盘区域 + 底部操作栏。
+            【2026-10 布局改造】顶部标题栏（含返回键、局名/回合信息、回合指示）整体下线：
+            返回入口移到残局模式底栏的「返回」，人机模式移到「菜单」弹出列表；回合信息不再需要，
+            当前走子方在棋盘上由回合高亮/提示条表达。标题栏腾出的空间全部归棋盘。 */}
         <View
-          style={styles.capturedDrawerHost}
+          style={styles.boardHost}
           onLayout={(e) => {
             setBoardAreaH(e.nativeEvent.layout.height);
-            setDrawerHostY(e.nativeEvent.layout.y);
+            setBoardHostY(e.nativeEvent.layout.y);
           }}
         >
-          {/* 被吃棋子明细抽屉：点击摘要文字后自标题行向下展开（浮层，棋盘不动） */}
-          <CapturedPiecesDrawer
-            side={capturedDrawerSide}
-            gameState={gameState}
-            playerSide={currentPlayerSide}
-            maxBoardHeight={maxBoardHeight}
-          />
-
-          {/* 棋盘区域 + 底部操作栏（顶部留白由预算控制：优先垂直居中，预留不足时整体下移贴住预留区） */}
+          {/* 内容垂直居中（boardPadTop 由纵向预算给出） */}
           <View style={[styles.boardContainer, { paddingTop: boardPadTop }]}>
             {/* AI 标识角标行：棋盘上方独立行，左对齐（参照联机对战对手名称角标样式），
-                实时指示当前 AI 引擎来源——绿色指示灯=云端皮卡鱼（含深度），灰色指示灯=本地AI（含难度） */}
-            <View style={[styles.aiNameRow, alignedRowStyle]} pointerEvents="none">
+                实时指示当前 AI 引擎来源——绿色指示灯=云端皮卡鱼（含深度），灰色指示灯=本地AI（含难度）。
+                残局模式下补一枚说明图标：标题栏 2026-10 下线后，说明弹窗的入口就地挪到这里。 */}
+            <View style={[styles.aiNameRow, alignedRowStyle]} pointerEvents="box-none">
               <View style={styles.aiNameChip}>
                 <View style={[styles.aiNameChipDot, aiIsOnline && styles.aiNameChipDotOnline]} />
                 <Text style={styles.aiNameChipText} numberOfLines={1}>
                   {aiChipLabel}
                 </Text>
               </View>
+              {isEndgame && currentEndgame && (
+                <Pressable
+                  onPress={() => setEndgameInfoVisible(true)}
+                  accessibilityLabel="玩法说明"
+                  accessibilityRole="button"
+                  hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                  style={styles.aiNameRowInfo}
+                >
+                  <FontAwesome6 name="circle-info" size={14} color={COLORS.primary} />
+                </Pressable>
+              )}
             </View>
 
             {/* 棋盘几何测量包裹层：绝杀特效据此锁定棋盘中心/底边（collapsable=false 保证 Android 可测量） */}
@@ -1162,14 +1158,9 @@ export default function GameScreen() {
               onEmptyPress={handleEmptyPress}
               onMove={handleEmptyPress}
               aiThinking={aiThinking}
-              capturedByRed={capturedByRed}
-              capturedByBlack={capturedByBlack}
-              hideCaptured={jueShaVisible}
               playerSide={currentPlayerSide}
               hintMove={hintMove}
-              onCapturedPress={(side) => setCapturedDrawerSide(prev => (prev === side ? null : side))}
               maxBoardHeight={maxBoardHeight}
-              capturedStripOffset={30}
               moveEffect={moveEffect}
               // 【提示口径 2026-10】不再向棋盘下发 banMoves 标红：提示统一收敛到
               // 「阈值前一步的一次性提示条」。banMoves 本身仍在 RuleState 里计算，
@@ -1180,96 +1171,6 @@ export default function GameScreen() {
               onBoardLayout={stableSetBoardSize}
             />
             </View>
-
-          {/* 底部操作栏（绝杀特效显示时隐藏但保持占位，防止棋盘位置移动）
-              残局闯关规则：不允许翻转；每局限 3 次提示（走皮卡鱼）+ 10 次悔棋，
-              剩余次数以按钮右上角数字角标展示；「说明」已移至标题行右侧标识 */}
-          <View
-            style={[styles.bottomBar, alignedRowStyle, { marginTop: dynamicGap }, jueShaVisible && { opacity: 0 }]}
-            pointerEvents={jueShaVisible ? 'none' : 'auto'}
-            onLayout={(e) => setBottomBarH(e.nativeEvent.layout.height)}
-          >
-            {isEndgame ? (
-              <>
-                <TouchableOpacity
-                  style={[styles.actionButton, !canEndgameHint && styles.actionButtonDisabled]}
-                  onPress={handleHint}
-                  disabled={!canEndgameHint}
-                >
-                  {/* 图标/加载指示器置于固定尺寸容器内：切换 icon↔spinner 时按钮高度不变，
-                      避免 bottomBarH 抖动 → 棋盘预算重算 → 棋盘忽大忽小 */}
-                  <View style={styles.actionIconFrame}>
-                    {hintLoading ? (
-                      <ActivityIndicator size="small" color={COLORS.textMuted} />
-                    ) : (
-                      <FontAwesome6 name="lightbulb" size={16} color={canEndgameHint ? COLORS.text : COLORS.textMuted} />
-                    )}
-                  </View>
-                  <Text style={[styles.actionButtonText, !canEndgameHint && { color: COLORS.textMuted }]}>
-                    提示
-                  </Text>
-                  {/* 剩余提示次数：按钮右上角数字角标（样式同棋盘棋子数量角标） */}
-                  <View style={styles.countBadge}>
-                    <Text style={styles.countBadgeText}>{endgameHintLeft}</Text>
-                  </View>
-                </TouchableOpacity>
-
-                <TouchableOpacity
-                  style={[styles.actionButton, !canEndgameUndo && styles.actionButtonDisabled]}
-                  onPress={handleUndo}
-                  disabled={!canEndgameUndo}
-                >
-                  <FontAwesome6
-                    name="rotate-left"
-                    size={16}
-                    color={canEndgameUndo ? COLORS.text : COLORS.textMuted}
-                  />
-                  <Text style={[styles.actionButtonText, !canEndgameUndo && { color: COLORS.textMuted }]}>
-                    悔棋
-                  </Text>
-                  {/* 剩余悔棋次数：按钮右上角数字角标（悔棋不参与金/银/铜冠评定） */}
-                  <View style={styles.countBadge}>
-                    <Text style={styles.countBadgeText}>{endgameUndoLeft}</Text>
-                  </View>
-                </TouchableOpacity>
-
-                <TouchableOpacity style={styles.actionButton} onPress={handleRestart}>
-                  <FontAwesome6 name="rotate-right" size={16} color={COLORS.text} />
-                  <Text style={styles.actionButtonText}>重开</Text>
-                </TouchableOpacity>
-              </>
-            ) : (
-              <>
-                <TouchableOpacity
-                  style={[styles.actionButton, !canHint && styles.actionButtonDisabled]}
-                  onPress={handleHint}
-                  disabled={!canHint}
-                >
-                  <FontAwesome6 name="lightbulb" size={16} color={canHint ? '#F57C00' : COLORS.textMuted} solid />
-                  <Text style={[styles.actionButtonText, !canHint && { color: COLORS.textMuted }]}>提示</Text>
-                </TouchableOpacity>
-
-                <TouchableOpacity
-                  style={[styles.actionButton, gameState.moveHistory.length < 2 && styles.actionButtonDisabled]}
-                  onPress={handleUndo}
-                  disabled={gameState.moveHistory.length < 2 || aiThinking}
-                >
-                  <FontAwesome6 name="rotate-left" size={16} color={COLORS.text} />
-                  <Text style={styles.actionButtonText}>悔棋</Text>
-                </TouchableOpacity>
-
-                <TouchableOpacity style={styles.actionButton} onPress={handleFlip}>
-                  <FontAwesome6 name="arrows-rotate" size={16} color={COLORS.text} />
-                  <Text style={styles.actionButtonText}>翻转</Text>
-                </TouchableOpacity>
-
-                <TouchableOpacity style={styles.actionButton} onPress={handleRestart}>
-                  <FontAwesome6 name="rotate-right" size={16} color={COLORS.text} />
-                  <Text style={styles.actionButtonText}>重开</Text>
-                </TouchableOpacity>
-              </>
-            )}
-          </View>
           </View>
 
           {/* 长将长捉规则提示（方案 12 文案）：接近阈值/禁着/违规警告。
@@ -1354,6 +1255,24 @@ export default function GameScreen() {
             />
           );
         })()}
+
+        {/* 底部操作栏（2026-10 第二轮改造）
+            位置：作为主容器的**最后一个**子节点，固定在屏幕最底端（此前挂在棋盘宿主内，
+            只是「棋盘下方」，底栏高度变化/棋盘纵向居中都会带着它上下浮动）。
+            为此 <Screen> 去掉 bottom 安全区（由 GameBottomBar 的 bottomInset 自行撑开），
+            让底栏的透明黑底一路铺到物理底边、盖住 Home Indicator 区域。
+            绝杀特效显示时隐藏但保持占位，防止棋盘位置移动。
+            人机对战：菜单 / 提示 / 悔棋 / 重开（翻转移入「菜单」弹出列表）
+            残局闯关：返回 / 提示 / 悔棋 / 重开（标题栏下线后，残局说明改挂到 AI 标识行
+            的关卡名角标上，用一个提示图标就地唤起原来的说明弹窗） */}
+        <GameBottomBar
+          widthStyle={alignedRowStyle}
+          style={{ marginTop: dynamicGap }}
+          bottomInset={insets.bottom}
+          hidden={jueShaVisible}
+          actions={isEndgame ? endgameBarActions : pveBarActions}
+          menuItems={isEndgame ? undefined : pveMenuItems}
+        />
       </View>
 
       {/* 残局说明弹窗 */}
@@ -1400,79 +1319,6 @@ const styles = StyleSheet.create({
     backgroundColor: COLORS.bg,
     alignItems: 'center',
   },
-  topBar: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    paddingHorizontal: 16,
-    paddingTop: 8,
-    paddingBottom: 8,
-    width: '100%',
-    // 与其他界面标题行一致的暖白底色 + 底部分隔线
-    backgroundColor: COLORS.bgCard,
-    borderBottomWidth: 1,
-    borderBottomColor: COLORS.border,
-  },
-  backButton: {
-    width: 100,
-    justifyContent: 'center',
-  },
-  backButtonInner: {
-    width: 40,
-    height: 40,
-    justifyContent: 'center',
-    alignItems: 'center',
-    borderRadius: 12,
-    backgroundColor: COLORS.bgCard,
-    borderWidth: 1,
-    borderColor: COLORS.border,
-  },
-  gameInfo: {
-    flex: 1,
-    alignItems: 'center',
-  },
-  // 标题行：标题 + 紧邻其右侧的玩法说明标识（残局闯关；与选关页 headerTitleRow 同款）
-  gameTitleRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 6,
-  },
-  gameTitle: {
-    fontSize: FONT.title,
-    fontWeight: '700',
-    color: COLORS.text,
-  },
-  gameSubtitle: {
-    fontSize: FONT.caption,
-    color: COLORS.textMuted,
-    marginTop: 2,
-    textAlign: 'center',
-    lineHeight: 17,
-  },
-  turnIndicator: {
-    width: 100,
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'flex-end',
-    gap: 6,
-    backgroundColor: COLORS.bgCard,
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: COLORS.border,
-  },
-  turnDot: {
-    width: 8,
-    height: 8,
-    borderRadius: 4,
-  },
-  turnText: {
-    fontSize: FONT.caption,
-    color: COLORS.text,
-    fontWeight: '600',
-  },
-  // AI 标识角标行：棋盘上方独立行（与联机对战名字角标同款药丸样式），左对齐
   aiNameRow: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -1510,73 +1356,19 @@ const styles = StyleSheet.create({
     color: COLORS.text,
     flexShrink: 1,
   },
-  // 标题行下方内容宿主：被吃棋子抽屉（绝对定位）锚定于此容器顶部
-  capturedDrawerHost: {
+  // 残局说明入口：贴在引擎标识角标右侧（标题栏下线后无处安放说明弹窗触发器）
+  aiNameRowInfo: {
+    marginLeft: 8,
+    padding: 2,
+  },
+  // 棋盘 + 底部操作栏的内容宿主（顶部标题栏已于 2026-10 下线，宿主直接顶到安全区下方）
+  boardHost: {
     flex: 1,
   },
   boardContainer: {
     flex: 1,
     justifyContent: 'flex-start',
     alignItems: 'center',
-  },
-  bottomBar: {
-    flexDirection: 'row',
-    justifyContent: 'center',
-    gap: 8,
-    paddingHorizontal: 16,
-    // 宽度在渲染处以数值屏宽传入（部分 Android 设备的 Yoga 对百分比/strech
-    // 处理不可靠），按钮 flex:1 等分可用宽度，保证任何屏宽下不溢出
-  },
-  actionButton: {
-    flex: 1,
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    gap: 5,
-    backgroundColor: COLORS.bgCard,
-    paddingHorizontal: 6,
-    paddingVertical: 12,
-    borderRadius: 14,
-    borderWidth: 1,
-    borderColor: COLORS.border,
-  },
-  actionButtonDisabled: {
-    opacity: 0.4,
-  },
-  // 固定尺寸的图标容器：提示按钮在 icon↔加载指示器间切换时占位不变，
-  // 保证底部操作栏高度稳定，棋盘布局预算不随之抖动
-  actionIconFrame: {
-    width: 20,
-    height: 20,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  actionButtonText: {
-    fontSize: FONT.body,
-    fontWeight: '600',
-    color: COLORS.text,
-  },
-  // 次数角标：按钮右上角红色圆形数字标识（样式与棋盘/摆子栏的棋子数量角标一致：
-  // 红底白字 + 白细边），略微越出按钮边缘形成叠加感；数字为剩余可用次数
-  countBadge: {
-    position: 'absolute',
-    top: -6,
-    right: -6,
-    minWidth: 17,
-    height: 17,
-    borderRadius: 9,
-    paddingHorizontal: 3,
-    backgroundColor: '#C62828',
-    alignItems: 'center',
-    justifyContent: 'center',
-    borderWidth: 1,
-    borderColor: 'rgba(255, 255, 255, 0.85)',
-  },
-  countBadgeText: {
-    color: '#FFFFFF',
-    fontSize: FONT.micro,
-    fontWeight: '700',
-    lineHeight: 13,
   },
   // 弹窗遮罩/卡片/按钮样式已收敛到 @/components/Modal（AppModal / AppDialog / ModalButton），
   // 尺寸与配色统一走 @/constants/modal 的 Design Tokens。

@@ -15,11 +15,11 @@ export type BoardStyleId = 'classic' | 'huali' | 'xuanmo';
  * 棋盘相对屏幕左右两侧的留白总量（两侧合计，屏幕与棋盘本体边缘之间各留 BOARD_H_PADDING / 2）。
  *
  * 全仓库唯一的棋盘横向留白来源：凡「按屏宽换算棋盘缩放」的地方都必须取本常量，
- * 包括 ChessBoard / CapturedPiecesDrawer（components/ChessBoard.tsx）、BoardEditor
- * （components/BoardEditor.tsx）、残局摆棋面板（screens/endgameEdit/index.tsx）、
- * 布局预算与对齐行宽度（utils/chess/capturedDrawerMetrics.ts、utils/chess/boardContentWidth.ts）
+ * 包括棋盘本体（components/ChessBoard.tsx）、摆棋编辑器（components/BoardEditor.tsx）、
+ * 残局摆棋面板（screens/endgameEdit/index.tsx）、
+ * 布局预算与对齐行宽度（utils/chess/boardLayoutBudget.ts、utils/chess/boardContentWidth.ts）
  * 以及绝杀特效的兜底估算（components/JueShaOverlay.tsx）。
- * 各处此前各自硬编码同一个 16，任何一处漏改都会让棋盘与角标行/抽屉/特效错位。
+ * 各处此前各自硬编码同一个 16，任何一处漏改都会让棋盘与角标行/特效错位。
  *
  * 历史值 16（单侧 8）；2026-10 依据真机反馈「棋盘与屏幕两侧还有一定空余」收紧一半为 8（单侧 4）。
  */

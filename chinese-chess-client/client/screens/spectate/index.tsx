@@ -14,7 +14,12 @@ import { useSafeRouter, useSafeSearchParams } from '@/hooks/useSafeRouter';
 import { FontAwesome6 } from '@expo/vector-icons';
 import { type GameState } from '@/utils/chess/GameEngine';
 import { RED_SIDE, type SideTag } from '@/utils/chess/types';
-import ChessBoard, { CapturedPiecesDrawer } from '@/components/ChessBoard';
+import ChessBoard from '@/components/ChessBoard';
+import GameBottomBar, {
+  BOTTOM_BAR_HEIGHT,
+  type GameBottomBarActionInput,
+  type GameMenuItem,
+} from '@/components/GameBottomBar';
 import { useMoveEffect } from '@/hooks/useMoveEffect';
 import { playJiangJunSound, playSound, preloadSounds, unloadAllSounds } from '@/utils/SoundManager';
 import { getOnlineServerUrl } from '@/utils/serverConfig';
@@ -22,7 +27,7 @@ import { serverNow } from '@/utils/serverClock';
 import { BattleSocket } from '@/utils/battleSocket';
 import { useBattleStateSync } from '@/hooks/useBattleStateSync';
 import { type BattlePlayer } from '@/utils/battleProtocol';
-import { useBoardLayoutBudget, capHostHeightToViewport } from '@/utils/chess/capturedDrawerMetrics';
+import { useBoardLayoutBudget, capHostHeightToViewport } from '@/utils/chess/boardLayoutBudget';
 import { boardAlignedRowStyle } from '@/utils/chess/boardContentWidth';
 import { useBoardStyle } from '@/utils/chess/boardStyleStore';
 import { Z_INDEX, ELEVATION } from '@/constants/modal';
@@ -45,6 +50,12 @@ const COLORS = {
 const screenWidth = Dimensions.get('window').width;
 // 窗口高度：用于把棋盘宿主实测高度封顶到视口内，打断宽屏纵向溢出的正反馈
 const windowHeight = Dimensions.get('window').height;
+
+// 底部信息行（房间名 / 观众数 / 回合进度 / 行棋方）在棋盘宿主之外、纵向流内的占位高度。
+// 与 StyleSheet 里 infoRow height 30 + marginBottom 2 保持一致；该行与固定底栏
+// 都在棋盘宿主之外，参与 capHostHeightToViewport 的 belowHostHeight 扣减。
+// 实测值可用时以实测优先（见下方 infoRowH），常量只作为首帧兜底，避免常量与样式脱节。
+const BOARD_INFO_ROW_FLOW_HEIGHT = 32;
 
 // 观战页只读取 id / name / side：直接改用协议层类型，避免本地接口与负载形状重复定义
 type RoomPlayer = BattlePlayer;
@@ -127,8 +138,6 @@ export default function SpectateScreen() {
   const [activeEmojis, setActiveEmojis] = useState<{ id: string; playerId: string; emoji: string; receivedAt: number }[]>([]);
 
   const { moveEffect, triggerMoveEffect } = useMoveEffect();
-  // 被吃棋子明细抽屉展开的一侧（null=收起），抽屉渲染在顶部标题行正下方（与人机对战一致）
-  const [capturedDrawerSide, setCapturedDrawerSide] = useState<'opponent' | 'mine' | null>(null);
   const phaseRef = useRef<SpectatePhase>('connecting');
   const mountedRef = useRef(true);
   // 观众身份 ID 必须全程稳定：心跳靠它续期、离场靠它注销，每次现生成会导致服务端无法匹配
@@ -139,34 +148,34 @@ export default function SpectateScreen() {
 
   // 棋盘区域尺寸测算（与人机/在线对局一致的居中布局）
   const [boardAreaH, setBoardAreaH] = useState(0);
-  const [bottomBarH, setBottomBarH] = useState(0);
-  // 棋盘内容宿主顶边相对页面内容顶边的 Y（含顶部栏与顶部安全区）：预算封顶时用于推算可用高度
-  const [drawerHostY, setDrawerHostY] = useState(0);
+  // 棋盘内容宿主顶边相对页面内容顶边的 Y（含顶部安全区）：预算封顶时用于推算可用高度
+  const [boardHostY, setBoardHostY] = useState(0);
+  // 底部信息行实测高度（棋盘宿主之外，随内容变化）；0 = 未测得，用常量兜底
+  const [infoRowH, setInfoRowH] = useState(0);
   const dynamicGap = Math.max(Math.round(screenWidth * 0.03), 8);
   // 当前棋盘样式：角标行宽度需按样式几何换算棋盘本体宽度
   const boardStyle = useBoardStyle();
-  // 棋盘高度预算 + 垂直定位留白（二分求解，口径与抽屉真实尺寸一致）：
-  // 条件 1 —— 棋盘顶边上方常驻预留「名称角标行(30) + 摘要条悬浮区(38+30) + 抽屉展开高度」，
-  //           无论抽屉是否点开都预留，保证展开时底边不压棋盘、不与摘要条/角标重叠；
+  // 棋盘高度预算 + 垂直定位留白（口径与对局页一致）：
+  // 条件 1 —— 棋盘顶边上方常驻预留「名称角标行(30)」，棋盘取到预留允许的最大尺寸；
   // 条件 2 —— 内容（上角标行 + 棋盘 + 下角标行）在宿主内垂直居中；居中时上方预留不足则整体
-  //           下移贴住预留区（把下方空白让给棋盘），棋盘取到预留允许的最大尺寸。
-  // 底部信息栏在宿主之外（宿主高本身已不含它，不再重复扣减），下方流内占位仅计下方名称角标行(26+2×2=30)。
+  //           下移贴住预留区（把下方空白让给棋盘）。
+  // 底部信息行 + 固定底栏在宿主之外（宿主高本身已不含它们），需作为 belowHostHeight 扣减；
+  // 宿主内下方流内占位仅计下方名称角标行(26+2×2=30)。
   // 宿主未测得时维持返回 0 的既有行为（载入占位框依赖该数值）。
   // hostHeight 经视口封顶：Screen 的 flexGrow 容器会让 flex:1 宿主按内容撑开，
   // 不封顶则「宿主变大 → 棋盘变大 → 内容更高」正反馈会让宽屏页面纵向溢出
-  // （详见 capHostHeightToViewport 注释）。本屏底部信息栏在宿主之外，需作为
-  // belowHostHeight 扣减（宿主内只含上下两行名称角标行，已由 top/bottomFlowHeight 计入）。
+  // （详见 capHostHeightToViewport 注释）。
+  // 注意 belowHostHeight 不含 insets.bottom —— capHostHeightToViewport 已扣过 bottomInset。
   const { maxBoardHeight: budgetBoardHeight, paddingTop: boardPadTop } = useBoardLayoutBudget({
     hostHeight: capHostHeightToViewport(
       boardAreaH,
       windowHeight,
-      drawerHostY,
+      boardHostY,
       insets.top,
       insets.bottom,
-      dynamicGap + bottomBarH
+      (infoRowH > 0 ? infoRowH : BOARD_INFO_ROW_FLOW_HEIGHT) + dynamicGap + BOTTOM_BAR_HEIGHT
     ),
     screenWidth,
-    stripOffset: 30,
     topFlowHeight: 30,
     bottomFlowHeight: 30,
   });
@@ -179,7 +188,7 @@ export default function SpectateScreen() {
     [boardStyle, maxBoardHeight]
   );
 
-  // 底部信息栏宽度：同样跟随棋盘本体宽度居中，宽屏下不再横贯整个屏幕
+  // 底部信息行宽度：同样跟随棋盘本体宽度居中，宽屏下不再横贯整个屏幕
   const bottomBarWidthStyle = useMemo(
     () => boardAlignedRowStyle(screenWidth, boardStyle, maxBoardHeight),
     [boardStyle, maxBoardHeight]
@@ -484,18 +493,6 @@ export default function SpectateScreen() {
   const bottomPlayer = isFlipped ? blackPlayer : redPlayer;
   const isRedTurn = gameState ? gameState.sideTag === RED_SIDE : false;
 
-  // 被吃棋子统计
-  const capturedByRed: number[] = [];
-  const capturedByBlack: number[] = [];
-  if (gameState) {
-    gameState.pieces.forEach(piece => {
-      if (!piece.alive) {
-        if (piece.id < 16) capturedByRed.push(piece.id);
-        else capturedByBlack.push(piece.id);
-      }
-    });
-  }
-
   // 【P4】最近一步与着法数：增量载荷的 gameState 不含 moveHistory，
   // 但 useBattleStateSync 会把 lastMove 合并进本地棋谱，故这里仍从本地历史读。
   const lastMove = gameState && gameState.moveHistory.length > 0
@@ -612,50 +609,33 @@ export default function SpectateScreen() {
     );
   };
 
+  // 观战页底部操作栏：观战者不参与对局，唯一入口是「菜单」弹出列表
+  const spectateBarActions: GameBottomBarActionInput[] = [{ key: 'menu', icon: 'bars', label: '菜单' }];
+  const spectateMenuItems: GameMenuItem[] = [
+    {
+      key: 'flip',
+      icon: 'arrows-rotate',
+      label: '翻转棋盘',
+      onPress: () => setIsFlipped((v) => !v),
+    },
+    { key: 'exit', icon: 'door-open', label: '退出观战', onPress: handleExit },
+  ];
+
   return (
-    <Screen>
+    // 【2026-10】去掉 'bottom' 安全区：底部操作栏是主容器的最后一个子节点（固定通栏），
+    // 自己用 insets.bottom 撑开内边距，避免 Screen 的底部安全区把透明黑底截断在半空。
+    <Screen safeAreaEdges={['top', 'left', 'right']}>
       <View style={styles.container}>
-        {/* 顶部信息栏 */}
-        <View style={styles.topBar}>
-          <View style={styles.backBtnZone}>
-            <TouchableOpacity style={styles.backBtn} onPress={handleExit}>
-              <FontAwesome6 name="chevron-left" size={20} color={COLORS.textPrimary} />
-            </TouchableOpacity>
-          </View>
-
-          <View style={styles.gameInfo}>
-            <Text style={styles.gameTitle} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.75}>
-              {roomName || '在线对局'}
-            </Text>
-            <Text style={styles.gameSubtitle} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.8}>
-              观战 · {spectatorCount} 人观看
-            </Text>
-          </View>
-
-          <View style={[styles.backBtnZone, { alignItems: 'flex-end' }]}>
-            <TouchableOpacity style={styles.backBtn} onPress={() => setIsFlipped(v => !v)} activeOpacity={0.8}>
-              <FontAwesome6 name="rotate" size={18} color={COLORS.textPrimary} />
-            </TouchableOpacity>
-          </View>
-        </View>
-
+        {/* 顶部信息栏已于 2026-10 下线：返回与翻转棋盘移入底部操作栏的「菜单」弹出列表，
+            房间名 / 观众数移到底部信息行（棋盘下方、底栏之上），保持信息不丢失。 */}
         {/* 棋盘区域 */}
         <View
-          style={styles.capturedDrawerHost}
+          style={styles.boardHost}
           onLayout={(e) => {
             setBoardAreaH(e.nativeEvent.layout.height);
-            setDrawerHostY(e.nativeEvent.layout.y);
+            setBoardHostY(e.nativeEvent.layout.y);
           }}
         >
-          {/* 被吃棋子明细抽屉：点击摘要文字后自标题行向下展开（浮层，棋盘不动），与人机对战一致 */}
-          {gameState && (
-            <CapturedPiecesDrawer
-              side={capturedDrawerSide}
-              gameState={gameState}
-              playerSide="red"
-              maxBoardHeight={maxBoardHeight}
-            />
-          )}
           {/* 顶部留白由预算控制：优先垂直居中，预留不足时整体下移贴住预留区 */}
           <View style={[styles.boardContainer, { paddingTop: boardPadTop }]}>
             {renderNameChip(
@@ -675,12 +655,8 @@ export default function SpectateScreen() {
                 isFlipped={isFlipped}
                 onPiecePress={() => undefined}
                 onEmptyPress={() => undefined}
-                capturedByRed={capturedByRed}
-                capturedByBlack={capturedByBlack}
                 playerSide="red"
                 maxBoardHeight={maxBoardHeight}
-                capturedStripOffset={30}
-                onCapturedPress={(side) => setCapturedDrawerSide(prev => (prev === side ? null : side))}
                 moveEffect={moveEffect}
               />
             ) : (
@@ -699,10 +675,17 @@ export default function SpectateScreen() {
           </View>
         </View>
 
-        {/* 底部信息栏 */}
-        <View style={[styles.bottomBar, bottomBarWidthStyle, { marginTop: dynamicGap }]}
-          onLayout={(e) => setBottomBarH(e.nativeEvent.layout.height)}
+        {/* 底部信息行：房间名 / 观众数 / 回合进度 / 当前行棋方（顶栏下线后的落位） */}
+        <View
+          style={[styles.infoRow, bottomBarWidthStyle]}
+          onLayout={(e) => {
+            const h = e.nativeEvent.layout.height;
+            setInfoRowH((prev) => (prev === h ? prev : h));
+          }}
         >
+          <Text style={styles.infoRowTitle} numberOfLines={1}>
+            {roomName || '在线对局'}
+          </Text>
           <View style={styles.infoPill}>
             <FontAwesome6 name="chess-board" size={14} color={COLORS.textLight} />
             <Text style={styles.infoPillText}>第 {Math.floor(moveCount / 2) + 1} 回合 · 共 {moveCount} 步</Text>
@@ -711,7 +694,18 @@ export default function SpectateScreen() {
             <View style={[styles.turnDot, { backgroundColor: isRedTurn ? COLORS.redPiece : COLORS.blackPiece }]} />
             <Text style={styles.infoPillText}>{isRedTurn ? '红方行棋' : '黑方行棋'}</Text>
           </View>
+          <Text style={styles.infoPillText}>{spectatorCount} 人观看</Text>
         </View>
+
+        {/* 底部操作栏（与人机/在线对战共用 @/components/GameBottomBar，2026-10 第二轮改造）：
+            固定通栏贴屏幕最底端。观战无对局操作，只有「菜单」（翻转棋盘 / 退出观战）。 */}
+        <GameBottomBar
+          widthStyle={bottomBarWidthStyle}
+          style={{ marginTop: dynamicGap }}
+          bottomInset={insets.bottom}
+          actions={spectateBarActions}
+          menuItems={spectateMenuItems}
+        />
 
         {/* 连接中遮罩 */}
         {phase === 'connecting' && (
@@ -778,45 +772,8 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: COLORS.background,
   },
-  topBar: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingHorizontal: 16,
-    paddingVertical: 10,
-    backgroundColor: COLORS.card,
-    borderBottomWidth: 1,
-    borderBottomColor: COLORS.borderSolid,
-  },
-  backBtnZone: {
-    width: 56,
-    alignItems: 'flex-start',
-  },
-  backBtn: {
-    width: 40,
-    height: 40,
-    borderRadius: 20,
-    borderWidth: 1,
-    borderColor: COLORS.borderSolid,
-    backgroundColor: COLORS.card,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  gameInfo: {
-    flex: 1,
-    alignItems: 'center',
-    paddingHorizontal: 4,
-  },
-  gameTitle: {
-    fontSize: FONT.title,
-    fontWeight: '700',
-    color: COLORS.textPrimary,
-  },
-  gameSubtitle: {
-    fontSize: FONT.caption,
-    color: COLORS.textLight,
-    marginTop: 2,
-  },
-  capturedDrawerHost: {
+  // 顶栏已下线（原 topBar / backBtnZone / backBtn / gameInfo / gameTitle / gameSubtitle）
+  boardHost: {
     flex: 1,
   },
   boardContainer: {
@@ -917,13 +874,20 @@ const styles = StyleSheet.create({
     fontSize: 18,
     lineHeight: 22,
   },
-  bottomBar: {
+  // 底部信息行（顶栏下线后承接房间名 / 观众数 / 回合进度 / 行棋方）。
+  // 占位高度 30 + marginBottom 2 = BOARD_INFO_ROW_FLOW_HEIGHT(32)，改样式需同步改常量。
+  infoRow: {
+    height: 30,
     flexDirection: 'row',
     alignItems: 'center',
-    justifyContent: 'center',
-    gap: 12,
-    paddingHorizontal: 16,
-    paddingVertical: 10,
+    gap: 8,
+    marginBottom: 2,
+  },
+  infoRowTitle: {
+    flexShrink: 1,
+    fontSize: FONT.caption,
+    fontWeight: '700',
+    color: COLORS.textPrimary,
   },
   infoPill: {
     flexDirection: 'row',

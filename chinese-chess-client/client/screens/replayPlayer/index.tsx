@@ -3,7 +3,8 @@
  *
  * - 只读棋盘：按步数重建局面（初始局面 + 顺序应用着法，全部预计算，拖动即时切换）
  * - 棋盘下方可拖拉进度条（整体进度 = 棋局步数）
- * - 进度条下方按钮：上一步 / 下一步 / 翻转
+ * - 底部固定操作栏：菜单（翻转棋盘 / 返回列表）、上一步、下一步
+ * - 顶部标题栏已于 2026-10 下线：对局标题 / 时间 / 结果芯片移到底部信息行
  */
 
 import React, { useState, useCallback, useMemo, useEffect } from 'react';
@@ -21,11 +22,16 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useSafeRouter, useSafeSearchParams } from '@/hooks/useSafeRouter';
 import { useFocusEffect } from 'expo-router';
 import { FontAwesome6 } from '@expo/vector-icons';
-import ChessBoard, { CapturedPiecesDrawer } from '@/components/ChessBoard';
+import ChessBoard from '@/components/ChessBoard';
+import GameBottomBar, {
+  BOTTOM_BAR_HEIGHT,
+  type GameBottomBarActionInput,
+  type GameMenuItem,
+} from '@/components/GameBottomBar';
 import { createInitialState, applyHandicap, makeMove, type GameState } from '@/utils/chess/GameEngine';
 import { RED_SIDE, BLACK_SIDE } from '@/utils/chess/types';
 import { getReplay, type ReplayGame } from '@/utils/replayStorage';
-import { useBoardLayoutBudget, capHostHeightToViewport } from '@/utils/chess/capturedDrawerMetrics';
+import { useBoardLayoutBudget, capHostHeightToViewport } from '@/utils/chess/boardLayoutBudget';
 import { boardAlignedRowStyle } from '@/utils/chess/boardContentWidth';
 import { useBoardStyle } from '@/utils/chess/boardStyleStore';
 import { playSound, playJiangJunSound, preloadSounds, unloadAllSounds } from '@/utils/SoundManager';
@@ -47,8 +53,14 @@ const COLORS = {
 const screenWidth = Dimensions.get('window').width;
 // 窗口高度：用于把棋盘宿主实测高度封顶到视口内，打断宽屏纵向溢出的正反馈
 const windowHeight = Dimensions.get('window').height;
-// 与人机对战一致：棋盘与下方控制区的间距随屏宽自适应
+// 与人机对战一致：棋盘与下方信息行的间距随屏宽自适应
 const dynamicGap = Math.max(Math.round(screenWidth * 0.03), 8);
+  // 底部信息行（对局标题 / 时间 / 结果芯片）在棋盘宿主之外、纵向流内的占位高度
+  // （StyleSheet 里 infoRow height 28 + marginBottom 2）；实测值可用时以实测优先
+  const REPLAY_INFO_FLOW_HEIGHT = 30;
+  // 控制区（步数行 + 进度条）在棋盘宿主之外、纵向流内的占位高度
+  // （progressRow ≈ 20 + slider 40 + 控件间间距）；实测值可用时以实测优先
+  const REPLAY_CONTROLS_FLOW_HEIGHT = 64;
 
 /** 由初始局面 + 着法序列预计算每一步的完整局面（steps[0]=开局，steps[N]=终局） */
 function buildSteps(replay: ReplayGame): GameState[] {
@@ -84,12 +96,11 @@ export default function ReplayPlayerScreen() {
   const [replay, setReplay] = useState<ReplayGame | null | undefined>(undefined); // undefined=加载中
   const [step, setStep] = useState(0);
   const [isFlipped, setIsFlipped] = useState(false);
-  // 被吃棋子明细抽屉展开的一侧（null=收起），抽屉渲染在顶部标题行正下方（与人机对战一致）
-  const [capturedDrawerSide, setCapturedDrawerSide] = useState<'opponent' | 'mine' | null>(null);
-  // 棋盘可用纵向空间实测（空间不足时缩小棋盘，避免挤占标题栏与进度条）
+  // 棋盘可用纵向空间实测（空间不足时缩小棋盘，避免挤占底部信息行与固定底栏）
   const [boardAreaH, setBoardAreaH] = useState(0);
-  const [controlsH, setControlsH] = useState(0);
-  // 棋盘内容宿主顶边相对页面内容顶边的 Y（含顶部栏与顶部安全区）：预算封顶时用于推算可用高度
+  // 底部信息行 + 控制区的实测总高（在棋盘宿主之外，以 belowHostHeight 参与预算封顶）
+  const [bottomSectionH, setBottomSectionH] = useState(0);
+  // 棋盘内容宿主顶边相对页面内容顶边的 Y（含顶部安全区）：预算封顶时用于推算可用高度
   const [boardAreaY, setBoardAreaY] = useState(0);
 
   // 每次进入页面按 id 重新加载（列表页删除后返回时兜底）
@@ -121,30 +132,17 @@ export default function ReplayPlayerScreen() {
         })()
       : null;
 
-  // 当前步被吃棋子统计（与对局页口径一致：capturedByRed=红方吃掉的黑方棋子）
-  const { capturedByRed, capturedByBlack } = useMemo(() => {
-    const byRed: number[] = [];
-    const byBlack: number[] = [];
-    if (boardState) {
-      boardState.pieces.forEach(p => {
-        if (!p.alive) {
-          if (p.id < 16) byRed.push(p.id);
-          else byBlack.push(p.id);
-        }
-      });
-    }
-    return { capturedByRed: byRed, capturedByBlack: byBlack };
-  }, [boardState]);
-
-  // 棋盘高度预算 + 垂直定位留白（二分求解，口径与抽屉真实尺寸一致）：
-  // 条件 1 —— 棋盘顶边上方常驻预留「摘要条悬浮区(38) + 抽屉展开高度」（复盘页棋盘上方无角标行，
-  //           stripOffset=0），无论抽屉是否点开都预留，保证展开时底边不压棋盘、不与摘要条重叠；
+  // 棋盘高度预算 + 垂直定位留白（口径与对局页一致）：
+  // 条件 1 —— 棋盘顶边上方无角标行，预留 0；
   // 条件 2 —— 内容（棋盘 + 控制区）在宿主内垂直居中；居中时上方预留不足则整体下移贴住预留区
   //           （把下方空白让给棋盘），棋盘取到预留允许的最大尺寸。
-  // 上方流内占位 = 0（无角标行）；下方流内占位 = dynamicGap + 控制区。
+  // 上方流内占位 = 0（无角标行）。
   // hostHeight 经视口封顶：Screen 的 flexGrow 容器会让 flex:1 宿主按内容撑开，
   // 不封顶则「宿主变大 → 棋盘变大 → 内容更高」正反馈会让宽屏页面纵向溢出
   // （详见 capHostHeightToViewport 注释）。
+  // 2026-10 第二轮改造：信息行 + 控制区 + 固定底栏全部移到 boardArea 之外（页面最底端），
+  // 它们占的是宿主之外的高度，因此走 belowHostHeight 而不是 bottomFlowHeight。
+  // 注意 belowHostHeight 不含 insets.bottom —— capHostHeightToViewport 已扣过 bottomInset。
   const { maxBoardHeight, paddingTop: boardPadTop } = useBoardLayoutBudget({
     hostHeight: capHostHeightToViewport(
       boardAreaH,
@@ -152,12 +150,14 @@ export default function ReplayPlayerScreen() {
       boardAreaY,
       insets.top,
       insets.bottom,
-      0 // 控制区在 boardArea 之内，已由 bottomFlowHeight 计入
+      // 信息行 + 控制区实测总高 + 底栏主体高度 + 底栏上边距。
+      // 注意不含 insets.bottom —— capHostHeightToViewport 已扣过 bottomInset。
+      (bottomSectionH > 0 ? bottomSectionH : REPLAY_INFO_FLOW_HEIGHT + REPLAY_CONTROLS_FLOW_HEIGHT)
+        + BOTTOM_BAR_HEIGHT + dynamicGap
     ),
     screenWidth,
-    stripOffset: 0,
     topFlowHeight: 0,
-    bottomFlowHeight: dynamicGap + controlsH,
+    bottomFlowHeight: 0,
   });
 
   // 控制区宽度：跟随棋盘本体宽度居中，宽屏下不再横贯整个屏幕
@@ -211,34 +211,40 @@ export default function ReplayPlayerScreen() {
         ? COLORS.success
         : COLORS.danger;
 
-  return (
-    <Screen>
-      <View style={styles.container}>
-        {/* 顶部标题栏（与人机对战一致） */}
-        <View style={styles.topBar}>
-          <View style={styles.topBarSide}>
-            <TouchableOpacity onPress={() => router.back()} style={styles.backButtonInner}>
-              <FontAwesome6 name="chevron-left" size={20} color={COLORS.text} />
-            </TouchableOpacity>
-          </View>
-          <View style={styles.topBarCenter}>
-            <Text style={styles.topBarTitle} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.75}>
-              {replay ? `${replay.mode === 'pve' ? '人机对战' : '在线对局'} · ${replay.note}` : '复盘'}
-            </Text>
-            {!!replay && (
-              <Text style={styles.topBarSubtitle}>{formatFullTime(replay.timestamp)}</Text>
-            )}
-          </View>
-          <View style={[styles.topBarSide, styles.topBarRight]}>
-            {!!replay && (
-              <View style={styles.resultChip}>
-                <Text style={[styles.resultChipText, { color: resultColor }]}>{resultLabel}</Text>
-              </View>
-            )}
-          </View>
-        </View>
+  // 底部操作栏（与人机/在线对战共用 @/components/GameBottomBar，2026-10 第二轮改造）：
+  // 菜单 / 上一步 / 下一步。「菜单」承接顶栏下线的返回与翻转，以及原有的控制区按钮。
+  const replayBarActions: GameBottomBarActionInput[] = [
+    { key: 'menu', icon: 'bars', label: '菜单' },
+    {
+      key: 'prev',
+      icon: 'backward-step',
+      label: '上一步',
+      disabled: currentStep <= 0,
+      badge: currentStep > 0 ? currentStep : null,
+      onPress: () => setStep((s) => Math.max(0, s - 1)),
+    },
+    {
+      key: 'next',
+      icon: 'forward-step',
+      label: '下一步',
+      disabled: currentStep >= totalSteps,
+      badge: totalSteps > 0 ? totalSteps - currentStep : null,
+      onPress: goNext,
+    },
+  ];
+  const replayMenuItems: GameMenuItem[] = [
+    { key: 'flip', icon: 'arrows-rotate', label: '翻转棋盘', onPress: () => setIsFlipped((f) => !f) },
+    { key: 'back', icon: 'door-open', label: '返回列表', onPress: () => router.back() },
+  ];
 
-        {/* 棋盘 + 控制区（整体居中，控制区紧跟棋盘） */}
+  return (
+    // 【2026-10】去掉 'bottom' 安全区：底部操作栏是主容器的最后一个子节点（固定通栏），
+    // 自己用 insets.bottom 撑开内边距，避免 Screen 的底部安全区把透明黑底截断在半空。
+    <Screen safeAreaEdges={['top', 'left', 'right']}>
+      <View style={styles.container}>
+        {/* 顶部标题栏已于 2026-10 下线：对局标题 + 时间 + 结果芯片移到底部信息行，
+            返回与翻转棋盘移入「菜单」弹出列表。 */}
+        {/* 棋盘（整体居中；控制区与底栏都已移出宿主，固定在页面最底端） */}
         <View
           style={styles.boardArea}
           onLayout={(e) => {
@@ -246,15 +252,6 @@ export default function ReplayPlayerScreen() {
             setBoardAreaY(e.nativeEvent.layout.y);
           }}
         >
-          {/* 被吃棋子明细抽屉：点击摘要文字后自标题行向下展开（浮层，棋盘不动），与人机对战一致 */}
-          {boardState && replay && (
-            <CapturedPiecesDrawer
-              side={capturedDrawerSide}
-              gameState={boardState}
-              playerSide={replay.mySide}
-              maxBoardHeight={maxBoardHeight}
-            />
-          )}
           {replay === undefined ? (
             <View style={styles.loadingBox}>
               <ActivityIndicator size="large" color={COLORS.primary} />
@@ -278,76 +275,80 @@ export default function ReplayPlayerScreen() {
                 onPiecePress={noop}
                 onEmptyPress={noop}
                 aiThinking={false}
-                capturedByRed={capturedByRed}
-                capturedByBlack={capturedByBlack}
                 playerSide={replay.mySide}
                 maxBoardHeight={maxBoardHeight}
-                onCapturedPress={(side) => setCapturedDrawerSide(prev => (prev === side ? null : side))}
               />
-
-              {/* 控制区：进度条 + 步进按钮 */}
-              <View
-                style={[styles.controls, controlsWidthStyle, { marginTop: dynamicGap }]}
-                onLayout={e => setControlsH(e.nativeEvent.layout.height)}
-              >
-                {/* 步数指示 */}
-                <View style={styles.progressRow}>
-                  <Text style={styles.progressText}>
-                    第 {currentStep} / {totalSteps} 步
-                  </Text>
-                  <Text style={styles.progressHint}>
-                    {currentStep === 0
-                      ? '开局'
-                      : currentStep === totalSteps
-                        ? '终局'
-                        : `第 ${Math.floor((currentStep - 1) / 2) + 1} 回合 · ${replay.moves[currentStep - 1].pieceId >= 16 ? '红方' : '黑方'}走棋`}
-                  </Text>
-                </View>
-
-                {/* 可拖拉进度条：整体进度 = 棋局步数 */}
-                <Slider
-                  style={styles.slider}
-                  minimumValue={0}
-                  maximumValue={Math.max(totalSteps, 1)}
-                  step={1}
-                  value={currentStep}
-                  onValueChange={setStep}
-                  disabled={totalSteps === 0}
-                  minimumTrackTintColor={COLORS.primary}
-                  maximumTrackTintColor={COLORS.border}
-                  thumbTintColor={COLORS.primary}
-                />
-
-                {/* 上一步 / 下一步 / 翻转（与人机对战按钮样式一致） */}
-                <View style={styles.buttonRow}>
-                  <TouchableOpacity
-                    style={[styles.actionButton, currentStep <= 0 && styles.actionButtonDisabled]}
-                    onPress={() => setStep(s => Math.max(0, s - 1))}
-                    disabled={currentStep <= 0}
-                  >
-                    <FontAwesome6 name="backward-step" size={16} color={COLORS.text} />
-                    <Text style={styles.actionButtonText}>上一步</Text>
-                  </TouchableOpacity>
-                  <TouchableOpacity
-                    style={[styles.actionButton, currentStep >= totalSteps && styles.actionButtonDisabled]}
-                    onPress={goNext}
-                    disabled={currentStep >= totalSteps}
-                  >
-                    <FontAwesome6 name="forward-step" size={16} color={COLORS.text} />
-                    <Text style={styles.actionButtonText}>下一步</Text>
-                  </TouchableOpacity>
-                  <TouchableOpacity
-                    style={styles.actionButton}
-                    onPress={() => setIsFlipped(f => !f)}
-                  >
-                    <FontAwesome6 name="arrows-rotate" size={16} color={COLORS.text} />
-                    <Text style={styles.actionButtonText}>翻转</Text>
-                  </TouchableOpacity>
-                </View>
-              </View>
             </View>
           )}
         </View>
+
+        {/* 底部信息行 + 控制区：整组包一层，onLayout 实测总高，
+            在 capHostHeightToViewport 的 belowHostHeight 里扣减（棋盘宿主之外，
+            高度随内容变化，实测比常量更准，也避免常量与样式脱节）。 */}
+        <View
+          style={styles.bottomSection}
+          onLayout={(e) => {
+            const sectionH = e.nativeEvent.layout.height;
+            setBottomSectionH((prev) => (prev === sectionH ? prev : sectionH));
+          }}
+        >
+        {/* 底部信息行：顶栏下线的对局标题 / 时间 / 结果芯片落位 */}
+        <View style={[styles.infoRow, controlsWidthStyle]}>
+          <Text style={styles.infoRowTitle} numberOfLines={1}>
+            {replay ? `${replay.mode === 'pve' ? '人机对战' : '在线对局'} · ${replay.note}` : '复盘'}
+          </Text>
+          {!!replay && (
+            <Text style={styles.infoRowTime}>{formatFullTime(replay.timestamp)}</Text>
+          )}
+          {!!replay && (
+            <View style={styles.resultChip}>
+              <Text style={[styles.resultChipText, { color: resultColor }]}>{resultLabel}</Text>
+            </View>
+          )}
+        </View>
+
+        {/* 控制区：进度条（步进按钮已移到底部操作栏） */}
+        {!!replay && boardState && (
+          <View style={[styles.controls, controlsWidthStyle, { marginTop: dynamicGap }]}>
+            {/* 步数指示 */}
+            <View style={styles.progressRow}>
+              <Text style={styles.progressText}>
+                第 {currentStep} / {totalSteps} 步
+              </Text>
+              <Text style={styles.progressHint}>
+                {currentStep === 0
+                  ? '开局'
+                  : currentStep === totalSteps
+                    ? '终局'
+                    : `第 ${Math.floor((currentStep - 1) / 2) + 1} 回合 · ${replay.moves[currentStep - 1].pieceId >= 16 ? '红方' : '黑方'}走棋`}
+              </Text>
+            </View>
+
+            {/* 可拖拉进度条：整体进度 = 棋局步数 */}
+            <Slider
+              style={styles.slider}
+              minimumValue={0}
+              maximumValue={Math.max(totalSteps, 1)}
+              step={1}
+              value={currentStep}
+              onValueChange={setStep}
+              disabled={totalSteps === 0}
+              minimumTrackTintColor={COLORS.primary}
+              maximumTrackTintColor={COLORS.border}
+              thumbTintColor={COLORS.primary}
+            />
+          </View>
+        )}
+        </View>
+
+        {/* 底部操作栏：固定通栏贴屏幕最底端。菜单 / 上一步 / 下一步 */}
+        <GameBottomBar
+          widthStyle={controlsWidthStyle}
+          style={{ marginTop: dynamicGap }}
+          bottomInset={insets.bottom}
+          actions={replayBarActions}
+          menuItems={replayMenuItems}
+        />
       </View>
     </Screen>
   );
@@ -358,58 +359,41 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: COLORS.bg,
   },
-  topBar: {
+  // 顶栏已下线（原 topBar / topBarSide / topBarRight / backButtonInner / topBarCenter /
+  // topBarTitle / topBarSubtitle 全部删除；标题与结果芯片移到底部信息行）
+  // 底部信息行 + 控制区的包裹层：只做 onLayout 实测高度用，本身不参与排版约束
+  bottomSection: {
+    alignSelf: 'stretch',
+  },
+  // 底部信息行（顶栏下线的对局标题 / 时间 / 结果芯片落位）
+  // 占位高度 28 + marginBottom 2 = REPLAY_INFO_FLOW_HEIGHT(30)，改样式需同步改常量。
+  infoRow: {
+    height: 28,
     flexDirection: 'row',
     alignItems: 'center',
-    justifyContent: 'space-between',
-    paddingHorizontal: 16,
-    paddingTop: 8,
-    paddingBottom: 8,
-    backgroundColor: COLORS.bgCard,
-    borderBottomWidth: 1,
-    borderBottomColor: COLORS.border,
+    gap: 8,
+    marginBottom: 2,
   },
-  topBarSide: {
-    width: 100,
-    justifyContent: 'center',
-  },
-  topBarRight: {
-    alignItems: 'flex-end',
-  },
-  backButtonInner: {
-    width: 40,
-    height: 40,
-    justifyContent: 'center',
-    alignItems: 'center',
-    borderRadius: 12,
-    backgroundColor: COLORS.bgCard,
-    borderWidth: 1,
-    borderColor: COLORS.border,
-  },
-  topBarCenter: {
-    flex: 1,
-    alignItems: 'center',
-  },
-  topBarTitle: {
-    fontSize: FONT.title,
+  infoRowTitle: {
+    flexShrink: 1,
+    fontSize: FONT.caption,
     fontWeight: '700',
     color: COLORS.text,
   },
-  topBarSubtitle: {
-    fontSize: FONT.caption,
+  infoRowTime: {
+    fontSize: FONT.micro,
     color: COLORS.textMuted,
-    marginTop: 2,
   },
   resultChip: {
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-    borderRadius: 12,
+    paddingHorizontal: 10,
+    paddingVertical: 3,
+    borderRadius: 999,
     borderWidth: 1,
     borderColor: COLORS.border,
     backgroundColor: COLORS.bgCard,
   },
   resultChipText: {
-    fontSize: FONT.caption,
+    fontSize: FONT.micro,
     fontWeight: '700',
   },
   boardArea: {
@@ -463,32 +447,5 @@ const styles = StyleSheet.create({
   slider: {
     width: '100%',
     height: 40,
-  },
-  buttonRow: {
-    width: '100%',
-    flexDirection: 'row',
-    gap: 10,
-    marginTop: 4,
-  },
-  actionButton: {
-    flex: 1,
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    gap: 5,
-    backgroundColor: COLORS.bgCard,
-    paddingHorizontal: 6,
-    paddingVertical: 12,
-    borderRadius: 14,
-    borderWidth: 1,
-    borderColor: COLORS.border,
-  },
-  actionButtonDisabled: {
-    opacity: 0.4,
-  },
-  actionButtonText: {
-    fontSize: FONT.body,
-    fontWeight: '600',
-    color: COLORS.text,
   },
 });

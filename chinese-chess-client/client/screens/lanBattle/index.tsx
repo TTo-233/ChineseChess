@@ -28,7 +28,12 @@ import { createInitialState, applyHandicap, cloneGameState, getSelectableMoves, 
 import { getMoveBanReason, banReasonNotice } from '@/utils/chess/RuleEngine';
 import { HandicapBoard } from '@/components/HandicapBoard';
 import { RED_SIDE, BLACK_SIDE, type SideTag } from '@/utils/chess/types';
-import ChessBoard, { CapturedPiecesDrawer } from '@/components/ChessBoard';
+import ChessBoard from '@/components/ChessBoard';
+import GameBottomBar, {
+  BOTTOM_BAR_HEIGHT,
+  type GameBottomBarActionInput,
+  type GameMenuItem,
+} from '@/components/GameBottomBar';
 import JueShaOverlay from '@/components/JueShaOverlay';
 import { AppDialog, AppModal, GameNotice, ModalButton, modalButtonRowStyle, type GameNoticeItem } from '@/components/Modal';
 import { useMoveEffect } from '@/hooks/useMoveEffect';
@@ -42,7 +47,7 @@ import { getRoomSessionToken, peekRoomSessionToken, clearRoomSessionToken } from
 import { BattleSocket } from '@/utils/battleSocket';
 import { isActionNotSent, BattleActionRejectedError, type BattleActionType, type BattleMove } from '@/utils/battleProtocol';
 import { saveReplay } from '@/utils/replayStorage';
-import { useBoardLayoutBudget, capHostHeightToViewport } from '@/utils/chess/capturedDrawerMetrics';
+import { useBoardLayoutBudget, capHostHeightToViewport } from '@/utils/chess/boardLayoutBudget';
 import { boardAlignedRowStyle } from '@/utils/chess/boardContentWidth';
 import { useBoardStyle } from '@/utils/chess/boardStyleStore';
 import {
@@ -317,12 +322,10 @@ export default function LanBattleScreen() {
   // 时跳过覆盖，直到服务端追上（着法数 >= 本端）再恢复同步；超时则判定上传失败放弃保护。
   // 具体的判定与「只延迟局面块」的处理在 hooks/useBattleStateSync 内。
   const pendingSyncRef = useRef<{ historyLen: number; at: number; snapshot: GameState } | null>(null);
-  // 被吃棋子明细抽屉展开的一侧（null=收起），抽屉渲染在顶部标题行正下方
-  const [capturedDrawerSide, setCapturedDrawerSide] = useState<'opponent' | 'mine' | null>(null);
-  // 棋盘可用纵向空间实测（宽屏/纵向空间不足时限制棋盘尺寸，避免挤占标题行与底部按钮）
+  // 棋盘可用纵向空间实测（宽屏/纵向空间不足时限制棋盘尺寸，避免挤占底部按钮）
   const [boardAreaH, setBoardAreaH] = useState(0);
-  const [bottomBarH, setBottomBarH] = useState(0);
-  // 与人机对战一致：棋盘与底部操作栏的间距随屏宽自适应
+  // 与人机对战一致：棋盘与底部操作栏的间距随屏宽自适应（底栏已改为页面固定通栏，
+  // 该间距作为底栏的上边距，不再随底栏实测高度浮动）
   const dynamicGap = Math.max(Math.round(screenWidth * 0.03), 8);
   // 表情下拉栏锚点（兼容回退）：我方名称角标行底边在棋盘容器内的 Y 坐标（onLayout 测得）。
   // 主锚点改为点按瞬间 measureInWindow 实测窗口坐标（见 emojiDropdownTop），onLayout 值仅作回退。
@@ -333,29 +336,31 @@ export default function LanBattleScreen() {
   const myNameRowRef = useRef<View>(null);
   const [emojiDropdownTop, setEmojiDropdownTop] = useState<number | null>(null);
   // 内容宿主（棋盘容器父级）相对根容器的 Y：配合 onLayout 回退锚点换算到根容器坐标系
-  const [drawerHostY, setDrawerHostY] = useState(0);
-  // 棋盘高度预算 + 垂直定位留白（二分求解，口径与抽屉真实尺寸一致）：
-  // 条件 1 —— 棋盘顶边上方常驻预留「对手名角标行(30) + 摘要条悬浮区(38+30) + 抽屉展开高度」，
-  //           无论抽屉是否点开都预留，保证展开时底边不压棋盘、不与摘要条/角标重叠；
+  const [boardHostY, setBoardHostY] = useState(0);
+  // 棋盘高度预算 + 垂直定位留白（口径与对局页一致）：
+  // 条件 1 —— 棋盘顶边上方常驻预留「对手名角标行(30)」，棋盘取到预留允许的最大尺寸；
   // 条件 2 —— 内容（上角标行 + 棋盘 + 下角标行 + 底部栏）在宿主内垂直居中；居中时上方预留
-  //           不足则整体下移贴住预留区（把下方空白让给棋盘），棋盘取到预留允许的最大尺寸。
-  // 上方流内占位 = 对手名角标行(26+4=30)；下方流内占位 = 我方名角标行(26+4=30) + dynamicGap + 底部栏。
+  //           不足则整体下移贴住预留区（把下方空白让给棋盘）。
+  // 上方流内占位 = 对手名角标行(26+4=30)；下方流内占位 = 我方名角标行(26+4=30)。
   // hostHeight 经视口封顶：Screen 的 flexGrow 容器会让 flex:1 宿主按内容撑开，
   // 不封顶则「宿主变大 → 棋盘变大 → 内容更高」正反馈会让宽屏页面纵向溢出（详见
   // capHostHeightToViewport 注释）。
+  // 底栏已移到 boardHost 之外（固定在页面最底端），它占的是宿主之外的高度，
+  // 因此以 belowHostHeight 参与封顶，而不是 bottomFlowHeight（口径与观战/回放页一致）。
+  // 注意 belowHostHeight 不要加 insets.bottom —— capHostHeightToViewport 已扣过一次
+  // bottomInset，重复计入会白白少掉一个安全区的高度。
   const { maxBoardHeight, paddingTop: boardPadTop } = useBoardLayoutBudget({
     hostHeight: capHostHeightToViewport(
       boardAreaH,
       windowHeight,
-      drawerHostY,
+      boardHostY,
       insets.top,
       insets.bottom,
-      0 // 底部栏在 capturedDrawerHost 之内，已由 bottomFlowHeight 计入
+      BOTTOM_BAR_HEIGHT + dynamicGap
     ),
     screenWidth,
-    stripOffset: 30,
     topFlowHeight: 30,
-    bottomFlowHeight: 30 + dynamicGap + bottomBarH,
+    bottomFlowHeight: 30,
   });
 
   // 棋盘真实几何（相对主容器）：供绝杀特效锁定棋盘中心、把结算文字/按钮排到棋盘正下方，
@@ -403,23 +408,23 @@ export default function LanBattleScreen() {
   }, [boardFrame, boardSize]);
 
   // 结算浮层（JueShaOverlay）用的棋盘矩形，单位为其所在宿主容器的坐标系。
-  // jueshaBoardFrame 是相对根容器（containerRef）测量的，而浮层实际挂在标题行下方的
-  // capturedDrawerHost 里——该宿主相对根容器向下偏移了 drawerHostY（实测 62px），
+  // jueshaBoardFrame 是相对根容器（containerRef）测量的，而浮层实际挂在棋盘内容宿主
+  // boardHost 里——该宿主相对根容器向下偏移了 boardHostY（实测 62px），
   // 直接把根容器坐标喂给浮层会让「绝/杀」特效、结果提示条与棋盘底下方按钮整体下移 62px。
   // boardFrame prop 的约定本就是「浮层容器内」的坐标，故在此完成换算。
   const jueshaHostBoardFrame = useMemo(() => {
     if (!jueshaBoardFrame) return null;
     // 宿主是根容器的纵向 flex 子节点、铺满整行宽度，x 方向无偏移，故只换算 y
-    return { ...jueshaBoardFrame, y: jueshaBoardFrame.y - drawerHostY };
-  }, [jueshaBoardFrame, drawerHostY]);
+    return { ...jueshaBoardFrame, y: jueshaBoardFrame.y - boardHostY };
+  }, [jueshaBoardFrame, boardHostY]);
 
   // 对局内提示条（GameNotice）的棋盘中心纵坐标，单位与主容器一致（容器相对）：
-  // 提示条挂载在 capturedDrawerHost 内，而 jueshaBoardFrame 正是相对根容器测量的，
-  // 两者相差 drawerHostY，需换算；缺测量时返回 undefined 由 GameNotice 退回容器 50% 居中。
+  // 提示条挂载在 boardHost 内，而 jueshaBoardFrame 正是相对根容器测量的，
+  // 两者相差 boardHostY，需换算；缺测量时返回 undefined 由 GameNotice 退回容器 50% 居中。
   const noticeCenterY = useMemo(() => {
     if (!jueshaBoardFrame) return undefined;
-    return jueshaBoardFrame.y + jueshaBoardFrame.height / 2 - drawerHostY;
-  }, [jueshaBoardFrame, drawerHostY]);
+    return jueshaBoardFrame.y + jueshaBoardFrame.height / 2 - boardHostY;
+  }, [jueshaBoardFrame, boardHostY]);
 
   // 对局中弹窗（悔棋/求和请求）的棋盘中心锚点，单位为窗口坐标：
   // boardFrame 是相对主容器的坐标，而 <Modal> 渲染在独立原生窗口、以窗口为坐标系，
@@ -534,27 +539,6 @@ export default function LanBattleScreen() {
     );
   }, []);
   const hideNotice = useCallback(() => setNotice(null), []);
-
-  // 计算被吃掉的棋子
-  const getCapturedPieces = () => {
-    const capturedByRed: number[] = []; // 红方吃掉的（黑方棋子）
-    const capturedByBlack: number[] = []; // 黑方吃掉的（红方棋子）
-    
-    gameState.pieces.forEach(piece => {
-      if (!piece.alive) {
-        // 棋子ID 0-15 是黑方，16-31 是红方
-        if (piece.id < 16) {
-          capturedByRed.push(piece.id); // 黑方棋子被红方吃掉
-        } else {
-          capturedByBlack.push(piece.id); // 红方棋子被黑方吃掉
-        }
-      }
-    });
-    
-    return { capturedByRed, capturedByBlack };
-  };
-
-  const { capturedByRed, capturedByBlack } = getCapturedPieces();
 
   // ===== 断线重连显式上报 =====
   // 「重连成功」以玩家真正回到对局页面为准：服务端仅由 POST /reconnect 清除断线等待，
@@ -2495,68 +2479,128 @@ export default function LanBattleScreen() {
   // 倒数完成自动弹出选边弹窗（选边仅通过弹窗进行）
   const isRed = mySide === 'red';
 
+  // ===== 底部操作栏配置（2026-10 改造：顶部标题栏下线，入口全部收到底栏）=====
+  // 对局中：菜单 / 认输 / 求和 / 悔棋（产品指定顺序）
+  // 等待准备：菜单 / 准备；结算：菜单 / 返回房间 / 退出房间
+  const lanMenuItems: GameMenuItem[] = useMemo(
+    () => [
+      {
+        key: 'settings',
+        icon: 'gear',
+        label: '房间设置',
+        // 服务端仅允许等待阶段改房间设置（PATCH /lan/rooms/:id/settings 见 handleSaveSettings），
+        // 对局中禁用并保持可见，让玩家知道入口在哪、为何不可用
+        disabled: phase === 'playing' || settingsVisible,
+        onPress: handleOpenSettings,
+      },
+      { key: 'exit', icon: 'door-open', label: '退出对局', onPress: requestExit },
+    ],
+    [phase, settingsVisible, handleOpenSettings, requestExit]
+  );
+
+  const lanBarActions: GameBottomBarActionInput[] = useMemo(() => {
+    const menu: GameBottomBarActionInput = { key: 'menu', icon: 'bars', label: '菜单' };
+    if (phase === 'waiting') {
+      // 等待阶段：仅保留准备按钮（随时可点）。双方就绪后按钮显示 3 秒倒数，
+      // 倒数期间再次点击即取消准备；倒数完成进入选边阶段后锁定不可取消
+      return [
+        menu,
+        {
+          key: 'ready',
+          icon: 'circle-check',
+          label: myReady ? '已准备' : '准备',
+          disabled: sidePickStage,
+          onPress: handleReady,
+          badge: myReady && readyCountdown !== null ? readyCountdown : null,
+        },
+      ];
+    }
+    if (phase === 'ended') {
+      /* 结算阶段的唯一操作入口：棋盘停在最终局面，去留在这里决定——
+         「返回房间」把**本端**退回房间准备界面（handleReturnToRoom；不再调 /rematch，
+         那是房间级重置且会把对手一起拽回），「退出房间」离开。
+         另标注兜底倒计时与对手去留：双方互不干扰，谁都不点则到点各自自动返回。
+         结算浮层只承担结果告知，不再重复提供这两个动作。
+
+         注意：本分支**不随对手动作收起**。对手点「返回房间」只会重置房间并下发
+         returnedToRoom，本端仍留在结算页、按钮与倒计时都保留，由玩家自己决定；
+         早期实现在此隐藏入口（settlementDismissed），导致对手一返回，本端倒计时
+         中途按钮变「占位」——即用户报告的「点了没反应、按钮也消失了」。 */
+      return [
+        menu,
+        {
+          key: 'return',
+          icon: 'rotate-right',
+          label: opponentReturned ? '对手已返回' : '返回房间',
+          // 兜底倒计时改用角标承载（底栏标签位只有 2~4 字宽度），文字保持稳定
+          badge: returnRoomCountdown !== null ? returnRoomCountdown : null,
+          onPress: handleReturnToRoom,
+        },
+        { key: 'leave', icon: 'door-open', label: '退出房间', onPress: handleBack },
+      ];
+    }
+    // 对局中：认输 / 求和 / 悔棋
+    return [
+      menu,
+      { key: 'surrender', icon: 'flag', label: '认输', onPress: () => setShowSurrenderModal(true) },
+      {
+        key: 'draw',
+        icon: 'handshake',
+        label: drawPending ? '求和中' : drawBlocked ? '求和已禁' : '求和',
+        disabled: drawPending || drawBlocked,
+        onPress: handleDrawRequest,
+      },
+      {
+        key: 'undo',
+        icon: 'rotate-left',
+        label: undoPending
+          ? '等待同意'
+          : undoBlocked
+            ? '悔棋已禁'
+            : canUndoDepth === 1
+              ? '退1手'
+              : '悔棋',
+        disabled: canUndoDepth === 0 || undoPending || undoBlocked,
+        onPress: handleUndo,
+      },
+    ];
+  }, [
+    phase,
+    myReady,
+    readyCountdown,
+    sidePickStage,
+    handleReady,
+    opponentReturned,
+    returnRoomCountdown,
+    handleReturnToRoom,
+    handleBack,
+    drawPending,
+    drawBlocked,
+    handleDrawRequest,
+    undoPending,
+    undoBlocked,
+    canUndoDepth,
+    handleUndo,
+  ]);
+
+  // 公示/倒数/绝杀阶段隐藏底栏内容但保留占位，避免棋盘位置跳动
+  const bottomBarHidden =
+    phase === 'reveal' || phase === 'countdown' || (phase === 'playing' && jueShaVisible);
+
   return (
-    <Screen>
+    // 【2026-10】去掉 'bottom' 安全区：底部操作栏是主容器的最后一个子节点（固定通栏），
+    // 自己用 insets.bottom 撑开内边距。Screen 再补一次底部安全区会让底栏悬在
+    // Home Indicator 之上，透明黑底断在半空。
+    <Screen safeAreaEdges={['top', 'left', 'right']}>
       <View style={styles.container} ref={containerRef}>
-        {/* 顶部信息栏 */}
-        <View style={styles.topBar}>
-          {/* 返回按钮：与其他页面一致的圆角描边芯片样式 */}
-          <View style={styles.backBtnZone}>
-            <TouchableOpacity style={styles.backBtn} onPress={requestExit}>
-              <FontAwesome6 name="chevron-left" size={20} color={COLORS.textPrimary} />
-            </TouchableOpacity>
-          </View>
-
-          <View style={styles.gameInfo}>
-            <Text style={styles.gameTitle} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.75}>
-              {roomName || '在线对局'}
-            </Text>
-            <Text style={styles.gameSubtitle} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.8}>
-              {phase === 'waiting' && !revealStartedRef.current
-                ? params.playerName
-                : `${isRed ? '红方' : '黑方'} · ${params.playerName}`}
-            </Text>
-          </View>
-
-          {phase === 'playing' && (
-            <View style={styles.turnIndicator}>
-              {/* 圆点跟随当前走棋方的棋子颜色（与其他页面顶栏一致） */}
-              <View style={[styles.turnDot, { backgroundColor: gameState.sideTag === RED_SIDE ? COLORS.redPiece : COLORS.blackPiece }]} />
-              <Text style={styles.turnText}>
-                {isMyTurn ? '你的回合' : '对手回合'}
-              </Text>
-            </View>
-          )}
-          {/* 非对局阶段：右侧显示房间设置按钮（与返回按钮同款芯片样式，右对齐保持标题居中） */}
-          {phase !== 'playing' && (
-            <View style={[styles.backBtnZone, { alignItems: 'flex-end' }]}>
-              <TouchableOpacity
-                style={styles.backBtn}
-                onPress={handleOpenSettings}
-                activeOpacity={0.8}
-              >
-                <FontAwesome6 name="gear" size={18} color={COLORS.textPrimary} />
-              </TouchableOpacity>
-            </View>
-          )}
-        </View>
-
-        {/* 标题行下方内容宿主（相对定位，被吃棋子抽屉锚定于此 = 标题行正下方） */}
+        {/* 棋盘内容宿主（相对定位；2026-10 起顶部标题栏下线，宿主直接顶到安全区下方） */}
         <View
-          style={styles.capturedDrawerHost}
+          style={styles.boardHost}
           onLayout={(e) => {
             setBoardAreaH(e.nativeEvent.layout.height);
-            setDrawerHostY(e.nativeEvent.layout.y);
+            setBoardHostY(e.nativeEvent.layout.y);
           }}
         >
-          {/* 被吃棋子明细抽屉：点击摘要文字后自标题行向下展开（浮层，棋盘不动） */}
-          <CapturedPiecesDrawer
-            side={capturedDrawerSide}
-            gameState={gameState}
-            playerSide={mySide as 'red' | 'black'}
-            maxBoardHeight={maxBoardHeight}
-          />
-
           {/* 棋盘区域：与人机对战一致——棋盘直接挂在水平居中容器中（屏宽居中逻辑由
               ChessBoard 外层容器承担），名字角标为棋盘上下独立行，不再悬浮遮挡棋盘；
               顶部留白由预算控制：优先垂直居中，预留不足时整体下移贴住预留区 */}
@@ -2626,13 +2670,8 @@ export default function LanBattleScreen() {
               onPiecePress={handlePiecePress}
               onEmptyPress={handleMove}
               onMove={handleMove}
-              capturedByRed={capturedByRed}
-              capturedByBlack={capturedByBlack}
-              hideCaptured={jueShaVisible}
               playerSide={mySide as 'red' | 'black'}
-              onCapturedPress={(side) => setCapturedDrawerSide(prev => (prev === side ? null : side))}
               maxBoardHeight={maxBoardHeight}
-              capturedStripOffset={30}
               moveEffect={moveEffect}
               // 【提示口径 2026-10】不再向棋盘下发 banMoves 标红：提示统一收敛到
               // 「阈值前一步的一次性提示条」。banMoves 本身仍在 RuleState 里计算，
@@ -2687,101 +2726,6 @@ export default function LanBattleScreen() {
                   <FontAwesome6 name="face-smile" size={12} color={emojiPickerOpen ? COLORS.primary : COLORS.textLight} />
                 )}
               </TouchableOpacity>
-            </View>
-
-            {/* 底部操作栏：与人机对战一致的样式与布局位置（宽度跟随棋盘本体 + 自适应间距），
-                全阶段常驻挂载以保持棋盘位置稳定，非交互阶段隐藏内容但保留占位 */}
-            <View
-              style={[styles.bottomBar, bottomBarWidthStyle, { marginTop: dynamicGap }]}
-              onLayout={(e) => setBottomBarH(e.nativeEvent.layout.height)}
-            >
-              {phase === 'waiting' && (
-                /* 等待阶段：仅保留准备按钮（随时可点）。双方就绪后按钮显示 3 秒倒数，
-                   倒数期间再次点击即取消准备；倒数完成进入选边阶段后锁定不可取消 */
-                <TouchableOpacity
-                  style={[styles.actionButton, sidePickStage && styles.actionButtonDisabled]}
-                  onPress={handleReady}
-                  disabled={sidePickStage}
-                >
-                  <FontAwesome6
-                    name="circle-check"
-                    size={16}
-                    color={myReady ? COLORS.textLight : COLORS.textPrimary}
-                  />
-                  <Text style={[styles.actionButtonText, myReady && { color: COLORS.textLight }]}>
-                    {readyCountdown !== null ? `已准备(${readyCountdown})` : myReady ? '已准备' : '准备'}
-                  </Text>
-                </TouchableOpacity>
-              )}
-              {phase === 'playing' && !jueShaVisible && (
-                <>
-                  <TouchableOpacity
-                    style={[styles.actionButton, (canUndoDepth === 0 || undoPending || undoBlocked) && styles.actionButtonDisabled]}
-                    onPress={handleUndo}
-                    disabled={canUndoDepth === 0 || undoPending || undoBlocked}
-                  >
-                    <FontAwesome6 name="rotate-left" size={16} color={COLORS.textPrimary} />
-                    <Text style={styles.actionButtonText}>
-                      {undoPending
-                        ? '等待对方同意'
-                        : undoBlocked
-                          ? '悔棋已禁'
-                          : canUndoDepth === 1
-                            ? '悔棋(退1手)'
-                            : '悔棋'}
-                    </Text>
-                  </TouchableOpacity>
-                  <TouchableOpacity
-                    style={[styles.actionButton, (drawPending || drawBlocked) && styles.actionButtonDisabled]}
-                    onPress={handleDrawRequest}
-                    disabled={drawPending || drawBlocked}
-                  >
-                    <FontAwesome6 name="handshake" size={16} color={COLORS.textPrimary} />
-                    <Text style={styles.actionButtonText}>
-                      {drawPending ? '求和中' : drawBlocked ? '求和已禁' : '求和'}
-                    </Text>
-                  </TouchableOpacity>
-                  <TouchableOpacity style={styles.actionButton} onPress={() => setShowSurrenderModal(true)}>
-                    <FontAwesome6 name="flag" size={16} color={COLORS.textPrimary} />
-                    <Text style={styles.actionButtonText}>认输</Text>
-                  </TouchableOpacity>
-                </>
-              )}
-              {phase === 'ended' && (
-                /* 结算阶段的唯一操作入口：棋盘停在最终局面，去留在这里决定——
-                   「返回房间」把**本端**退回房间准备界面（handleReturnToRoom；不再调 /rematch，
-                   那是房间级重置且会把对手一起拽回），「退出房间」离开。
-                   另标注兜底倒计时与对手去留：双方互不干扰，谁都不点则到点各自自动返回。
-                   结算浮层只承担结果告知，不再重复提供这两个动作。
-
-                   注意：本分支**不随对手动作收起**。对手点「返回房间」只会重置房间并下发
-                   returnedToRoom，本端仍留在结算页、按钮与倒计时都保留，由玩家自己决定；
-                   早期实现在此隐藏入口（settlementDismissed），导致对手一返回，本端倒计时
-                   中途按钮变「占位」——即用户报告的「点了没反应、按钮也消失了」。 */
-                <>
-                  <TouchableOpacity style={styles.actionButton} onPress={handleReturnToRoom}>
-                    <FontAwesome6 name="rotate-right" size={16} color={COLORS.textPrimary} />
-                    <Text style={styles.actionButtonText}>
-                      {returnRoomCountdown !== null
-                        ? opponentReturned
-                          ? '对手已返回房间'
-                          : `返回房间(${returnRoomCountdown})`
-                        : '返回房间'}
-                    </Text>
-                  </TouchableOpacity>
-                  <TouchableOpacity style={styles.actionButton} onPress={handleBack}>
-                    <FontAwesome6 name="door-open" size={16} color={COLORS.textPrimary} />
-                    <Text style={styles.actionButtonText}>退出房间</Text>
-                  </TouchableOpacity>
-                </>
-              )}
-              {(phase === 'reveal' || phase === 'countdown' || (phase === 'playing' && jueShaVisible)) && (
-                /* 占位按钮：不可见但保持底部栏高度，避免公示/倒数/绝杀/结算阶段棋盘跳动 */
-                <View style={[styles.actionButton, { opacity: 0 }]} pointerEvents="none">
-                  <FontAwesome6 name="flag" size={16} color={COLORS.textPrimary} />
-                  <Text style={styles.actionButtonText}>占位</Text>
-                </View>
-              )}
             </View>
 
           {/* 对方断线等待浮层 */}
@@ -2852,7 +2796,7 @@ export default function LanBattleScreen() {
           {/* 对局内低干扰提示条（含长将长捉超限/接近阈值提示，替代重构前的 10 处 Alert.alert，
               Web 端此前完全不显示）：
               绝对定位在棋盘中心、pointerEvents="box-none" 不阻塞落子，3s 后自动淡出。
-              centerY 为 noticeCenterY：棋盘中心换算到本提示条所属 capturedDrawerHost
+              centerY 为 noticeCenterY：棋盘中心换算到本提示条所属 boardHost
               坐标系的纵坐标（换算在 noticeCenterY 内完成）。缺测量时传 undefined，
               组件退回 50% 居中。结算浮层展示期间让位，避免与结果文字重叠。 */}
           <GameNotice
@@ -2870,7 +2814,7 @@ export default function LanBattleScreen() {
           <View
             style={[
               styles.emojiDropdown,
-              { top: emojiDropdownTop ?? (drawerHostY + emojiAnchorY + 6), width: Math.max(screenWidth - 24, 0) },
+              { top: emojiDropdownTop ?? (boardHostY + emojiAnchorY + 6), width: Math.max(screenWidth - 24, 0) },
             ]}
           >
             <ScrollView
@@ -3241,6 +3185,19 @@ export default function LanBattleScreen() {
           onConfirm={() => handleDrawResponse(true)}
         />
 
+        {/* 底部操作栏（与人机对战共用 @/components/GameBottomBar，2026-10 第二轮改造）
+            位置：主容器的最后一个子节点，固定通栏贴屏幕最底端（此前在 boardHost 内，
+            底栏高度变化/棋盘纵向居中都会带着它上下浮动）。
+            公示/倒数/绝杀阶段隐藏内容但保留占位，避免棋盘位置跳动。
+            对局中：菜单 / 认输 / 求和 / 悔棋 */}
+        <GameBottomBar
+          widthStyle={bottomBarWidthStyle}
+          style={{ marginTop: dynamicGap }}
+          bottomInset={insets.bottom}
+          hidden={bottomBarHidden}
+          actions={lanBarActions}
+          menuItems={lanMenuItems}
+        />
       </View>
     </Screen>
   );
@@ -3251,67 +3208,9 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: COLORS.background,
   },
-  topBar: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    paddingHorizontal: 16,
-    paddingTop: 8,
-    paddingBottom: 8,
-    backgroundColor: COLORS.card,
-    borderBottomWidth: 1,
-    borderBottomColor: COLORS.borderSolid,
-  },
-  backBtnZone: {
-    width: 100,
-    justifyContent: 'center',
-  },
-  backBtn: {
-    width: 40,
-    height: 40,
-    justifyContent: 'center',
-    alignItems: 'center',
-    borderRadius: 12,
-    backgroundColor: COLORS.card,
-    borderWidth: 1,
-    borderColor: COLORS.borderSolid,
-  },
-  gameInfo: {
+  // 棋盘 + 底部操作栏内容宿主（2026-10 起顶部标题栏下线，宿主直接顶到安全区下方）
+  boardHost: {
     flex: 1,
-    alignItems: 'center',
-  },
-  gameTitle: {
-    fontSize: FONT.title,
-    fontWeight: '700',
-    color: COLORS.textPrimary,
-  },
-  gameSubtitle: {
-    fontSize: FONT.caption,
-    color: COLORS.textLight,
-    marginTop: 2,
-    textAlign: 'center',
-  },
-  turnIndicator: {
-    minWidth: 100,
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'flex-end',
-    gap: 6,
-    backgroundColor: COLORS.card,
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: COLORS.borderSolid,
-  },
-  turnDot: {
-    width: 8,
-    height: 8,
-    borderRadius: 4,
-  },
-  turnText: {
-    fontSize: FONT.caption,
-    color: COLORS.textSecondary,
   },
   // 浮层（覆盖在棋盘上方）
   overlay: {
@@ -3509,10 +3408,6 @@ const styles = StyleSheet.create({
     color: '#FFFFFF',
   },
   // 棋盘
-  // 标题行下方内容宿主：被吃棋子抽屉（绝对定位）锚定于此容器顶部
-  capturedDrawerHost: {
-    flex: 1,
-  },
   // 与人机模式一致：容器无额外 padding，棋盘由 ChessBoard 自身按屏宽居中
   boardContainer: {
     flex: 1,
@@ -3670,34 +3565,8 @@ const styles = StyleSheet.create({
     fontSize: 26,
     lineHeight: 32,
   },
-  // 底部操作栏：与人机对战完全一致（宽度在渲染处以数值屏宽传入，按钮 flex:1 等分）
-  bottomBar: {
-    flexDirection: 'row',
-    justifyContent: 'center',
-    gap: 8,
-    paddingHorizontal: 16,
-  },
-  actionButton: {
-    flex: 1,
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    gap: 5,
-    backgroundColor: COLORS.card,
-    paddingHorizontal: 6,
-    paddingVertical: 12,
-    borderRadius: 14,
-    borderWidth: 1,
-    borderColor: COLORS.borderSolid,
-  },
-  actionButtonDisabled: {
-    opacity: 0.4,
-  },
-  actionButtonText: {
-    fontSize: FONT.body,
-    fontWeight: '600',
-    color: COLORS.textPrimary,
-  },
+  // 底部操作栏的视觉与交互已收敛到共享组件 @/components/GameBottomBar
+  // （固定高度 BOTTOM_BAR_HEIGHT + 「菜单」向上弹出列表），各模式共用一份实现。
   // 弹窗遮罩/卡片/标题/按钮样式已收敛到 @/components/Modal
   // （AppModal 提供遮罩+卡片壳子，AppDialog 提供标题+正文+按钮，ModalButton 提供按钮变体），
   // 尺寸与配色统一走 @/constants/modal 的 Design Tokens。

@@ -42,22 +42,15 @@ interface ChessBoardProps {
   onEmptyPress: (col: number, row: number) => void;
   onMove?: (col: number, row: number) => void;
   aiThinking?: boolean;
-  capturedByRed: number[]; // 红方吃掉的棋子（黑方棋子ID）
-  capturedByBlack: number[]; // 黑方吃掉的棋子（红方棋子ID）
-  hideCaptured?: boolean; // 是否隐藏被吃棋子显示
-  playerSide: 'red' | 'black'; // 玩家执棋方（用于被吃棋子标题）
+  /** 玩家执棋方 */
+  playerSide: 'red' | 'black';
   /** 提示功能：最优解（待走棋子橙色描边 + 落点橙色圆点），null/不传表示无提示 */
   hintMove?: { pieceId: number; toCol: number; toRow: number } | null;
   /** 让子幽灵标记（在线对局让子局专用）：被让出的棋子在其初始位置半透明展示 + 红色「让」角标，
    *  不参与对局、不响应触摸；该交叉点被真实棋子占据后自动隐藏 */
   ghostPieces?: { id: number; col: number; row: number }[];
-  /** 点击被吃棋子摘要文字（对方/我方），由父级在标题行正下方渲染 CapturedPiecesDrawer */
-  onCapturedPress?: (side: 'opponent' | 'mine') => void;
   /** 棋盘可用的最大纵向高度（父级实测传入）；空间不足时按比例缩小棋盘，防止挤占上下 UI */
   maxBoardHeight?: number;
-  /** 被吃棋子摘要条（悬浮于棋盘上方）的额外上移偏移量：
-   *  棋盘上方存在其他元素（如人机对局的 AI 标识角标行）时传入其高度，避免摘要文字与之重叠 */
-  capturedStripOffset?: number;
   /** 吃子/将军特效（seq 变化时重播），null/不传表示无特效 */
   moveEffect?: MoveEffect | null;
   /** 长将长捉超限落点标记：超限方的「继续长将/长捉」落点以红色标记高亮，
@@ -94,9 +87,6 @@ const PIECE_AREA_HEIGHT = PIECE_BOTTOM - PIECE_TOP; // 608
 // 9x10 网格（9列10行交叉点）
 export const COLS = 9;
 export const ROWS = 10;
-
-// 被吃棋子摘要行固定高度（抽屉向下展开的锚定偏移量）
-const CAPTURED_SUMMARY_H = 30;
 
 // 计算网格间距（原始图片中的像素；【C-85】私有，仅作 unitScale 的归一化分母）
 const GRID_SPACING_X = PIECE_AREA_WIDTH / (COLS - 1); // 540 / 8 = 67.5
@@ -207,19 +197,6 @@ const PieceItem = memo(function PieceItem({
     prev.imageSource === next.imageSource;
 });
 
-// ==================== Captured Pieces Helpers ====================
-
-// 按棋子类型分组统计（用于被吃棋子展示）
-function groupCapturedPieces(ids: number[]): [string, number[]][] {
-  const groups: { [key: string]: number[] } = {};
-  ids.forEach(pieceId => {
-    const name = PIECE_NAMES[pieceId] || '?';
-    if (!groups[name]) groups[name] = [];
-    groups[name].push(pieceId);
-  });
-  return Object.entries(groups);
-}
-
 // ==================== Main Component ====================
 
 export default function ChessBoard({
@@ -232,15 +209,10 @@ export default function ChessBoard({
   onEmptyPress,
   onMove,
   aiThinking,
-  capturedByRed,
-  capturedByBlack,
-  hideCaptured,
   playerSide,
   hintMove = null,
   ghostPieces,
-  onCapturedPress,
   maxBoardHeight,
-  capturedStripOffset = 0,
   moveEffect = null,
   banMoves = null,
   onBoardLayout,
@@ -292,15 +264,6 @@ export default function ChessBoard({
   // 棋子大小（基于缩放比例，直径随样式几何变化）
   const pieceSize = Math.floor(boardStyle.pieceDiameter * scale);
   const pieceHalf = pieceSize / 2;
-
-  // ===== 被吃棋子 =====
-  // 摘要行常驻于棋盘上方（点击后由父级通过 onCapturedPress 在标题行正下方
-  // 渲染 CapturedPiecesDrawer 明细抽屉，本组件不再内置展开层；
-  // 明细项尺寸计算见 CapturedPiecesDrawer）
-
-  // 左半区（对方损失）与右半区（我方损失）对应的被吃棋子
-  const opponentLostIds = playerSide === 'red' ? capturedByRed : capturedByBlack;
-  const mineLostIds = playerSide === 'red' ? capturedByBlack : capturedByRed;
 
   // 预计算所有网格交叉点位置（90个点，只算一次）
   const gridPositions = useMemo(() => {
@@ -714,46 +677,6 @@ export default function ChessBoard({
     // 导致被吃棋子半区（flex:1）超出屏幕）。容器由父级 alignItems: 'center' 居中，
     // 宽度恰好等于屏幕可见宽，棋盘容器在其中居中、视觉效果与之前完全一致。
     <View style={[styles.outerContainer, { width: screenWidth }]}>
-      {/* 被吃棋子覆盖层：独立全宽条带，锚定在棋盘上方。
-          参照系是数值屏宽的 outerContainer（而非可能超宽的棋盘容器）。
-          两个半区各显示摘要文字（对方/我方损失棋子：N），点击后通过
-          onCapturedPress 通知父级在标题行正下方展开明细抽屉 */}
-      {!hideCaptured && (
-        <View
-          style={[
-            styles.capturedStrip,
-            // 棋盘上方有其他元素（如 AI 标识角标行）时整体上移，保证摘要文字不与其重叠
-            capturedStripOffset > 0 && { marginBottom: 8 + capturedStripOffset },
-          ]}
-          pointerEvents="box-none"
-        >
-          {/* 摘要行：左右各半（固定高度） */}
-          <View style={styles.capturedSummaryRow}>
-            {(
-              [
-                { ids: opponentLostIds, title: '对方损失棋子', side: 'opponent' as const },
-                { ids: mineLostIds, title: '我方损失棋子', side: 'mine' as const },
-              ]
-            ).map(({ ids, title, side }) => {
-              // 无损失时仅保留占位槽位维持左右各半布局
-              if (ids.length === 0) {
-                return <View key={side} style={styles.capturedHalf} />;
-              }
-              return (
-                <TouchableOpacity
-                  key={side}
-                  style={styles.capturedHalf}
-                  activeOpacity={0.7}
-                  onPress={() => onCapturedPress?.(side)}
-                >
-                  <Text style={styles.capturedTitle}>{title}：{ids.length}</Text>
-                </TouchableOpacity>
-              );
-            })}
-          </View>
-        </View>
-      )}
-
       <View
         style={[
           styles.container,
@@ -897,134 +820,6 @@ export default function ChessBoard({
   );
 }
 
-// ==================== Captured Pieces Drawer (导出，由对局页渲染) ====================
-
-export interface CapturedPiecesDrawerProps {
-  /** 展开的一侧；null 表示收起 */
-  side: 'opponent' | 'mine' | null;
-  gameState: GameState;
-  /** 玩家执棋方（用于区分对方/我方被吃棋子） */
-  playerSide: 'red' | 'black';
-  /** 棋盘可用的最大纵向高度（与 ChessBoard 同参），用于保持明细棋子尺寸与棋盘一致缩放 */
-  maxBoardHeight?: number;
-}
-
-/**
- * 被吃棋子明细抽屉：由对局页渲染在【顶部标题行正下方】的全宽浮层
- * （绝对定位，覆盖摘要行与棋盘上方区域，不挤压任何布局、棋盘位置不动）。
- * 规格与棋盘摘要行一致：80% 棋子图尺寸随屏宽自适应 + 右上方红色数量角标。
- * 父级使用方式：作为标题行下方相对定位容器（flex:1，无 padding）的首个子节点。
- */
-export function CapturedPiecesDrawer({ side, gameState, playerSide, maxBoardHeight }: CapturedPiecesDrawerProps) {
-  // 动画值用 useState 惰性初始化（避免渲染期访问 ref.current）
-  const [anim] = useState(() => new Animated.Value(0));
-  // 实际渲染的一侧：收起动画播放期间保持渲染，动画结束后再卸载
-  const [renderedSide, setRenderedSide] = useState<'opponent' | 'mine' | null>(side);
-
-  // 渲染期派生（React 官方 adjust-state-during-render 模式）：
-  // 展开/切换时立即同步渲染目标；收起时保留旧值直至退出动画结束
-  if (side && side !== renderedSide) {
-    setRenderedSide(side);
-  }
-
-  // 展开：下滑 + 淡入；收起：上滑 + 淡出，动画结束后卸载
-  useEffect(() => {
-    if (side) {
-      Animated.timing(anim, { toValue: 1, duration: 160, useNativeDriver: true }).start();
-    } else if (renderedSide) {
-      Animated.timing(anim, { toValue: 0, duration: 140, useNativeDriver: true }).start(({ finished }) => {
-        if (finished) setRenderedSide(null);
-      });
-    }
-  }, [side, renderedSide, anim]);
-
-  // 由 gameState 推导双方被吃棋子（口径与 ChessBoard 摘要行完全一致：
-  // capturedByRed=红方战果（被吃的黑方棋子），capturedByBlack=黑方战果（被吃的红方棋子）；
-  // "对方损失"=被玩家吃掉的对方棋子）
-  const capturedByRed: number[] = [];
-  const capturedByBlack: number[] = [];
-  gameState.pieces.forEach((p) => {
-    if (!p.alive) {
-      if (p.id >= 16) capturedByBlack.push(p.id);
-      else capturedByRed.push(p.id);
-    }
-  });
-  const ids = renderedSide === 'opponent'
-    ? (playerSide === 'red' ? capturedByRed : capturedByBlack)
-    : (playerSide === 'red' ? capturedByBlack : capturedByRed);
-
-  // 与 ChessBoard 相同的尺寸计算（80% 棋子图 + 角标按基准比例联动）；
-  // 棋盘因纵向空间不足缩小时，明细棋子同步缩小
-  // 【C-77】同 ChessBoard 主组件：Dimensions.get('window') 是模块级快照，改为订阅式 hook
-  const { width: screenWidth } = useWindowDimensions();
-  const drawerStyle = useBoardStyle();
-  const widthScale = (screenWidth - BOARD_H_PADDING) / drawerStyle.scaleBaseWidth;
-  const scale = maxBoardHeight && maxBoardHeight > 0
-    ? Math.min(widthScale, maxBoardHeight / drawerStyle.scaleBaseHeight)
-    : widthScale;
-  const pieceSize = Math.floor(drawerStyle.pieceDiameter * scale);
-  const capturedPieceSize = Math.max(Math.floor(pieceSize * 0.8), 1);
-  const capturedBadgeSize = Math.max(Math.round(capturedPieceSize * 0.47), 12);
-  const capturedBadgeFont = Math.max(Math.round(capturedBadgeSize * 0.6), 8);
-  const capturedBadgeOffset = -Math.round(capturedBadgeSize * 0.27);
-
-  // 未展开（且收起动画已结束）或该方暂无棋子时不渲染（自动收起，避免空卡片）
-  if (!renderedSide || ids.length === 0) return null;
-
-  return (
-    <Animated.View
-      style={[
-        styles.capturedDrawerOverlay,
-        {
-          opacity: anim,
-          transform: [{ translateY: anim.interpolate({ inputRange: [0, 1], outputRange: [-8, 0] }) }],
-        },
-      ]}
-      collapsable={false}
-    >
-      <View style={styles.capturedPiecesRow}>
-        {groupCapturedPieces(ids).map(([name, gids]) => (
-          <View key={name} style={styles.capturedPieceItem}>
-            <Image
-              source={getPieceImage(gids[0])}
-              style={{ width: capturedPieceSize, height: capturedPieceSize }}
-            />
-            {/* 数量角标：棋子右上方红色圆标，仅数量 > 1 时显示 */}
-            {gids.length > 1 && (
-              <View
-                style={[
-                  styles.capturedPieceBadge,
-                  {
-                    top: capturedBadgeOffset,
-                    right: capturedBadgeOffset,
-                    minWidth: capturedBadgeSize,
-                    height: capturedBadgeSize,
-                    borderRadius: capturedBadgeSize / 2,
-                    paddingHorizontal: capturedBadgeSize * 0.17,
-                  },
-                ]}
-              >
-                <Text
-                  allowFontScaling={false}
-                  style={[
-                    styles.capturedPieceBadgeText,
-                    {
-                      fontSize: capturedBadgeFont,
-                      lineHeight: Math.max(Math.round(capturedBadgeFont * 1.2), 1),
-                    },
-                  ]}
-                >
-                  {gids.length}
-                </Text>
-              </View>
-            )}
-          </View>
-        ))}
-      </View>
-    </Animated.View>
-  );
-}
-
 const styles = StyleSheet.create({
   outerContainer: {
     alignItems: 'center',
@@ -1105,80 +900,5 @@ const styles = StyleSheet.create({
     position: 'absolute',
     backgroundColor: 'rgba(245, 124, 0, 0.8)',
     zIndex: 9,
-  },
-  capturedStrip: {
-    position: 'absolute',
-    left: 0,
-    right: 0,
-    bottom: '100%',
-    marginBottom: 8,
-    zIndex: 10,
-  },
-  capturedSummaryRow: {
-    flexDirection: 'row',
-    // 固定高度，摘要行位置始终不动
-    height: CAPTURED_SUMMARY_H,
-  },
-  capturedHalf: {
-    flex: 1,
-    alignItems: 'center',
-    justifyContent: 'center',
-    paddingVertical: 4, // 扩大摘要文字的点击区域
-  },
-  // 明细弹窗：居中卡片浮层，与棋盘/标题行完全解耦
-  // 被吃棋子抽屉：绝对定位于摘要行正下方，向下展开覆盖棋盘上方区域；
-  // zIndex/elevation 高于棋盘层，保证 Android Release 下也不被棋盘遮挡
-  // 被吃棋子明细抽屉（对局页层级 CapturedPiecesDrawer 使用）：
-  // 锚定顶部标题行正下方，全宽实心浮层，覆盖摘要行与棋盘上方区域；
-  // zIndex/elevation 置于最高层，collapsable={false} 防止 Android Release
-  // 视图扁平化导致被棋盘遮挡
-  capturedDrawerOverlay: {
-    position: 'absolute',
-    top: 0,
-    left: 0,
-    right: 0,
-    backgroundColor: 'transparent',
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    zIndex: 50,
-    elevation: 50,
-  },
-  capturedPiecesRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    flexWrap: 'wrap',
-    alignSelf: 'stretch',
-    paddingHorizontal: 4,
-    // 注意：此处不能使用 gap 属性——Yoga（Android）在 gap + flexWrap 组合下
-    // 换行宽度计算有缺陷，会导致最后一项的"×数量"文字被挤出屏幕。
-    // 间距通过 capturedPieceItem 的 marginHorizontal 实现。
-  },
-  capturedTitle: {
-    fontSize: FONT.body,
-    color: '#666',
-  },
-  capturedPieceItem: {
-    // 数量改为右上角角标后，项尺寸即棋子图尺寸；角标绝对定位于项内
-    position: 'relative',
-    // 对称外边距代替 gap：相邻项间距 6px，且每项的完整宽度
-    // （棋子图 + 外边距）都会被计入换行判断
-    marginHorizontal: 3,
-    marginVertical: 3,
-  },
-  // 数量角标：棋子右上方红色圆形标记（参考通知角标样式），
-  // 略微超出棋子边缘形成叠加感；白字细边保证在木质底色上清晰。
-  // 尺寸/偏移/内边距均随棋子图尺寸按比例内联传入（移动端自适应）
-  capturedPieceBadge: {
-    position: 'absolute',
-    backgroundColor: '#C62828',
-    alignItems: 'center',
-    justifyContent: 'center',
-    borderWidth: 1,
-    borderColor: 'rgba(255, 255, 255, 0.85)',
-  },
-  capturedPieceBadgeText: {
-    color: '#fff',
-    fontWeight: '700',
   },
 });

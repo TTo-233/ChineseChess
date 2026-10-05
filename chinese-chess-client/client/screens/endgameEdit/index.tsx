@@ -92,7 +92,7 @@ type Placements = number[][];
 const emptyBoard = (): Placements =>
   Array.from({ length: 9 }, () => new Array(10).fill(-1));
 
-// 选子摘要条高度（与被吃棋子摘要条 CAPTURED_SUMMARY_H 一致）
+// 选子摘要条高度（与引擎标识角标行 AI_NAME_ROW_FLOW_HEIGHT 一致）
 const SELECT_STRIP_H = 30;
 
 export default function EndgameEditScreen() {
