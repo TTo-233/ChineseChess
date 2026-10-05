@@ -45,12 +45,26 @@ export interface BackgroundStyle {
   tone: 'light' | 'dark';
 }
 
+/**
+ * 数组顺序就是「样式设置 → 背景」分页里的卡片展示顺序。
+ *
+ * 卡片是固定宽度 + 横向滚动（卡片宽 96 + 间距 10，可视区约 272~380px，
+ * 一屏只能看到 2~3 张，见 StyleSettingsModal 的 bgRow 注释），
+ * 所以越靠右越难触达：想优先让人看到的样式必须排在前面。
+ */
 export const BACKGROUND_STYLES: BackgroundStyle[] = [
   {
     id: 'none',
     name: '默认',
     desc: '纯色底',
     image: null,
+    tone: 'light',
+  },
+  {
+    id: 'jiangshan',
+    name: '江山',
+    desc: '青绿长卷',
+    image: require('@/assets/backgrounds/bg_jiangshan.jpg'),
     tone: 'light',
   },
   {
@@ -73,13 +87,6 @@ export const BACKGROUND_STYLES: BackgroundStyle[] = [
     desc: '红帐宫灯',
     image: require('@/assets/backgrounds/bg_zhuge.jpg'),
     tone: 'dark',
-  },
-  {
-    id: 'jiangshan',
-    name: '江山',
-    desc: '青绿长卷',
-    image: require('@/assets/backgrounds/bg_jiangshan.jpg'),
-    tone: 'light',
   },
 ];
 

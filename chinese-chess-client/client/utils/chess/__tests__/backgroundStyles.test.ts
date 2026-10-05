@@ -65,10 +65,10 @@ function readJpegSize(buf: Buffer): { width: number; height: number } {
 }
 
 describe('backgroundStyles 注册表', () => {
-  it('id 唯一，且按 none → shuimo → xianshan → zhuge → jiangshan 排列', () => {
+  it('id 唯一，且按 none → jiangshan → shuimo → xianshan → zhuge 排列', () => {
     const ids = BACKGROUND_STYLES.map((s) => s.id);
     expect(new Set(ids).size).toBe(ids.length);
-    expect(ids).toEqual(['none', 'shuimo', 'xianshan', 'zhuge', 'jiangshan']);
+    expect(ids).toEqual(['none', 'jiangshan', 'shuimo', 'xianshan', 'zhuge']);
   });
 
   it('展示名不超过 4 个字，且互不相同', () => {
