@@ -374,6 +374,14 @@ const styles = StyleSheet.create({
   },
   backgroundImage: {
     ...StyleSheet.absoluteFillObject,
+    // 必须显式写死 100%×100%：RN 的 <Image>（Image.ios.js / Image.android.js 均有
+    // `style = [{width: source.width, height: source.height}, ...props.style]`）会把素材
+    // 固有尺寸注入成默认样式，而 absoluteFillObject 只给 left/right/top/bottom、不含宽高，
+    // 覆盖不掉注入值——结果背景被布局成素材原始尺寸（1080×2400 dp）并锚在左上角，
+    // 真机上只显示画面一角，且不随屏幕长宽自适应。
+    // 这里用百分比而不是 `width: undefined`：显式值一定覆盖注入值，undefined 在序列化时可能被丢弃。
+    width: '100%',
+    height: '100%',
   },
 });
 

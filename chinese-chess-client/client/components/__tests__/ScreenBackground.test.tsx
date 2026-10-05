@@ -9,7 +9,7 @@
  * 这里钉住五条：
  *   ① 传图时渲染一层绝对定位、按负安全区偏移撑满整屏的背景层；
  *   ② `pointerEvents="none"` 挂在**那层 View** 上，且必须是 JSX prop；
- *   ③ Image 自身填满背景层（StyleSheet.absoluteFill）；
+ *   ③ Image 自身填满背景层（四向偏移 + 显式 100%×100%，缺一不可）；
  *   ④ 不传图时**一个 Image 都不渲染**（默认观感零回归）；
  *   ⑤ 背景是本页第一个子节点 ⇒ 压在内容之下。
  *
@@ -125,6 +125,12 @@ describe('Screen 背景图', () => {
     expect(style.left).toBe(0);
     expect(style.right).toBe(0);
     expect(style.bottom).toBe(0);
+    // 关键：RN 的 <Image> 会把素材固有尺寸注入成默认样式
+    // （Image.ios.js / Image.android.js：`style = [{width: source.width, height: source.height}, ..., props.style]`），
+    // 只给四向偏移会被它顶掉 —— 背景于是按素材原始像素（1080×2400 dp）布局并锚在左上角，
+    // 真机上只显示画面一角且不随屏幕长宽自适应。必须显式给 100% 才能盖住注入值。
+    expect(style.width).toBe('100%');
+    expect(style.height).toBe('100%');
   });
 
   it('backgroundResizeMode 可覆盖（如竖图改用 stretch）', () => {

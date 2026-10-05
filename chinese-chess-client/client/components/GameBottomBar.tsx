@@ -451,8 +451,10 @@ const styles = StyleSheet.create({
   },
   barImage: {
     ...StyleSheet.absoluteFillObject,
-    width: undefined,
-    height: undefined,
+    // 同 Screen.backgroundImage：RN <Image> 会注入素材固有尺寸，absoluteFillObject 覆盖不掉，
+    // 必须显式给 100%（用 undefined 不保险，序列化时可能被丢弃）才能随底栏尺寸自适应。
+    width: '100%',
+    height: '100%',
   },
   barScrim: {
     ...StyleSheet.absoluteFillObject,
