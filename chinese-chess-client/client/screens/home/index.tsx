@@ -92,7 +92,7 @@ export default function HomeScreen() {
   return (
     <Screen>
       <View style={styles.container}>
-        {/* 固定右上角：历史对局（复盘）+ 设置（棋盘样式）入口，独立于标题单独一行 */}
+        {/* 固定右上角：历史对局（复盘）+ 棋盘样式入口，独立于标题单独一行 */}
         <View style={styles.topBarRow}>
           <TouchableOpacity
             style={styles.replayEntry}
@@ -105,8 +105,11 @@ export default function HomeScreen() {
             style={styles.replayEntry}
             onPress={() => setStyleModalVisible(true)}
             activeOpacity={0.8}
+            accessibilityLabel="棋盘样式"
           >
-            <FontAwesome6 name="gear" size={17} color={COLORS.primary} />
+            {/* 2026-10 由 gear 改为 chess-board：该入口打开的是「棋盘样式选择」
+                （BoardStyleModal），齿轮图标与实际功能不符 */}
+            <FontAwesome6 name="chess-board" size={17} color={COLORS.primary} />
           </TouchableOpacity>
         </View>
 
