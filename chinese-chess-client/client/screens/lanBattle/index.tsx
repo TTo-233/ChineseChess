@@ -349,6 +349,8 @@ export default function LanBattleScreen() {
   // 因此以 belowHostHeight 参与封顶，而不是 bottomFlowHeight（口径与观战/回放页一致）。
   // 注意 belowHostHeight 不要加 insets.bottom —— capHostHeightToViewport 已扣过一次
   // bottomInset，重复计入会白白少掉一个安全区的高度。
+  // 【C-81】下方那一行角标通过 belowHostSlack 借用底栏上边距 dynamicGap，
+  // 使棋盘宽度不受它影响（横向留白口径与人机对战一致，见【C-81】注释）。
   const { maxBoardHeight, paddingTop: boardPadTop } = useBoardLayoutBudget({
     hostHeight: capHostHeightToViewport(
       boardAreaH,
@@ -361,6 +363,10 @@ export default function LanBattleScreen() {
     screenWidth,
     topFlowHeight: 30,
     bottomFlowHeight: 30,
+    // 【C-81】下方角标行借用底栏上边距 dynamicGap 这段确实空着的间距。
+    // 横向宽度只由 BOARD_H_PADDING 决定，与人机对战保持一致；
+    // 借用量恰好等于封顶溢出量，因此最坏情况只是内容贴到底栏上沿，不会压到底栏。
+    belowHostSlack: dynamicGap,
   });
 
   // 棋盘真实几何（相对主容器）：供绝杀特效锁定棋盘中心、把结算文字/按钮排到棋盘正下方，

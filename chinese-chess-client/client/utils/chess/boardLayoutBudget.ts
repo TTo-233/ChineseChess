@@ -20,7 +20,9 @@ import { useMemo } from 'react';
 import { useBoardStyle } from './boardStyleStore';
 import { BOARD_H_PADDING, type BoardStyle } from './boardStyles';
 
-/** 棋盘最小可用高度（极矮屏下的保底值，与历史实现一致） */
+/**
+ * 棋盘最小可用高度（极矮屏下的保底值，与历史实现一致）
+ */
 export const DEFAULT_MIN_BOARD_HEIGHT = 200;
 
 /**
@@ -55,8 +57,32 @@ export interface BoardLayoutBudgetInput {
   screenWidth: number;
   /** 棋盘"上方"流内占位高度（AI 标识/对手名称角标行及其 marginBottom；无则 0） */
   topFlowHeight: number;
-  /** 棋盘"下方"流内占位高度（dynamicGap + 底部操作栏/控制区；均在宿主内） */
+  /**
+   * 棋盘**下方**、宿主之内的流内占位高度（我方名称角标行等；无则 0）。
+   *
+   * 它主要参与**垂直定位**（见 computeBoardLayoutBudget 的 paddingTop）。
+   * 是否参与棋盘尺寸封顶由 belowHostSlack 决定：横向留白只由 boardStyles 的
+   * BOARD_H_PADDING 一处定义，不该因为某个页面在棋盘下方多渲染一行角标，
+   * 就顺带把棋盘按高度缩小、两侧留白被放大（【C-81】，见下方说明）。
+   */
   bottomFlowHeight: number;
+  /**
+   * 棋盘宿主**正下方、宿主之外**确认为空的高度（当前各页即底部操作栏与棋盘之间的
+   * dynamicGap = max(屏宽*3%, 8)）；默认为 0。
+   *
+   * 【C-81】2026-10 实机问题：在线对局棋盘两侧留白比人机对战宽。
+   * 根因是在线对局多渲染了「我方名称角标行」（棋盘下方一行，占 bottomFlowHeight），
+   * 它被计入纵向封顶 → 棋盘被按高度缩小 → 横向留白被顺带放大。
+   *
+   * 修法不是删掉这一行（它必须占位，否则会压到底栏），而是把「棋盘下方那段
+   * 确实空着的间距」显式声明出来：下方内容可以借用这段空白，
+   * 于是棋盘宽度重新只由「屏宽 - BOARD_H_PADDING」决定。
+   *
+   * 安全性：只有该页确实把这段间距留空时才可传，且借用量恰好等于封顶时的溢出量
+   * （见 computeBoardLayoutBudget），因此最坏情况只是内容正好贴到底栏上沿，
+   * 绝不会压到底栏或与之重叠。
+   */
+  belowHostSlack?: number;
   /** 棋盘最小高度保底（默认 DEFAULT_MIN_BOARD_HEIGHT） */
   minBoardHeight?: number;
 }
@@ -76,12 +102,18 @@ export interface BoardLayoutBudgetResult {
  * 即 topOffset ≤ hostHeight - topFlowHeight - board - bottomFlowHeight。
  * 取 topOffset = max((hostHeight - 内容高)/2, 0)（垂直居中）代入，解出
  *   board ≤ hostHeight - topFlowHeight - bottomFlowHeight（无需二分，直接线性求解）。
+ *
+ * 【C-81】belowHostSlack > 0 时，上式的封顶改为「只封顶上方占位」：
+ *   board ≤ hostHeight + belowHostSlack - topFlowHeight
+ * 即下方的行可以借用棋盘下方那段确实空着的间距（当前即底栏上边距 dynamicGap），
+ * 横向宽度重新只由 BOARD_H_PADDING 决定，人机对战与在线对局的留白因此一致。
  */
 export function computeBoardLayoutBudget(
   input: BoardLayoutBudgetInput,
   boardStyle: BoardStyle
 ): BoardLayoutBudgetResult {
   const { hostHeight, screenWidth, topFlowHeight, bottomFlowHeight } = input;
+  const belowHostSlack = input.belowHostSlack ?? 0;
   const minBoardHeight = input.minBoardHeight ?? DEFAULT_MIN_BOARD_HEIGHT;
 
   if (!(hostHeight > 0)) {
@@ -93,7 +125,7 @@ export function computeBoardLayoutBudget(
   const widthBoardHeight = widthScale * boardStyle.scaleBaseHeight;
 
   // 纵向约束 + 保底：极端矮屏下宁可溢出也要保住 minBoardHeight（否则棋盘小到无法落子）
-  const flowBudget = hostHeight - topFlowHeight - bottomFlowHeight;
+  const flowBudget = hostHeight + belowHostSlack - topFlowHeight - bottomFlowHeight;
   const board = Math.max(Math.min(widthBoardHeight, flowBudget), minBoardHeight);
 
   // 垂直定位留白：内容在宿主内垂直居中（内容高于宿主时为 0，由下方溢出承载）
@@ -106,13 +138,21 @@ export function computeBoardLayoutBudget(
 /** 基于当前棋盘样式的预算 Hook（用户切换棋盘样式时同步更新） */
 export function useBoardLayoutBudget(input: BoardLayoutBudgetInput): BoardLayoutBudgetResult {
   const boardStyle = useBoardStyle();
-  const { hostHeight, screenWidth, topFlowHeight, bottomFlowHeight, minBoardHeight } = input;
+  const { hostHeight, screenWidth, topFlowHeight, bottomFlowHeight, belowHostSlack, minBoardHeight } =
+    input;
   return useMemo(
     () =>
       computeBoardLayoutBudget(
-        { hostHeight, screenWidth, topFlowHeight, bottomFlowHeight, minBoardHeight },
+        {
+          hostHeight,
+          screenWidth,
+          topFlowHeight,
+          bottomFlowHeight,
+          belowHostSlack,
+          minBoardHeight,
+        },
         boardStyle
       ),
-    [hostHeight, screenWidth, topFlowHeight, bottomFlowHeight, minBoardHeight, boardStyle]
+    [hostHeight, screenWidth, topFlowHeight, bottomFlowHeight, belowHostSlack, minBoardHeight, boardStyle]
   );
 }
