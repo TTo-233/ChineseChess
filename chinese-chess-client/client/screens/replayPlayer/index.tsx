@@ -234,7 +234,7 @@ export default function ReplayPlayerScreen() {
     <Screen
       safeAreaEdges={['top', 'left', 'right']}
       backgroundImage={background.image}
-      // 深色背景图（仙山/朱阁）下黑色状态栏图标看不清，切成浅色
+      // 深色背景图（华彩红顶 / 茶室木梁）下黑色状态栏图标看不清，切成浅色
       statusBarStyle={background.tone === 'dark' ? 'light' : 'dark'}
     >
       <View style={[styles.container, hasBackground && styles.containerTransparent]}>
@@ -409,7 +409,7 @@ const styles = StyleSheet.create({
    * 整屏背景图下的文字外描边（浅色光晕）。
    *
    * 进度区（步数 + 回合提示）与「对局不存在」都在棋盘宿主之外，直接落在页面底色上 ——
-   * 没有任何不透明卡片托底。背景图可能是深色的（仙山夜月 / 朱阁红帐），
+   * 没有任何不透明卡片托底。背景图可能是深色的（注册表里 tone='dark' 的那一档），
    * 深棕前景压上去会糊成一片。
    *
    * 之所以用 textShadow 而不是加卡片：textShadow **不参与布局测量**，

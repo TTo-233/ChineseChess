@@ -26,7 +26,7 @@ import type { ImageSourcePropType } from 'react-native';
  * `'none'` 是「不使用背景图」的默认态——底色沿用各屏自己的 `COLORS.bg`（米黄古纸色），
  * 即本功能上线前的既有观感，保证老用户升级后视觉不变，且随时可以退回来。
  */
-export type BackgroundStyleId = 'none' | 'shuimo' | 'xianshan' | 'zhuge' | 'jiangshan';
+export type BackgroundStyleId = 'none' | 'jiangshan' | 'zhuyue' | 'huacai' | 'chashi';
 
 export interface BackgroundStyle {
   id: BackgroundStyleId;
@@ -68,24 +68,24 @@ export const BACKGROUND_STYLES: BackgroundStyle[] = [
     tone: 'light',
   },
   {
-    id: 'shuimo',
-    name: '水墨',
-    desc: '淡墨山水',
-    image: require('@/assets/backgrounds/bg_shuimo.jpg'),
+    id: 'zhuyue',
+    name: '竹月',
+    desc: '月照墨竹',
+    image: require('@/assets/backgrounds/bg_zhuyue.jpg'),
     tone: 'light',
   },
   {
-    id: 'xianshan',
-    name: '仙山',
-    desc: '夜月琼楼',
-    image: require('@/assets/backgrounds/bg_xianshan.jpg'),
+    id: 'huacai',
+    name: '华彩',
+    desc: '剪纸戏韵',
+    image: require('@/assets/backgrounds/bg_huacai.jpg'),
     tone: 'dark',
   },
   {
-    id: 'zhuge',
-    name: '朱阁',
-    desc: '红帐宫灯',
-    image: require('@/assets/backgrounds/bg_zhuge.jpg'),
+    id: 'chashi',
+    name: '茶室',
+    desc: '素壁茶烟',
+    image: require('@/assets/backgrounds/bg_chashi.jpg'),
     tone: 'dark',
   },
 ];

@@ -631,7 +631,7 @@ export default function SpectateScreen() {
     <Screen
       safeAreaEdges={['top', 'left', 'right']}
       backgroundImage={background.image}
-      // 深色背景图（仙山/朱阁）下黑色状态栏图标看不清，切成浅色
+      // 深色背景图（华彩红顶 / 茶室木梁）下黑色状态栏图标看不清，切成浅色
       statusBarStyle={background.tone === 'dark' ? 'light' : 'dark'}
     >
       <View style={[styles.container, hasBackground && styles.containerTransparent]}>
@@ -911,8 +911,9 @@ const styles = StyleSheet.create({
   /**
    * 整屏背景图下的文字外描边（浅色光晕）。
    *
-   * 背景图可能是深色的（仙山夜月 / 朱阁红帐），而本页前景色一直是深棕。信息行里有几处文字
-   * 直接落在页面底色上（没有 infoPill 那样的不透明药丸托底），深色字压在深色图上会糊成一片。
+   * 背景图可能是深色的（注册表里 tone='dark' 的那一档），而本页前景色一直是深棕。
+   * 信息行里有几处文字直接落在页面底色上（没有 infoPill 那样的不透明药丸托底），
+   * 深色字压在深色图上会糊成一片。
    *
    * 之所以用 textShadow 而不是给药丸：textShadow **不参与布局测量**，
    * 加在文字上不会改变 infoRow 那条 `height: 30`（与 BOARD_INFO_ROW_FLOW_HEIGHT = 32 常量绑定），

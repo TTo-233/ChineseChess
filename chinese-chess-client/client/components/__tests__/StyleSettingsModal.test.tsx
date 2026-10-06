@@ -7,7 +7,7 @@
  * 本文件钉住四条契约：
  *   ① 标题是「样式设置」（不再是「棋盘样式」）；
  *   ② 两枚分页按钮存在，默认停在「棋盘」；
- *   ③ 切到「背景」后棋盘卡片整体消失、五张背景卡片出现（含「默认」纯色底）；
+ *   ③ 切到「背景」后棋盘卡片整体消失、背景卡片出现（含「默认」纯色底）；
  *   ④ 点卡片即选中——写 store、写 AsyncStorage、并把选中态挪到该卡片上。
  *      两个分页各自写各自的 key，互不串台。
  *
@@ -114,7 +114,7 @@ describe('StyleSettingsModal', () => {
     const texts = allText(render());
 
     expect(texts).toEqual(expect.arrayContaining(['经典', '花梨木', '玄墨']));
-    for (const bgName of ['默认', '水墨', '仙山', '朱阁', '江山']) {
+    for (const bgName of ['默认', '江山', '竹月', '华彩', '茶室']) {
       expect(texts).not.toContain(bgName);
     }
   });
@@ -124,7 +124,7 @@ describe('StyleSettingsModal', () => {
     pressByText(tree, '背景');
     const texts = allText(tree);
 
-    expect(texts).toEqual(expect.arrayContaining(['默认', '水墨', '仙山', '朱阁', '江山']));
+    expect(texts).toEqual(expect.arrayContaining(['默认', '江山', '竹月', '华彩', '茶室']));
     for (const boardName of ['经典', '花梨木', '玄墨']) {
       expect(texts).not.toContain(boardName);
     }
@@ -133,26 +133,26 @@ describe('StyleSettingsModal', () => {
   it('分页可来回切换，且回到「棋盘」后棋盘样式还在', () => {
     const tree = render();
     pressByText(tree, '背景');
-    expect(allText(tree)).toContain('水墨');
+    expect(allText(tree)).toContain('江山');
     pressByText(tree, '棋盘');
     expect(allText(tree)).toContain('经典');
-    expect(allText(tree)).not.toContain('水墨');
+    expect(allText(tree)).not.toContain('江山');
   });
 
   it('选中背景即生效 + 持久化，选中态挪到该卡片上', async () => {
     const tree = render();
     pressByText(tree, '背景');
-    expect(isSelected(tree, '水墨')).toBe(false);
+    expect(isSelected(tree, '江山')).toBe(false);
     expect(isSelected(tree, '默认')).toBe(true);
 
     await act(async () => {
-      pressByText(tree, '水墨');
+      pressByText(tree, '江山');
       await Promise.resolve();
     });
 
-    expect(getBackgroundStyleId()).toBe('shuimo');
-    expect(AsyncStorage.setItem).toHaveBeenCalledWith(BACKGROUND_KEY, 'shuimo');
-    expect(isSelected(tree, '水墨')).toBe(true);
+    expect(getBackgroundStyleId()).toBe('jiangshan');
+    expect(AsyncStorage.setItem).toHaveBeenCalledWith(BACKGROUND_KEY, 'jiangshan');
+    expect(isSelected(tree, '江山')).toBe(true);
     expect(isSelected(tree, '默认')).toBe(false);
   });
 
@@ -161,10 +161,10 @@ describe('StyleSettingsModal', () => {
     pressByText(tree, '背景');
 
     await act(async () => {
-      pressByText(tree, '朱阁');
+      pressByText(tree, '江山');
       await Promise.resolve();
     });
-    expect(getBackgroundStyleId()).toBe('zhuge');
+    expect(getBackgroundStyleId()).toBe('jiangshan');
 
     await act(async () => {
       pressByText(tree, '默认');

@@ -1115,7 +1115,7 @@ export default function GameScreen() {
     <Screen
       safeAreaEdges={['top', 'left', 'right']}
       backgroundImage={background.image}
-      // 深色背景图（仙山/朱阁）下黑色状态栏图标看不清，切成浅色
+      // 深色背景图（华彩红顶 / 茶室木梁）下黑色状态栏图标看不清，切成浅色
       statusBarStyle={background.tone === 'dark' ? 'light' : 'dark'}
     >
       <View style={[styles.container, hasBackground && styles.containerTransparent]} ref={containerRef}>

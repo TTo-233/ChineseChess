@@ -70,12 +70,12 @@ describe('backgroundStyleStore', () => {
     const tree = renderProbe();
 
     await act(async () => {
-      await setBackgroundStyleId('zhuge');
+      await setBackgroundStyleId('jiangshan');
     });
 
-    expect(getBackgroundStyleId()).toBe('zhuge');
-    expect(renderedId(tree)).toBe('zhuge');
-    expect(AsyncStorage.setItem).toHaveBeenCalledWith(STORAGE_KEY, 'zhuge');
+    expect(getBackgroundStyleId()).toBe('jiangshan');
+    expect(renderedId(tree)).toBe('jiangshan');
+    expect(AsyncStorage.setItem).toHaveBeenCalledWith(STORAGE_KEY, 'jiangshan');
   });
 
   it('非法 id 被忽略：既不广播也不写库', async () => {
@@ -131,10 +131,24 @@ describe('backgroundStyleStore', () => {
 
     const tree = renderProbe();
     await act(async () => {
-      await setBackgroundStyleId('shuimo');
+      await setBackgroundStyleId('jiangshan');
     });
 
-    expect(getBackgroundStyleId()).toBe('shuimo');
-    expect(renderedId(tree)).toBe('shuimo');
+    expect(getBackgroundStyleId()).toBe('jiangshan');
+    expect(renderedId(tree)).toBe('jiangshan');
+  });
+
+  it('已被下线的背景 id（如旧版本的 shuimo）读回时静默回落默认', async () => {
+    // 老用户升级后 storage 里可能还留着已删除背景的 id，
+    // 必须和白名单一样被拒绝，否则界面会停在一个已经不存在的样式上。
+    (AsyncStorage.getItem as jest.Mock).mockResolvedValue('shuimo');
+
+    const tree = renderProbe();
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(getBackgroundStyleId()).toBe('none');
+    expect(renderedId(tree)).toBe('none');
   });
 });

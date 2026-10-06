@@ -4,13 +4,17 @@
  * 钉住四件事：
  *   ① 命名合规：展示名 ≤ 4 字（用户 m02998 明确要求"重命名（4字以内）"）；
  *   ② 有图/无图与 tone 自洽：`'none'` 必须无图，其余必须有图；
- *   ③ 素材尺寸就是设计约定：四张图都必须是 **1080x2400**。
+ *   ③ 素材尺寸就是设计约定：图都必须是 **1080x2400**。
  *      这是整屏 `cover` 方案的成立前提 —— 比例偏离越多，在真机上被裁掉的画面越多；
  *      有人换图时尺寸不对会被这里拦住（而不是等到实机才发现构图被切掉一半）；
  *   ④ 查找/回落：未知 id 与空值一律回落到默认背景。
  *
  * 关于 ③：jest-expo 会把所有 `require('*.jpg')` 压成同一个 stub，
  * 所以资源身份无法在 mock 层校验，只能**直接读磁盘上的真实文件**解析 JPEG 头。
+ *
+ * ⚠️ 素材目录下的 jpg 必须与注册表一一对应：删除某个背景时，
+ * 既要从 `BACKGROUND_STYLES` 移除该项，也要删掉 jpg 本体（否则死资源会一直进包体），
+ * 并同步改这里的 `FILES` 与 id 顺序断言。
  */
 
 import * as fs from 'fs';
@@ -30,10 +34,10 @@ const EXPECTED_H = 2400;
 
 /** id -> 素材文件名（注册表里 require 的必须是这几张，改了这里会红） */
 const FILES: Record<Exclude<BackgroundStyleId, 'none'>, string> = {
-  shuimo: 'bg_shuimo.jpg',
-  xianshan: 'bg_xianshan.jpg',
-  zhuge: 'bg_zhuge.jpg',
   jiangshan: 'bg_jiangshan.jpg',
+  zhuyue: 'bg_zhuyue.jpg',
+  huacai: 'bg_huacai.jpg',
+  chashi: 'bg_chashi.jpg',
 };
 
 const ASSET_DIR = path.resolve(__dirname, '../../../assets/backgrounds');
@@ -65,10 +69,18 @@ function readJpegSize(buf: Buffer): { width: number; height: number } {
 }
 
 describe('backgroundStyles 注册表', () => {
-  it('id 唯一，且按 none → jiangshan → shuimo → xianshan → zhuge 排列', () => {
+  it('素材目录里不留死文件：jpg 与有图背景一一对应', () => {
+    const onDisk = fs
+      .readdirSync(ASSET_DIR)
+      .filter((f) => f.toLowerCase().endsWith('.jpg'))
+      .sort();
+    expect(onDisk).toEqual(Object.values(FILES).sort());
+  });
+
+  it('id 唯一，且按 none → jiangshan → zhuyue → huacai → chashi 排列', () => {
     const ids = BACKGROUND_STYLES.map((s) => s.id);
     expect(new Set(ids).size).toBe(ids.length);
-    expect(ids).toEqual(['none', 'jiangshan', 'shuimo', 'xianshan', 'zhuge']);
+    expect(ids).toEqual(['none', 'jiangshan', 'zhuyue', 'huacai', 'chashi']);
   });
 
   it('展示名不超过 4 个字，且互不相同', () => {
@@ -87,13 +99,15 @@ describe('backgroundStyles 注册表', () => {
     }
   });
 
-  it('tone 取值合法，且深色图（仙山/朱阁）被正确标为 dark', () => {
+  it('tone 取值合法，且按图片上沿明度标注（华彩红顶 / 茶室木梁为 dark）', () => {
     for (const s of BACKGROUND_STYLES) {
       expect(['light', 'dark']).toContain(s.tone);
     }
-    expect(getBackgroundStyle('xianshan').tone).toBe('dark');
-    expect(getBackgroundStyle('zhuge').tone).toBe('dark');
     expect(getBackgroundStyle('none').tone).toBe('light');
+    expect(getBackgroundStyle('jiangshan').tone).toBe('light');
+    expect(getBackgroundStyle('zhuyue').tone).toBe('light');
+    expect(getBackgroundStyle('huacai').tone).toBe('dark');
+    expect(getBackgroundStyle('chashi').tone).toBe('dark');
   });
 
   it('默认背景是纯色底（none），保证老用户升级后观感不变', () => {
