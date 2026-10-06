@@ -106,6 +106,10 @@ function New-ClientZip {
     '--exclude', 'chinese-chess-client/client/dist',
     '--exclude', 'chinese-chess-client/client/web-build',
     '--exclude', 'chinese-chess-client/client/build',
+    # 棋盘设计源图（assets/boards/_source/，约 5.8MB）只用于用
+    # `python scripts/board_assets.py build --all` 重新生成索引色 PNG，
+    # 不是运行所需，不随部署包分发。
+    '--exclude', 'chinese-chess-client/client/assets/boards/_source',
     'chinese-chess-client'
   )
   & tar @tarArgs

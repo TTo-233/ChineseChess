@@ -130,6 +130,45 @@ node chinese-chess-server/scripts/verify-rule-engine-parity.mjs --write   # 重�
 
 `--write` 覆盖 `ruleEngine.cjs` 之后，**必须重启服务端**（`dist/index.js` 是 `require` 加载它，不会热更）。
 
+## 棋盘背景图标准处理流程（固定流程，禁止手工转格式）
+
+棋盘图**一律**由脚本从设计源图生成，**不要**手工用图片工具另存、更不要直接存成 JPG。
+
+```bash
+# 在 chinese-chess-client/client 下
+python scripts/board_assets.py build --all          # 批量：assets/boards/_source/ -> assets/boards/
+python scripts/board_assets.py build --src raw.png --style huali --blacktop   # 单张
+node   scripts/verify-board-assets.mjs               # 校验资源结构（已接入 pnpm -w validate）
+```
+
+| 环节 | 约定 |
+| --- | --- |
+| 设计源图 | 放 `client/assets/boards/_source/`，命名 `<style>_<blacktop\|redtop>.png`（24 位 RGBA，**带透明边**） |
+| 产物 | `client/assets/boards/board_<style>_<blacktop\|redtop>.png`，**索引色 PNG（colour type 3）+ tRNS** |
+| 尺寸 | 必须与 `utils/chess/boardStyles.ts` 登记的 `imgWidth/imgHeight` 一致，换尺寸要同步改那里 |
+| 引用 | `boardStyles.ts` 的 `require()` 路径；新增/改名资源要同步改这里 |
+| 入包 | `_source/` 由 `pack.ps1`/`pack.sh` 排除，不随部署包分发 |
+
+### 为什么必须走这个流程（都是实际踩过的坑）
+
+- **绝不能存 JPG**：棋盘四周有一圈透明边（棋盘要浮在 App 背景上，`classic` 棋盘本身就是
+  带透明的 RGBA PNG）。JPG 没有 alpha 通道，透明边会被压成实色，线上就会出现**一圈黑边**。
+  本项目已经因此翻车过一次：把 RGBA 源图 `convert("RGB")` 存成 JPG，`convert` 会把全透明像素
+  压成**纯黑**，棋盘四周立刻出现黑晕。
+- **为什么是索引色 PNG**：24 位无损 PNG 实测 5.8MB，索引色 815KB（**-86%**），肉眼无差别。
+- **为什么必须 FASTOCTREE**：这是防黑晕的核心。量化时若只在**不透明像素**上聚类再对每簇
+  alpha 取平均，全透明像素会被并进 `alpha≈215` 的簇，透明边以 84% 不透明度渲染——**又变回黑晕**；
+  直接对 RGB 做 Floyd–Steinberg 抖动同样会把透明像素分到 `alpha≈255` 的簇。
+  `FASTOCTREE` 在 **R,G,B,A 四维**聚类，alpha 参与距离计算，全透明像素**结构上不可能**
+  与可见像素共用调色板项。
+- **为什么不抖动**：试过 numpy 版 Floyd–Steinberg，渐变断层虽消失，但木纹上出现明显斑驳噪点，
+  花梨木 PSNR 从 34dB 掉到 17dB。按实际显示尺寸看不出断层（放大裁切图上的「banding」是
+  最近邻放大的假象），故默认不抖动。
+
+`board_assets.py` 生成时会回读校验，`alpha==0` 像素误差超阈值直接**中止且不落盘**；
+`verify-board-assets.mjs` 再检查 PNG colour type / tRNS / 尺寸，已挂进 `pnpm -w validate`，
+把棋盘图存成 JPG 或丢了 alpha 都会让校验失败、阻塞出包。
+
 ## 打包规范（仓库根目录 pack.ps1 / pack.sh）
 
 ```bash

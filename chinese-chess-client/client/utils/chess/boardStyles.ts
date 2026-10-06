@@ -83,8 +83,8 @@ export const BOARD_STYLES: BoardStyle[] = [
     pieceDiameter: 92,
     scaleBaseWidth: 891,
     scaleBaseHeight: 981,
-    normalImage: require('@/assets/boards/board_huali_redtop.jpg'),
-    flippedImage: require('@/assets/boards/board_huali_blacktop.jpg'),
+    normalImage: require('@/assets/boards/board_huali_redtop.png'),
+    flippedImage: require('@/assets/boards/board_huali_blacktop.png'),
   },
   {
     id: 'xuanmo',
@@ -99,8 +99,8 @@ export const BOARD_STYLES: BoardStyle[] = [
     pieceDiameter: 92,
     scaleBaseWidth: 893,
     scaleBaseHeight: 985,
-    normalImage: require('@/assets/boards/board_xuanmo_redtop.jpg'),
-    flippedImage: require('@/assets/boards/board_xuanmo_blacktop.jpg'),
+    normalImage: require('@/assets/boards/board_xuanmo_redtop.png'),
+    flippedImage: require('@/assets/boards/board_xuanmo_blacktop.png'),
   },
 ];
 

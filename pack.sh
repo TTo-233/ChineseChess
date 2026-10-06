@@ -57,6 +57,7 @@ pack_client() {
        'chinese-chess-client/client/dist/*' \
        'chinese-chess-client/client/web-build/*' \
        'chinese-chess-client/client/build/*' \
+       'chinese-chess-client/client/assets/boards/_source/*' \
        'chinese-chess-client/.eslintcache' \
        'chinese-chess-client/client/.eslintcache' \
        'chinese-chess-client/**/.env' \
