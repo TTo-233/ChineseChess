@@ -7,7 +7,7 @@ import {
   StyleSheet,
   Animated,
   Easing,
-  Dimensions,
+  useWindowDimensions,
   BackHandler,
   AppState,
   ScrollView,
@@ -77,9 +77,9 @@ const COLORS = {
 };
 
 // 数值屏宽（与人机对战一致：底部操作栏/角标行按屏宽布局，规避部分 Android Yoga 对 stretch 的兼容问题）
-const screenWidth = Dimensions.get('window').width;
-// 窗口高度：用于把棋盘宿主实测高度封顶到视口内，打断宽屏纵向溢出的正反馈
-const windowHeight = Dimensions.get('window').height;
+// 【C-90】屏宽/屏高改用组件内的 useWindowDimensions（响应式）：原先是模块级
+// Dimensions.get('window')，只在首次加载取一次，转屏后不会更新。纵向基准改成
+// 「屏幕 50%」后，屏高直接决定棋盘中心线，屏高一旦过期，转屏后棋盘就会明显偏离中线。
 
 function sideStringToTag(side: string): boolean {
   return side === 'red' ? RED_SIDE : !RED_SIDE;
@@ -326,6 +326,8 @@ export default function LanBattleScreen() {
   // 时跳过覆盖，直到服务端追上（着法数 >= 本端）再恢复同步；超时则判定上传失败放弃保护。
   // 具体的判定与「只延迟局面块」的处理在 hooks/useBattleStateSync 内。
   const pendingSyncRef = useRef<{ historyLen: number; at: number; snapshot: GameState } | null>(null);
+  // 【C-90】响应式屏宽/屏高：转屏/分屏后立即更新，棋盘中心线与横向留白跟着重算
+  const { width: screenWidth, height: windowHeight } = useWindowDimensions();
   // 棋盘可用纵向空间实测（宽屏/纵向空间不足时限制棋盘尺寸，避免挤占底部按钮）
   const [boardAreaH, setBoardAreaH] = useState(0);
   // 与人机对战一致：棋盘与底部操作栏的间距随屏宽自适应（底栏已改为页面固定通栏，
@@ -370,7 +372,11 @@ export default function LanBattleScreen() {
     // 【C-81】下方角标行借用底栏上边距 dynamicGap 这段确实空着的间距。
     // 横向宽度只由 BOARD_H_PADDING 决定，与人机对战保持一致；
     // 借用量恰好等于封顶溢出量，因此最坏情况只是内容贴到底栏上沿，不会压到底栏。
+    // 【C-90】纵向基准改为屏幕 50%（棋盘本体居中于物理屏幕中线）：
+    // 原先按宿主区间居中会被底栏截断的上移，实测横屏 −29px / 桌面 −35px。
     belowHostSlack: dynamicGap,
+    hostTopY: boardHostY,
+    viewportHeight: windowHeight,
   });
 
   // 棋盘真实几何（相对主容器）：供绝杀特效锁定棋盘中心、把结算文字/按钮排到棋盘正下方，

@@ -4,7 +4,7 @@ import {
   Text,
   TouchableOpacity,
   StyleSheet,
-  Dimensions,
+  useWindowDimensions,
   Animated,
   Easing,
 } from 'react-native';
@@ -48,9 +48,7 @@ const COLORS = {
   blackPiece: '#2C2C2C',
 };
 
-const screenWidth = Dimensions.get('window').width;
-// 窗口高度：用于把棋盘宿主实测高度封顶到视口内，打断宽屏纵向溢出的正反馈
-const windowHeight = Dimensions.get('window').height;
+// 屏宽/屏高已改用组件内的 useWindowDimensions（响应式，见 SpectateScreen 内注释）。
 
 // 底部信息行（房间名 / 观众数 / 回合进度 / 行棋方）在棋盘宿主之外、纵向流内的占位高度。
 // 与 StyleSheet 里 infoRow height 30 + marginBottom 2 保持一致；该行与固定底栏
@@ -156,6 +154,8 @@ export default function SpectateScreen() {
   const [boardHostY, setBoardHostY] = useState(0);
   // 底部信息行实测高度（棋盘宿主之外，随内容变化）；0 = 未测得，用常量兜底
   const [infoRowH, setInfoRowH] = useState(0);
+  // 【C-90】响应式屏宽/屏高：转屏/分屏后立即更新，棋盘中心线与横向留白跟着重算
+  const { width: screenWidth, height: windowHeight } = useWindowDimensions();
   const dynamicGap = Math.max(Math.round(screenWidth * 0.03), 8);
   // 当前棋盘样式：角标行宽度需按样式几何换算棋盘本体宽度
   const boardStyle = useBoardStyle();
@@ -182,6 +182,10 @@ export default function SpectateScreen() {
     screenWidth,
     topFlowHeight: 30,
     bottomFlowHeight: 30,
+    // 【C-90】纵向基准改为屏幕 50%（棋盘本体居中于物理屏幕中线）：
+    // 原先按宿主区间居中，宿主底边被信息行 + 底栏截断 ⇒ 棋盘整体上移。
+    hostTopY: boardHostY,
+    viewportHeight: windowHeight,
   });
   const maxBoardHeight = budgetBoardHeight ?? 0;
 
@@ -669,7 +673,12 @@ export default function SpectateScreen() {
                 moveEffect={moveEffect}
               />
             ) : (
-              <View style={[styles.loadingBox, { height: Math.max(maxBoardHeight, 240) }]}>
+              <View
+                style={[
+                  styles.loadingBox,
+                  { width: Math.max(screenWidth - 48, 0), height: Math.max(maxBoardHeight, 240) },
+                ]}
+              >
                 <Text style={styles.loadingText}>正在载入棋局…</Text>
               </View>
             )}
@@ -948,8 +957,9 @@ const styles = StyleSheet.create({
     height: 10,
     borderRadius: 5,
   },
+  // 【C-90】width 不再从模块级 screenWidth 取（该常量已随响应式改造移除）：
+  // 载入占位框按当前屏宽现算，转屏后也会跟着变。
   loadingBox: {
-    width: screenWidth - 48,
     alignItems: 'center',
     justifyContent: 'center',
     backgroundColor: COLORS.card,

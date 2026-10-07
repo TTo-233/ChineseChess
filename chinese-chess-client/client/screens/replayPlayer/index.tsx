@@ -19,7 +19,7 @@ import {
   TouchableOpacity,
   StyleSheet,
   ActivityIndicator,
-  Dimensions,
+  useWindowDimensions,
 } from 'react-native';
 import Slider from '@react-native-community/slider';
 import { Screen } from '@/components/Screen';
@@ -52,11 +52,7 @@ const COLORS = {
   border: '#D7CCC8',
 };
 
-const screenWidth = Dimensions.get('window').width;
-// 窗口高度：用于把棋盘宿主实测高度封顶到视口内，打断宽屏纵向溢出的正反馈
-const windowHeight = Dimensions.get('window').height;
-// 与人机对战一致：棋盘与下方进度区之间的间距随屏宽自适应
-const dynamicGap = Math.max(Math.round(screenWidth * 0.03), 8);
+// 屏宽/屏高已改用组件内的 useWindowDimensions（响应式，见 ReplayPlayerScreen 内注释）。
 // 进度区（步数行 + 进度条）在棋盘宿主之外、纵向流内的占位高度
 // （progressRow ≈ 20 + slider 40 + 控件内间距 2）；实测值可用时以实测优先。
 // 信息行下线后，本页再无第二块附属内容，故该常量现在是 belowHostHeight 的唯一来源。
@@ -65,7 +61,14 @@ const REPLAY_CONTROLS_FLOW_HEIGHT = 58;
 // 取底栏上边距 dynamicGap 的一半：贴太紧会与棋盘边框糊在一起，
 // 但进度区是「浏览」控件，不需要底栏那样大的呼吸空间。
 // 注意 onLayout 实测的高度不含 margin，所以该间距在预算里必须显式加上（见 belowHostHeight）。
-const REPLAY_PROGRESS_GAP = Math.round(dynamicGap / 2);
+// 【C-90】改成按屏宽现算：dynamicGap 现在由组件内的 useWindowDimensions 响应式给出，
+// 模块级常量已取不到它（且转屏后本就该跟着变）。
+
+/** 进度区间距 = 底栏上边距 dynamicGap 的一半（随屏宽自适应） */
+function progressGapOf(screenWidth: number): number {
+  const dynamicGap = Math.max(Math.round(screenWidth * 0.03), 8);
+  return Math.round(dynamicGap / 2);
+}
 
 /** 由初始局面 + 着法序列预计算每一步的完整局面（steps[0]=开局，steps[N]=终局） */
 function buildSteps(replay: ReplayGame): GameState[] {
@@ -89,6 +92,12 @@ export default function ReplayPlayerScreen() {
   const params = useSafeSearchParams<{ id: string }>();
   // 安全区：Screen 已在内容之外施加，预算封顶时需据此扣减可用高度
   const insets = useSafeAreaInsets();
+  // 【C-90】响应式屏宽/屏高：转屏/分屏后立即更新，棋盘中心线与控制区宽度跟着重算
+  const { width: screenWidth, height: windowHeight } = useWindowDimensions();
+  // 与人机对战一致：棋盘与下方进度区之间的间距随屏宽自适应
+  const dynamicGap = Math.max(Math.round(screenWidth * 0.03), 8);
+  // 进度区间距（棋盘下沿 → 进度区），同口径按屏宽现算（见 progressGapOf 注释）
+  const progressGap = progressGapOf(screenWidth);
   // 当前棋盘样式：控制区宽度需按样式几何换算棋盘本体宽度（用户可在首页设置中切换样式）
   const boardStyle = useBoardStyle();
   // 整屏背景（首页「样式设置 → 背景」所选）。未选背景图时不产生任何视觉变化。
@@ -157,13 +166,17 @@ export default function ReplayPlayerScreen() {
       // 注意不含 insets.bottom —— capHostHeightToViewport 已扣过 bottomInset。
       // 注意进度区的 margin 不计入 onLayout 实测高度，间距必须在这里显式加上。
       (bottomSectionH > 0 ? bottomSectionH : REPLAY_CONTROLS_FLOW_HEIGHT) +
-        REPLAY_PROGRESS_GAP +
+        progressGap +
         BOTTOM_BAR_HEIGHT +
         dynamicGap
     ),
     screenWidth,
     topFlowHeight: 0,
     bottomFlowHeight: 0,
+    // 【C-90】纵向基准改为屏幕 50%（棋盘本体居中于物理屏幕中线）：
+    // 原先按宿主区间居中，宿主底边被进度区 + 底栏截断 ⇒ 棋盘整体上移。
+    hostTopY: boardAreaY,
+    viewportHeight: windowHeight,
   });
 
   // 控制区宽度：跟随棋盘本体宽度居中，宽屏下不再横贯整个屏幕
@@ -293,7 +306,7 @@ export default function ReplayPlayerScreen() {
         >
         {/* 进度区：步数指示 + 可拖拉进度条（步进按钮已移到底部操作栏） */}
         {!!replay && boardState && (
-          <View style={[styles.controls, controlsWidthStyle, { marginTop: REPLAY_PROGRESS_GAP }]}>
+          <View style={[styles.controls, controlsWidthStyle, { marginTop: progressGap }]}>
             {/* 步数指示 */}
             <View style={styles.progressRow}>
               <Text style={[styles.progressText, hasBackground && styles.textHalo]}>

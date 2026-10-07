@@ -90,6 +90,10 @@ export function useGameBoardLayout(options: GameBoardLayoutOptions): GameBoardLa
   // hostHeight 经视口封顶：Screen 的 flexGrow 容器会让 flex:1 宿主按内容撑开，
   // 不封顶则「宿主变大 → 棋盘变大 → 内容更高」正反馈会让宽屏页面纵向溢出
   // （详见 capHostHeightToViewport 注释）。
+  //
+  // 【C-90】纵向基准 = 屏幕 50%：传 hostTopY/viewportHeight 让棋盘本体居中于物理屏幕中线，
+  // 而不是「宿主区间」中线——宿主底边被底栏 + dynamicGap 截断，原先按宿主居中
+  // 会把棋盘整体上推（实测竖屏 −23px / 横屏 −29px / 桌面 −35px）。
   const { maxBoardHeight, paddingTop: boardPadTop } = useBoardLayoutBudget({
     hostHeight: capHostHeightToViewport(
       boardAreaH,
@@ -104,6 +108,8 @@ export function useGameBoardLayout(options: GameBoardLayoutOptions): GameBoardLa
     screenWidth,
     topFlowHeight: AI_NAME_ROW_FLOW_HEIGHT,
     bottomFlowHeight: 0,
+    hostTopY: boardHostY,
+    viewportHeight: windowHeight,
   });
 
   // 棋盘真实几何（相对主容器）：供绝杀特效锁定棋盘中心、把结算文字/按钮排到棋盘正下方

@@ -235,3 +235,192 @@ describe('棋盘横向留白：在线对局 = 人机对战（【C-81】）', () 
     expect(tiny.maxBoardHeight).toBe(DEFAULT_MIN_BOARD_HEIGHT);
   });
 });
+
+/**
+ * 【C-90】纵向基准 = 屏幕 50%：棋盘本体中心必须落在物理屏幕中线上。
+ *
+ * 旧口径（宿主内居中）把内容居中在「宿主区间」，而宿主底边是被底部操作栏
+ * + dynamicGap 从视口底部截断的 ⇒ 二者中心天然错开，棋盘被整体上推。
+ * 2026-10 实机实测偏移（CDP 量测）：竖屏 −23px、横屏 −29px、桌面 −35px。
+ *
+ * 本文件钉住的不是某个具体像素，而是三条不变式：
+ *   1. 棋盘中心 = 视口高 / 2（正中，误差 < 0.01px）；
+ *   2. 棋盘尺寸不再被「底栏有多高」影响（封顶解里 hostHeight 被消掉）；
+ *   3. 不越界：棋盘下沿 ≤ 宿主底边 + 下方流内占位（绝不压到底栏）。
+ *
+ * 下方用**与实机一致的输入**复现三档视口，偏移一旦回归会被直接算出并断言。
+ */
+
+/** 按页面真实口径算出棋盘中心的绝对 Y（宿主坐标系 → 页面坐标系） */
+function boardCenterY(
+  viewportHeight: number,
+  hostTopY: number,
+  hostHeight: number,
+  topFlowHeight: number,
+  bottomFlowHeight: number
+): number {
+  const r = computeBoardLayoutBudget(
+    {
+      hostHeight,
+      screenWidth: 393,
+      topFlowHeight,
+      bottomFlowHeight,
+      hostTopY,
+      viewportHeight,
+    },
+    classicStyle
+  );
+  const board = r.maxBoardHeight ?? 0;
+  // 棋盘顶边绝对 Y = 宿主顶 + paddingTop + 上方流内占位
+  return hostTopY + r.paddingTop + topFlowHeight + board / 2;
+}
+
+describe('棋盘纵向居中：棋盘本体中心 = 屏幕 50%（【C-90】）', () => {
+  // 人机对战的真实几何（CDP 实测 393×852）：
+  //   视口 852 / 宿主顶 0 / 宿主高 728（= 852 - 底栏 62 - dynamicGap 12 - … 封顶后）
+  //   上方 AI 角标行 30，下方流内占位 0
+  const PVE = { hostTopY: 0, topFlowHeight: NAME_ROW_FLOW_HEIGHT, bottomFlowHeight: 0 } as const;
+
+  it('竖屏 393×852：棋盘中心正好落在 426（屏幕 50%），且尺寸不被牺牲', () => {
+    const vp = 852;
+    const hostHeight = 728;
+    const r = computeBoardLayoutBudget(
+      {
+        hostHeight,
+        screenWidth: 393,
+        topFlowHeight: PVE.topFlowHeight,
+        bottomFlowHeight: PVE.bottomFlowHeight,
+        hostTopY: PVE.hostTopY,
+        viewportHeight: vp,
+      },
+      classicStyle
+    );
+    const center = boardCenterY(vp, 0, hostHeight, PVE.topFlowHeight, PVE.bottomFlowHeight);
+    expect(center).toBeCloseTo(vp / 2, 2);
+    // 纵向充裕时棋盘尺寸由**宽度**独尊，新旧口径一致 ⇒ 竖屏零代价
+    expect(r.maxBoardHeight).toBeCloseTo(426.48, 0);
+  });
+
+  it('三档视口（含横屏/桌面）棋盘中心一律等于视口高的一半', () => {
+    for (const [vp, hostHeight] of [
+      [852, 728], // 393×852 竖屏
+      [393, 269], // 852×393 横屏（宿主被底栏截断）
+      [800, 738], // 1280×800 桌面
+      [360, 240], // 窄矮屏
+    ] as const) {
+      const center = boardCenterY(
+        vp,
+        PVE.hostTopY,
+        hostHeight,
+        PVE.topFlowHeight,
+        PVE.bottomFlowHeight
+      );
+      expect(Math.abs(center - vp / 2)).toBeLessThan(0.01);
+    }
+  });
+
+  it('旧口径在同一批输入下确实偏离中线（钉住本次修复的真因）', () => {
+    // 回归钉子：不传 hostTopY/viewportHeight 即退回「宿主内居中」，
+    // 横屏下棋盘中心会落在中线之上 ~29px —— 与实机现象一致。
+    const vp = 393;
+    const hostHeight = 269;
+    const legacy = computeBoardLayoutBudget(
+      {
+        hostHeight,
+        screenWidth: 393,
+        topFlowHeight: PVE.topFlowHeight,
+        bottomFlowHeight: PVE.bottomFlowHeight,
+      },
+      classicStyle
+    );
+    const legacyCenter =
+      PVE.hostTopY + legacy.paddingTop + PVE.topFlowHeight + (legacy.maxBoardHeight ?? 0) / 2;
+    // 旧口径偏上（center < vp/2），且新口径必须严格更接近中线
+    expect(legacyCenter).toBeLessThan(vp / 2);
+    const fixed = boardCenterY(
+      vp,
+      PVE.hostTopY,
+      hostHeight,
+      PVE.topFlowHeight,
+      PVE.bottomFlowHeight
+    );
+    expect(Math.abs(fixed - vp / 2)).toBeLessThan(Math.abs(legacyCenter - vp / 2));
+  });
+
+  it('下方流内占位（在线对局的我方名称角标行）同样不得破坏居中', () => {
+    const vp = 852;
+    const hostHeight = 698;
+    const center = boardCenterY(vp, 0, hostHeight, NAME_ROW_FLOW_HEIGHT, NAME_ROW_FLOW_HEIGHT);
+    expect(center).toBeCloseTo(vp / 2, 2);
+  });
+
+  it('不越界：棋盘下沿不得越过宿主底边（绝不压到底栏）', () => {
+    // 宿主高度取 CDP 实测值：viewportH - 底栏 62 - dynamicGap(max(屏宽*3%,8))
+    // （Screen 的 flexGrow 会把 flex:1 宿主撑到内容高度，故实测≈封顶后的可用高度）
+    const cases: Array<[viewportH: number, hostH: number]> = [
+      [852, 778], // 393×852 竖屏，dynamicGap 12 → 宽度独尊，棋盘远在宿主内
+      [393, 305], // 852×393 横屏，dynamicGap 26 → 被宿主封顶，恰好顶到宿主底边
+      [800, 700], // 1280×800 桌面，dynamicGap 38 → 被宿主封顶，恰好顶到宿主底边
+    ];
+    const widthDriven =
+      ((393 - BOARD_H_PADDING) / classicStyle.scaleBaseWidth) * classicStyle.scaleBaseHeight;
+    for (const [vp, hostHeight] of cases) {
+      const r = computeBoardLayoutBudget(
+        {
+          hostHeight,
+          screenWidth: 393,
+          topFlowHeight: PVE.topFlowHeight,
+          bottomFlowHeight: PVE.bottomFlowHeight,
+          hostTopY: 0,
+          viewportHeight: vp,
+        },
+        classicStyle
+      );
+      const board = r.maxBoardHeight ?? 0;
+      // 棋盘下沿（视口坐标）：paddingTop 恒等于 centerY - board/2 - topFlow - hostTopY，
+      // 故下沿 = centerY + board/2 —— 与宿主顶边无关，这正是【C-90】的解耦结果。
+      const boardBottom = PVE.hostTopY + r.paddingTop + PVE.topFlowHeight + board;
+      expect(boardBottom).toBeLessThanOrEqual(hostHeight + 1e-6);
+      // 被宿主封顶（而非宽度）的档位，应恰好顶到宿主底边，不多占也不少占
+      if (board < widthDriven) {
+        expect(boardBottom).toBeCloseTo(hostHeight, 6);
+      }
+    }
+  });
+
+  it('宿主极矮时按既定取舍溢出：DEFAULT_MIN_BOARD_HEIGHT 优先于宿主封顶', () => {
+    // 既有行为（本文件修改前即如此）：极端矮屏下宁可让棋盘越过宿主底边，
+    // 也要保住 minBoardHeight，否则棋盘小到无法落子。此处把该取舍钉住，
+    // 避免后人误以为「新口径应当永远不越界」而把保底去掉。
+    const r = computeBoardLayoutBudget(
+      {
+        hostHeight: 120,
+        screenWidth: 393,
+        topFlowHeight: PVE.topFlowHeight,
+        bottomFlowHeight: PVE.bottomFlowHeight,
+        hostTopY: 0,
+        viewportHeight: 300,
+      },
+      classicStyle
+    );
+    expect(r.maxBoardHeight).toBe(DEFAULT_MIN_BOARD_HEIGHT);
+  });
+
+  it('宿主顶边下移（顶部有标题栏/安全区）只挪位置、不改棋盘尺寸', () => {
+    // 「以屏幕中线为中心」意味着棋盘尺寸只取决于中线两侧的流内占位，
+    // 与宿主顶边的绝对 Y 无关：同一视口下宿主顶下移 100px，棋盘高必须一模一样。
+    const vp = 852;
+    const a = computeBoardLayoutBudget(
+      { hostHeight: 628, screenWidth: 393, topFlowHeight: 30, bottomFlowHeight: 0, hostTopY: 0, viewportHeight: vp },
+      classicStyle
+    );
+    const b = computeBoardLayoutBudget(
+      { hostHeight: 528, screenWidth: 393, topFlowHeight: 30, bottomFlowHeight: 0, hostTopY: 100, viewportHeight: vp },
+      classicStyle
+    );
+    expect(b.maxBoardHeight).toBeCloseTo(a.maxBoardHeight ?? 0, 6);
+    // 但棋盘中心仍都落在中线上（paddingTop 相应减少 100）
+    expect(b.paddingTop).toBeCloseTo(a.paddingTop - 100, 6);
+  });
+});
+
