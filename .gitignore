@@ -19,5 +19,8 @@ _board_stage/
 _tmp_*.png
 _tmp_*.npy
 
+# 本机启动服务端/客户端时的分离式进程日志（.runlogs/*.log）
+.runlogs/
+
 # 系统文件
 .DS_Store

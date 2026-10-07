@@ -3,7 +3,7 @@
 #       pwsh -File pack.ps1 [client|server|all]
 # 产物: 仓库根目录 chinese-chess-{client|server}_YYYYMMDD.zip
 # 排除: node_modules、缓存（.expo/.eslintcache/coverage/.cache/.turbo/.parcel-cache）、
-#       构建产物（dist/web-build/build）、日志、编辑器目录、OS 杂项
+#       构建产物（dist/web-build/build）、日志（*.log 与 .runlogs/）、编辑器目录、OS 杂项
 # 清理: 每次打包会先删除「该端」的历史 zip（只删同前缀，client 与 server 互不影响），
 #       仓库根目录始终只保留每个端当天的这一个包，避免旧包被误当成最新包分发。
 param([ValidateSet('client', 'server', 'all')][string]$Target = 'all')
@@ -47,7 +47,10 @@ $ExcludeCommon = @(
   # 【I-24】差分闸门 verify-server-diff.cjs 会在 chinese-chess-server/.verify-old/ 下留一份
   # 1.4MB 的旧 dist 产物（--keep / 被强杀 / 中途 throw 都会留下），它不是可运行主体，
   # 混进部署包极易被误用。
-  '--exclude', '.verify-old'
+  '--exclude', '.verify-old',
+  # 本机以分离式进程启动服务端/客户端时留下的运行日志（仓库根 .runlogs/），
+  # 纯本机产物，不随部署包分发。(*.log 已排除文件，但目录本身与未来新增文件仍需这条)
+  '--exclude', '.runlogs'
 )
 
 # 删除指定端的历史打包文件（保留当天那个，由后续打包重新生成）
@@ -70,11 +73,13 @@ function Assert-NoJunk {
   $junk = & tar -tf $Zip | Where-Object {
     # 【I-12】.env / .env.local / *.env —— 排除项漏了时由这里兜底，宁可误报也不放过
     # 【I-24】.verify-old —— 差分闸门留下的旧 dist 产物
+    # .runlogs —— 本机分离式进程的运行日志
     $_ -match $junkPattern `
       -or $_ -match '\.(log|tsbuildinfo|eslintcache|DS_Store)$' `
       -or $_ -match '(^|/)\.env($|\.)' `
       -or $_ -match '\.env$' `
-      -or $_ -match '(^|/)\.verify-old(/|$)'
+      -or $_ -match '(^|/)\.verify-old(/|$)' `
+      -or $_ -match '(^|/)\.runlogs(/|$)'
   }
   if ($junk) {
     throw "「$Zip」里混入了缓存/构建产物/环境配置：`n  $($junk -join "`n  ")`n请补 --exclude 规则后重打。"

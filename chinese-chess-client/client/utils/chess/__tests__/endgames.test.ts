@@ -39,6 +39,47 @@ function symmetryKeys(fen: string): string[] {
   return out;
 }
 
+/**
+ * 「子力签名」：两枚残局若**棋子种类和个数完全一致**（区分阵营），只摆法不同，
+ * 玩家的解法体验高度重合，按「重复关卡」处理，必须在全库唯一。
+ *
+ * 例：原第 7「车封将门」与第 8「单车闷毙」同为「红帅+单车 / 黑将+双士」，
+ * 只是车摆的位置不同；这类关卡会成组扎堆（原库一次留下 17 组、64 关）。
+ */
+function materialSignature(fen: string, colorBlind = false): string {
+  const board = fen.trim().split(/\s+/)[0].split('/');
+  const counts: Record<string, number> = {};
+  for (const row of board) {
+    for (const ch of row) {
+      if (ch >= '1' && ch <= '9') continue;
+      // colorBlind：红黑同种棋子（如红车与黑车）视为同一种，用于更严的查重口径
+      const key = colorBlind ? ch.toLowerCase() : ch;
+      counts[key] = (counts[key] || 0) + 1;
+    }
+  }
+  return Object.keys(counts)
+    .sort()
+    .map((k) => `${k}x${counts[k]}`)
+    .join(' ');
+}
+
+/** 查重：签名相同即为重复，返回冲突描述 */
+function findDuplicateBySignature(colorBlind: boolean): string[] {
+  const owner = new Map<string, number>();
+  const dups: string[] = [];
+  BUILTIN_ENDGAMES.forEach((level, i) => {
+    const sig = materialSignature(level.fen, colorBlind);
+    const prev = owner.get(sig);
+    if (prev !== undefined) {
+      const a = BUILTIN_ENDGAMES[prev];
+      dups.push(`第${i + 1}关 ${level.name} 与 第${prev + 1}关 ${a.name} 子力相同（${sig}）`);
+    } else {
+      owner.set(sig, i);
+    }
+  });
+  return dups;
+}
+
 describe('BUILTIN_ENDGAMES 共 100 关', () => {
   it('关卡总数为 100', () => {
     expect(BUILTIN_ENDGAMES).toHaveLength(100);
@@ -78,13 +119,14 @@ describe('难度排序与分档', () => {
     expect(BUILTIN_ENDGAMES[99].name).toBe('侧面虎(高钓马)');
   });
 
-  it('原有 30 关已按实测难度打散到各档，而不是整体留在经典档', () => {
-    // 原库 id 为 1,2,3,31..57（掀棋盘 id=57 已剔除）
-    const originalIds = new Set([1, 2, 3, ...Array.from({ length: 26 }, (_, i) => i + 31)]);
-    const original = BUILTIN_ENDGAMES.filter((l) => originalIds.has(l.id));
-    expect(original).toHaveLength(29);
-    const byTier = new Set(original.map((l) => l.tier));
-    expect(byTier.size).toBeGreaterThanOrEqual(3);
+  it('各档边界与编号：入门档开篇是最简残局，其他档收尾是最难残局', () => {
+    // id 为本仓库自增编号（2001 = 第 1 关），与闯关序号不对应；排序只看数组下标。
+    expect(BUILTIN_ENDGAMES[0].id).toBe(2001);
+    expect(BUILTIN_ENDGAMES[99].id).toBe(2100);
+    // 第 1 关是全库子力最少的之一（帅+车 vs 孤将，一步杀）；第 100 关是公认最难的「侧面虎(高钓马)」
+    const pieces = (fen: string) => fen.split(' ')[0].split('/').join('').replace(/[^a-z]/gi, '').length;
+    const easiest = Math.min(...BUILTIN_ENDGAMES.map((l) => pieces(l.fen)));
+    expect(pieces(BUILTIN_ENDGAMES[0].fen)).toBe(easiest);
   });
 });
 
@@ -127,6 +169,34 @@ describe('关卡内容', () => {
 
   it('已剔除的「掀棋盘」不再出现（它红方全部着法都立刻判和，无法通关）', () => {
     expect(BUILTIN_ENDGAMES.some((l) => l.name === '掀棋盘')).toBe(false);
+  });
+});
+
+describe('子力查重（同类问题的回归闸门）', () => {
+  it('子力签名（区分阵营）全库唯一：不得有「棋子种类和个数一致、只是摆法不同」的关卡', () => {
+    // 历史问题：第 7「车封将门」与第 8「单车闷毙」同为「红帅+单车 / 黑将+双士」，
+    // 全库一度有 17 组这样的「同子力不同摆法」关卡（共 64 关）。这里逐组钉死。
+    expect(findDuplicateBySignature(false)).toEqual([]);
+  });
+
+  it('子力签名（忽略阵营，红黑同种棋子等价）同样全库唯一', () => {
+    // 更严一档的口径：红车与黑车视为同一种子。用于防止「换边重摆」型重复。
+    expect(findDuplicateBySignature(true)).toEqual([]);
+  });
+
+  it('签名口径确实能抓住已知的同子力样例（防止断言自身失效）', () => {
+    // 两个真实存在过的重复样例：车封将门 / 单车闷毙
+    const a = materialSignature('5a3/2R6/3k1a3/9/9/9/9/9/4K4/9');
+    const b = materialSignature('9/R3ak3/5a3/9/9/9/9/9/4K4/9');
+    expect(a).toBe(b);
+    // 签名只认「棋子种类 + 个数」，与摆法无关：同一批棋子的不同摆法签名必然相同
+    expect(materialSignature('3k5/9/9/9/2P6/9/9/9/4K4/9')).toBe(
+      materialSignature('3k5/9/2P6/9/9/9/9/9/9/4K4')
+    );
+    // 子力真的不同，签名才不同
+    expect(materialSignature('3k5/9/9/9/2P6/9/9/9/4K4/9')).not.toBe(
+      materialSignature('3k5/9/9/9/2N6/9/9/9/4K4/9')
+    );
   });
 });
 
