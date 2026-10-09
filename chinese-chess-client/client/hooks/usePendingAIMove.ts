@@ -24,6 +24,7 @@ import { useCallback, useEffect, useRef } from 'react';
 
 import type { GameState } from '@/utils/chess/GameEngine';
 import { abortSearch } from '@/utils/chess/AIEngine';
+import { cancelOfflineSearch, cancelOfflinePonder } from '@/utils/chess/offlineAiAdapter';
 
 /** 一次异步操作的代数票据 */
 export interface MoveTicket {
@@ -82,6 +83,11 @@ export function usePendingAIMove(options: UsePendingAIMoveOptions): PendingAIMov
     // 只靠代数校验不够：旧搜索会继续占着主线程跑到自然结束（最多一整个预算），
     // 与重置后新排定的 AI 思考抢算力——「悔棋/翻转/重开后越打越卡就是这么来的」。
     abortSearch();
+    // 本地皮卡鱼同样要中止：它是**同步阻塞**引擎线程的，不 stop 就会一直占着
+    // 唯一的引擎实例，导致重置后的新搜索排队等待（表现为"悔棋后要等好几秒才动"）。
+    // 先取消后台预计算，再中止进行中的搜索（顺序：预计算会自己 abort signal）。
+    cancelOfflinePonder();
+    cancelOfflineSearch();
     discardRef.current?.();
   }, []);
 

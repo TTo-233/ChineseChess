@@ -16,8 +16,10 @@
     "verify:server-parity": "node ../chinese-chess-server/build.js --check",
     "verify:rule-engine-parity": "node ../chinese-chess-server/scripts/verify-rule-engine-parity.mjs",
     "verify:board-assets": "node client/scripts/verify-board-assets.mjs",
+    "verify:pikafish-engine-assets": "node client/scripts/verify-pikafish-engine-assets.mjs",
+    "gen:pikafish-host": "node client/scripts/gen-pikafish-host.mjs",
     "test:client": "pnpm --filter expo-app run test:ci",
-    "validate": "pnpm run lint && pnpm run verify:server-parity && pnpm run verify:rule-engine-parity && pnpm run verify:board-assets && pnpm run test:client"
+    "validate": "pnpm run lint && pnpm run verify:server-parity && pnpm run verify:rule-engine-parity && pnpm run verify:board-assets && pnpm run verify:pikafish-engine-assets && pnpm run test:client"
   },
   "dependencies": {},
   "devDependencies": {},

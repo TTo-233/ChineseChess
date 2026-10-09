@@ -58,6 +58,9 @@ pack_client() {
        'chinese-chess-client/client/web-build/*' \
        'chinese-chess-client/client/build/*' \
        'chinese-chess-client/client/assets/boards/_source/*' \
+       # 皮卡鱼引擎**源**二进制只用于重新生成 assets/engines/* 与逐字节溯源校验；
+       # 产物已随包分发，运行不需要源目录，故不重复携带这 4.8MB。
+       'chinese-chess-client/client/engine-source/*' \
        'chinese-chess-client/.eslintcache' \
        'chinese-chess-client/client/.eslintcache' \
        'chinese-chess-client/**/.env' \
@@ -70,6 +73,7 @@ pack_client() {
 # 服务端 dist/index.js 现在由 chinese-chess-server/src/ 经 `node build.js` 生成（esbuild）。
 #    打包前强制校验「已提交的 dist 与重新构建的结果一致」：dist 被手工改过或被旧产物
 #    覆盖过就直接阻塞出包；6 条加固都在 src/ 里，不会再出现「补丁丢了却照样出包」。
+#    （2026-10 去 AI 化：原 ai\ 引擎与开局库已随服务端 AI 一并移除。）
 # 【I-11】此校验必须在任何 rm 之前执行：以前它排在 remove_old_zip 之后，校验失败时
 #    「上一版可用包已删、新包未出」——该端零包且无法回滚。
 assert_server_dist_fresh() {

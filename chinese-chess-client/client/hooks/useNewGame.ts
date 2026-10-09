@@ -19,9 +19,12 @@ import {
 import {
   clearHistoryHash,
   computeZobristHash,
-  precomputeHint,
   recordHistoryHash,
 } from '@/utils/chess/AIEngine';
+import {
+  notifyOfflineNewGame,
+  precomputeOfflineHint,
+} from '@/utils/chess/offlineAiAdapter';
 
 /** 残局闯关每局限用次数：提示 3 次、悔棋 10 次（评级只看提示，悔棋不计入） */
 export const ENDGAME_HINT_LIMIT = 3;
@@ -174,6 +177,11 @@ export function useNewGame(args: UseNewGameArgs): UseNewGameApi {
       setEndgameUndoLeft(ENDGAME_UNDO_LIMIT);
       if (remountBoard) setBoardKey?.(k => k + 1);
 
+      // 新一局：通知本地引擎清空跨局状态与排队中的预计算
+      // （引擎每次搜索都会带 ucinewgame，这里额外清队列，避免旧局面的
+      //   pending 请求在新局面上"复活"）
+      notifyOfflineNewGame();
+
       // 开局：AI 先走则排定一次 AI 走子，玩家先走则后台预计算提示
       const fenSaysAiFirst =
         aiFirstByFen && typeof endgameFen === 'string'
@@ -182,7 +190,7 @@ export function useNewGame(args: UseNewGameArgs): UseNewGameApi {
       if (fenSaysAiFirst) {
         scheduleAIMove(newState);
       } else {
-        precomputeHint(newState);
+        precomputeOfflineHint(newState);
       }
       return newState;
     },

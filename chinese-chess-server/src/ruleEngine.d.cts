@@ -14,6 +14,12 @@
  *   - 真正的类型定义在客户端源码里（`client/utils/chess/types.ts` 等）；
  *   - 服务端只做「建初始局面 + 校验 + 落子」几次调用，声明过细会在两端打包之间反复漂移。
  * 声明文件不会进入 dist/index.js，改它无需重新构建。
+ *
+ * ⚠️【2026-10 审计 P3】不要声明 ruleEngine.cjs **实际没有**的导出。
+ * 此前这里残留着 `getPikaTier` / `allPikaTiers`（皮卡鱼难度档位）——那是服务端还有 AI 时的
+ * 「两端档位同源」体系的遗留；档位 re-export 随去 AI 化从 ruleEngine.bundle.ts 删除后，
+ * 这两个符号在 ruleEngine.cjs 里已不存在，但声明还留着，于是 `tsc --noEmit` 会**放过**
+ * 对不存在导出的调用（运行时才炸 undefined）。要加导出请先确认它确实被打进了 ruleEngine.cjs。
  */
 declare const ruleEngine: {
   /** 【S-8】服务端自建开局局面：与客户端 `createInitialState` 同源（默认红先）。 */
@@ -24,6 +30,10 @@ declare const ruleEngine: {
   getValidMoves(state: any, pieceId: number): any;
   /** 服务端权威落子：返回 `{ newState, isGameOver, ... }`（含长将长捉与终局判定）。 */
   makeMove(state: any, pieceId: number, toCol: number, toRow: number): any;
+  /** 规则二禁着：判定某着法是否被禁（长将/长捉超限），并给出原因。 */
+  getMoveBanReason(state: any, pieceId: number, toCol: number, toRow: number): any;
+  /** 禁着原因 → 用户可读文案（与客户端弹的提示同源同字）。 */
+  banReasonNotice(reason: any): string;
 };
 
 export = ruleEngine;

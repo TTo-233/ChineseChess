@@ -2,11 +2,8 @@ import express from "express";
 import cors from "cors";
 import http from "http";
 import lanGameRouter from './routes/lanGame';
-import aiRouter from './routes/ai';
 import { attachBattleWebSocket } from './routes/battleWs';
 import { failBody } from './routes/actionOutcome';
-import { warmupPikafish } from './services/pikafish';
-import { loadOpeningBook } from './services/openingBook';
 
 const app = express();
 const port = process.env.PORT || 9091;
@@ -23,11 +20,8 @@ app.get('/api/v1/health', (_req, res) => {
   res.status(200).json({ status: 'ok' });
 });
 
-// LAN Game routes
+// LAN Game routes（在线对局：建房/加入/走子/悔棋/认输/观战/重连等）
 app.use('/api/v1/lan', lanGameRouter);
-
-// AI routes（在线皮卡鱼）
-app.use('/api/v1/ai', aiRouter);
 
 // API 404 兜底：未知 /api 路径统一返回 JSON（避免落到 Express 默认 HTML 404）
 app.use('/api', (req, res) => {
@@ -71,8 +65,4 @@ process.on('uncaughtException', (err) => {
 
 server.listen(port, () => {
   console.log(`Server listening at http://localhost:${port}/`);
-  // 加载开局库（同步，失败不影响主流程）
-  loadOpeningBook();
-  // 预热皮卡鱼引擎（后台异步，不阻塞启动）
-  warmupPikafish();
 });

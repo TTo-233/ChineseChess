@@ -39,9 +39,17 @@ function issueSessionToken(): string {
 
 // 常量时间比较，避免 token 被逐字节爆破（时序侧信道）。
 // 先比长度是因为 timingSafeEqual 要求两个 Buffer 等长，长度本身不是秘密。
+// ⚠️ 长度必须按「UTF-8 字节数」比而不是 JS 字符数：服务端签发的 token 是纯 ASCII，
+//    两者数值相同，但攻击者可以送「字符数相同、全多字节」的 token（如 43 个汉字），
+//    此时字符数相等而字节数不等（129 ≠ 43），timingSafeEqual 会抛 RangeError：
+//    HTTP 侧变 500，WS 握手侧异常逃逸到 uncaughtException，连接既不 welcome 也不
+//    error，且未注册进连接池 → 永不被空闲清理（未鉴权即可无限堆积连接）。
+//    字节长度在编码前即可用 Buffer.byteLength 求得，不引入额外解码成本。
 function tokenEquals(a: unknown, b: unknown): boolean {
   if (typeof a !== 'string' || typeof b !== 'string') return false;
-  if (a.length !== b.length || a.length === 0) return false;
+  const aLen = Buffer.byteLength(a, 'utf8');
+  const bLen = Buffer.byteLength(b, 'utf8');
+  if (aLen !== bLen || aLen === 0) return false;
   return crypto.timingSafeEqual(Buffer.from(a, 'utf8'), Buffer.from(b, 'utf8'));
 }
 
@@ -1144,7 +1152,12 @@ router.post('/rooms/:roomId/join', (req, res) => {
   });
 });
 
-// 获取房间详情（含玩家选边/准备状态与执棋公示信息；不返回密码明文）
+// 获取房间详情（含玩家选边/准备状态与执棋公示信息）
+// 【2026-10 审计 P1】password 仅对「持 token 的房主」可见：
+// 改造前无差别返回明文，任何匿名者 GET 一下就能拿到密码并直接入房，
+// 密码房的加入校验形同虚设。客户端唯一消费方是房主在设置弹窗里查看/修改
+// （lanBattle/index.tsx setRoomPassword(room.password)），房主持自己的 token
+// 轮询本接口即可继续拿到；非房主（含对手/观战者/匿名）只看 hasPassword。
 router.get('/rooms/:roomId', (req, res) => {
   const { roomId } = req.params;
   const room = rooms.get(roomId);
@@ -1153,13 +1166,17 @@ router.get('/rooms/:roomId', (req, res) => {
     return res.status(404).json(failBody(404, '房间不存在'));
   }
 
+  // 房主判定与 PATCH /settings 同口径：token 定位成员，再比 hostId
+  const actor = findPlayerByToken(room, readSessionToken(req));
+  const isHost = !!actor && actor.id === room.hostId;
+
   res.json({
     room: {
       id: room.id,
       name: room.name,
       hasPassword: !!room.password,
-      // 房间密码：休闲房间场景，返回明文便于房主在设置弹窗中查看/修改
-      password: room.password,
+      // 房间密码：仅房主可见（设置弹窗回显用）；其余请求方为 null
+      password: isHost ? room.password : null,
       hostId: room.hostId,
       phase: room.phase,
       settings: room.settings,

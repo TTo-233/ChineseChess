@@ -264,6 +264,11 @@ export default function LanBattleScreen() {
   // 后续由房间轮询/改名接口回填覆盖为最新值
   const [roomName, setRoomName] = useState(params.roomName || '');
   const [roomPassword, setRoomPassword] = useState<string | null>(null);
+  // 【2026-10 审计 P1】是否见过密码明文（即本端确为房主且 token 已恢复）：
+  // 服务端收紧后 password 只对持 token 的房主可见，此前把它当作"可能拿不到的正常值"，
+  // 但保存设置时若把"没拿到"误当"想清空"，会把真实密码静默清掉。此 ref 区分两者：
+  // false = 从未拿到（跳过 password 字段，不修改）；true = 见过（正常直传，允许清空）。
+  const passwordSeenRef = useRef(false);
   const [hostId, setHostId] = useState('');
   const [sidePickVisible, setSidePickVisible] = useState(false); // 选边弹窗
   const [readyCountdown, setReadyCountdown] = useState<number | null>(null); // 双方就绪后的 3 秒倒数（null=未倒数）
@@ -685,7 +690,14 @@ export default function LanBattleScreen() {
         try {
           const base = await getOnlineServerUrl();
           // 携带 playerId：服务端据此刷新成员活跃时间，等待清扫器不会把 HTTP 轮询活跃但 WS 异常的成员误踢
-          const response = await fetch(`${base}/api/v1/lan/rooms/${roomId}?playerId=${encodeURIComponent(playerId)}`);
+          const response = await fetch(`${base}/api/v1/lan/rooms/${roomId}?playerId=${encodeURIComponent(playerId)}`, {
+            // 【2026-10 审计 P1】服务端已收紧：房间密码仅对持 token 的房主可见。
+            // 轮询是房主在设置弹窗中回显密码的数据源（roomPassword ← room.password），
+            // 必须带上会话凭证；非房主拿到的 password 恒为 null，UI 显示"无"。
+            headers: {
+              ...(sessionTokenRef.current ? { 'x-session-token': sessionTokenRef.current } : {}),
+            },
+          });
           // 房间已被销毁（如本人无活跃连接被服务端清扫、房主离开致房间解散、断线判负后房间解散）：
           // 切终态浮层并给出返回大厅入口
           // （响应返回时可能已主动退出——在途请求与退出动作的竞态，须再次检查退出标记）
@@ -709,6 +721,8 @@ export default function LanBattleScreen() {
             }
             // 获取房间设置与名称
             setRoomName(room.name || '');
+            // 服务端收紧后非房主/无 token 一律为 null；拿到非 null 才标记"见过"
+            if (room.password != null) passwordSeenRef.current = true;
             setRoomPassword(room.password ?? null);
             setHostId(room.hostId || '');
             // 服务端存储的 turnTimeLimit 单位为秒，直接使用
@@ -1402,7 +1416,11 @@ export default function LanBattleScreen() {
         body: JSON.stringify({
           playerId,
           name: trimmedName,
-          password: editPassword.trim(),
+          // 【2026-10 审计 P1】password 仅对持 token 的房主可见。若弹窗打开时本端还从未
+          // 拿到过密码明文（token 异步恢复完成前的轮询竞态），editPassword 为空串只是
+          // "还不知道密码"，不是"想清除密码"——此时不传 password（undefined=不修改），
+          // 避免把真实密码误清空。见过密码之后（含真实清空操作）恢复直传语义。
+          ...(passwordSeenRef.current === true || roomPassword === null ? { password: editPassword.trim() } : {}),
           turnTimeSeconds: editTurn,
           baseTimeSeconds: editBaseTime,
           // 加秒与读秒互斥（UI 已保证二选一，此处再兜底）；不限时时均不生效
@@ -1415,6 +1433,8 @@ export default function LanBattleScreen() {
       if (data.success && data.room) {
         // 立即应用新值（轮询也会同步）
         setRoomName(data.room.name || trimmedName);
+        // 保存走房主 token，响应里带密码明文；同上维护 passwordSeenRef
+        if (data.room.password != null) passwordSeenRef.current = true;
         setRoomPassword(data.room.password ?? null);
         setTurnTimeLimit(data.room.settings?.turnTimeLimit || 0);
         setBaseTimeSeconds(data.room.settings?.baseTimeSeconds || 0);

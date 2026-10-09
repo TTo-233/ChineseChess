@@ -17,6 +17,7 @@
  *   node scripts/verify-server-diff.cjs --old <path> --new <path>
  *   node scripts/verify-server-diff.cjs --old-port 9091 --new-port 9092
  *   node scripts/verify-server-diff.cjs --phase rest|ws|ai|all     # 只跑某个阶段
+ *                                       ^ ai 阶段现为「断言 /api/v1/ai 已移除（404）」
  *   node scripts/verify-server-diff.cjs --keep          # 保留 .verify-old/ 运行目录
  *
  * 退出码：0 = 无「非已知」差异；1 = 有差异 / 环境错误。
@@ -27,7 +28,8 @@
  *   `chinese-chess-server/` 的**直接子目录**：旧产物复制到 `.verify-old/index.js`，
  *   新产物即 `dist/index.js`。两个子进程都以 `cwd = chinese-chess-server` 启动，
  *   用 `PORT` 环境变量区分端口。
- * - pikafish 引擎池就绪会打印日志，但**不必等**：只轮询 `/api/v1/health`。
+ * - 服务端不再有任何 AI/引擎池（2026-10 去 AI 化），启动后无需等待引擎预热，
+ *   只轮询 `/api/v1/health` 即可判定可用。
  * - 任何退出路径（含异常、SIGINT）都会杀掉两个子进程。
  *
  * ---------------------------------------------------------------------------
@@ -115,6 +117,7 @@ const assert = require('assert');
 const crypto = require('crypto');
 const fs = require('fs');
 const http = require('http');
+const net = require('net');
 const os = require('os');
 const path = require('path');
 const { spawn } = require('child_process');
@@ -249,6 +252,12 @@ function normalizeOnce(value, ctx) {
 
 function normalizeString(s, ctx, key) {
   let out = s;
+  // 会话凭证（sessionToken）：**每次签发都是随机的**，两个进程（old/new）必然不同，
+  // 且它从来不是"行为差异"的载体 —— 真正的行为信号是"有没有这个字段"，
+  // 而不是"值是多少"。故只把**值**换成占位符，保留字段的存在/缺失语义。
+  // 【2026-10 审计补充】此前归一化完全没有处理它，导致 `--self`（同一文件当 old 与 new）
+  // 也必然报出一串 sessionToken 差异而 exit 1：自检模式永远红，harness 事实上不可用。
+  if (key === 'sessionToken' || key === 'token') return '<TOKEN>';
   // 时间字段名上的字符串形式时间 → <TS>
   if (key && (TS_KEY_RE.test(key) || NUM_TIME_KEY.has(key))) {
     if (/^\d{4}-\d{2}-\d{2}T/.test(out) || /^\d{10,}$/.test(out)) return '<TS>';
@@ -551,6 +560,77 @@ function spawnServer(label, file, port) {
   return child;
 }
 
+/**
+ * 启动前检查端口是否空闲。
+ *
+ * ============================================================================
+ * 【2026-10 审计补充 · 为什么必须有这一步】
+ *
+ * 缺陷（实测踩到）：若目标端口**已被别的进程占用**（最典型的情形是本项目自己的
+ * dev server —— `scripts/start.mjs` / `pnpm dev:server` 的默认端口恰好也是 9091，
+ * 而本脚本 `--old-port` 的默认值同样是 9091），那么被 spawn 的子进程会因
+ * `listen EADDRINUSE` **立刻退出**，而 waitHealthy 的第一个循环里
+ * "检查子进程是否已退出" 与 "请求 /api/v1/health" 之间存在竞态：
+ * 只要那个**外来服务**先答出 200，waitHealthy 就直接返回，于是：
+ *   · 本脚本以为两个实例都就绪；
+ *   · 后续所有 old 侧请求其实都打到那个外来服务上；
+ *   · 两侧响应自然完全一致 → 打印「全部通过」并以 exit 0 结束。
+ * 即：**差分闸门静默失效，还报成功**。实测确认过（把 old 换成故意篡改的产物，
+ * 仍被判「干净」；停掉占用 9091 的 dev server 后同一篡改立刻被抓出
+ * `body.error` 差异并 exit 1）。
+ *
+ * 因此启动前必须 fail-closed：端口被占用就直接报错，并给出可操作的指引，
+ * 绝不允许"用一个不是我们子进程的服务"来充当差分的一侧。
+ */
+async function assertPortFree(port, label) {
+  await new Promise((resolve, reject) => {
+    const socket = net.createConnection({ host: '127.0.0.1', port });
+    let settled = false;
+    const done = (fn, arg) => {
+      if (settled) return;
+      settled = true;
+      try {
+        socket.destroy();
+      } catch {
+        /* 忽略 */
+      }
+      fn(arg);
+    };
+    socket.once('connect', () =>
+      done(
+        reject,
+        new Error(
+          `【${label} 端口 ${port} 已被占用】拒绝继续（否则差分结果不可信）。\n` +
+            `  通常是本项目的 dev server 占着默认端口 9091（start.mjs / pnpm dev:server）。\n` +
+            `  处理：停掉它，或显式换端口，例如\n` +
+            `    node scripts/verify-server-diff.cjs --old-port 9401 --new-port 9402`
+        )
+      )
+    );
+    socket.once('error', () => done(resolve));
+    socket.setTimeout(1500, () => done(resolve));
+  });
+}
+
+/**
+ * 就绪后复查"这一侧的响应确实来自我们自己的子进程"。
+ *
+ * 关闭 assertPortFree 之后仍残存的竞态：外来服务若在本脚本 spawn 之后才起来
+ * （或端口在检查与 spawn 之间被抢占），waitHealthy 仍可能被外来服务骗过。
+ * 因此就绪之后必须再看一眼子进程是否还活着 —— 子进程已退出却"健康"，
+ * 只可能是在跟别的进程说话。
+ */
+function assertChildAlive(child) {
+  if (child.__exit && child.__exit.code !== null) {
+    throw new Error(
+      `【${child.__label} 子进程在就绪后已退出（code=${child.__exit.code} sig=${child.__exit.sig}）】\n` +
+        `  这说明刚才那个"健康"响应并非来自本脚本的子进程（端口被他人占用或被抢占），\n` +
+        `  差分的一方来源不明，结果不可信，拒绝继续。\n` +
+        `--- ${child.__label} 输出 ---\n${(child.__log || []).join('').slice(-2000)}`
+    );
+  }
+}
+
 async function waitHealthy(port, child, timeoutMs = 30000) {
   const deadline = Date.now() + timeoutMs;
   let lastErr = null;
@@ -771,6 +851,7 @@ function commitDiffs(stepLabel, phaseLabel, diffs, step) {
  * 用途：差分定位 —— 差异发生在服务端内部时，只有服务端日志能说明原因。
  */
 function dumpServerLogs(maxLines = 16) {
+  // 保留 pikafish/引擎 关键字：若将来有人把 AI 路由挂回来，这些日志应被识别出来排查
   const NOISE = /\[lan\]\s*(tick|GC|sweep|heal)|pikafish|Pikafish|引擎|Engine/i;
   for (const child of children) {
     if (!child || !child.__log) continue;
@@ -1509,35 +1590,23 @@ async function phaseRest(lockstep, ruleEngine) {
   });
 }
 
+/**
+ * 【场景 7】AI 端点 —— 已随服务端去 AI 化移除（2026-10）
+ *
+ * 原场景比对 `/api/v1/ai/{move,stats}`（在线皮卡鱼）。AI 能力与引擎池已从服务端
+ * 删除，这些路径不再存在；但「它们确实不存在」本身值得守护：若有人误把 aiRouter
+ * 挂回来、或路由表出现意外回归，这里应当立刻发现。
+ *
+ * 实现上改为断言这些端点返回 404（命中 /api 兜底），既能验证"确实已移除"，
+ * 又不会因为旧布尔逻辑产生假绿灯。
+ */
 async function phaseAi(lockstep) {
-  console.log('\n[场景 7] AI 端点');
+  console.log('\n[场景 7] AI 端点（已移除，断言 404）');
   const base = '/api/v1/ai';
-  const startFen = 'rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w';
-  await lockstep.same('GET /api/v1/ai/stats', { method: 'GET', path: `${base}/stats`, phaseLabel: 'ai-stats' });
-  await lockstep.same('POST /api/v1/ai/move（缺 fen → 400）', {
-    method: 'POST', path: `${base}/move`, body: { difficulty: 'hint' }, phaseLabel: 'ai-move',
+  await lockstep.same('GET /api/v1/ai/stats（已移除 → 404）', { method: 'GET', path: `${base}/stats`, phaseLabel: 'ai-stats' });
+  await lockstep.same('POST /api/v1/ai/move（已移除 → 404）', {
+    method: 'POST', path: `${base}/move`, body: { fen: 'x w', difficulty: 'hint' }, phaseLabel: 'ai-removed',
   });
-  await lockstep.same('POST /api/v1/ai/move（板面行宽非法 → 400）', {
-    method: 'POST', path: `${base}/move`, body: { fen: 'bad/fen/here w', difficulty: 'hint' }, phaseLabel: 'ai-move',
-  });
-  await lockstep.same('POST /api/v1/ai/move（非法难度 → 400）', {
-    method: 'POST', path: `${base}/move`, body: { fen: startFen, difficulty: 'nope' }, phaseLabel: 'ai-move',
-  });
-  // hint 难度是确定性搜索（multiPV=1, depth=8），同一局面结果恒定；开销小、可离线复现
-  await lockstep.same('POST /api/v1/ai/move（hint，确定性引擎输出）', {
-    method: 'POST',
-    path: `${base}/move`,
-    body: { fen: startFen, difficulty: 'hint', clientId: 'diff-ai-1' },
-    timeoutMs: 60000,
-    phaseLabel: 'ai-move',
-  }, { phaseLabel: 'ai-move' });
-  await lockstep.same('POST /api/v1/ai/move（easy，随机挑子 → 仅比形状）', {
-    method: 'POST',
-    path: `${base}/move`,
-    body: { fen: startFen, difficulty: 'easy', clientId: 'diff-ai-2' },
-    timeoutMs: 60000,
-    phaseLabel: 'ai-move',
-  }, { phaseLabel: 'ai-move' });
 }
 
 async function phaseWs(lockstep, ruleEngine) {
@@ -1706,12 +1775,19 @@ async function main() {
   }
 
   console.log(`\n启动子进程（cwd=${SERVER_DIR}）…`);
+  // 先确认端口空闲：端口被占用会导致子进程 EADDRINUSE 秒退，而 waitHealthy 可能
+  // 被外来服务的健康响应骗过 → 差分静默失效却报「全部通过」（见 assertPortFree 说明）
+  await assertPortFree(opts.oldPort, 'old');
+  await assertPortFree(opts.newPort, 'new');
   const childOld = spawnServer('old', modes.old.file, modes.old.port);
   const childNew = spawnServer('new', modes.new.file, modes.new.port);
   modes.old.child = childOld;
   modes.new.child = childNew;
   await waitHealthy(modes.old.port, childOld);
   await waitHealthy(modes.new.port, childNew);
+  // 就绪后复查子进程仍存活：确认刚才的"健康"确实来自我们自己的进程
+  assertChildAlive(childOld);
+  assertChildAlive(childNew);
   console.log('  两个实例 /api/v1/health 均就绪');
 
   const lockstep = new Lockstep(modes, opts);

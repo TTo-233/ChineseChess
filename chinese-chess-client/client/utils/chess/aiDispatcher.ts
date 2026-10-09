@@ -1,515 +1,61 @@
 /**
- * 混合 AI 调度器：联网优先调用服务端皮卡鱼（在线），网络不可用/不稳定时回退本地 AI（离线）。
+ * AI 调度器：**纯本地**（本地皮卡鱼 → 旧 TS AI 兜底），不发起任何网络请求。
  *
- * 策略：
- * 1. 网络预判：通过 NetInfo 检测连接状态（短 TTL 缓存）；明确离线则直接走本地 AI。
- * 2. 在线尝试：带严格超时（ONLINE_TIMEOUT_MS，超时真 abort）；成功则采用云端走法。
- * 3. 失败分类：区分「服务端忙（429）」/「超时」/「网络故障」。
- *    - 忙 = 服务健康仅排队 → 短延迟退避重试，**不熔断**（熔断等于掐掉唯一能出棋的路径）。
- *    - 超时/网络故障 → 计入连续失败，达到阈值后熔断，期间走本地 AI。
- * 4. 熔断器：熔断期直接走本地；冷却结束先做一次轻量健康探测（GET /api/v1/health）
- *    主动恢复，而不是盲发一次完整走子请求——健康探测毫秒级返回，能立刻自愈。
- * 5. clientId 每次请求唯一：服务端用它做进程内去重且算完才释放，复用玩家 ID 会让
- *    一次超时未完成的请求挡住后续所有重试（429 busy 活锁）。
+ * ============================================================================
+ * 【2026-10 服务端去 AI 化：在线分支已整体移除】
+ *
+ * 此前这里是「混合调度」：本地皮卡鱼优先，本地不可用才回退服务端在线皮卡鱼
+ * （/api/v1/ai/move），并带一整套配套机制——NetInfo 预判、2s 超时、busy 指数退避、
+ * 熔断与半开自愈、主动重连定时器，以及给 UI 订阅的在线状态角标。
+ *
+ * 服务端 AI 已移除后，那条回退路径**只剩代价、没有收益**：
+ *   · 端点不存在 → 每步都要白跑一次注定 404 的请求，再吃一次超时；
+ *   · 连续失败打开熔断后，"重连中"角标会常驻——这正是 2026-10 用户实测反馈的
+ *     那个误导性提示的同一条路径，删掉服务端反而更容易复发；
+ *   · 棋力并不会变强（难度档位本就同源，在线唯一的独有优势只有开局库）。
+ *
+ * 因此这里删除 onlineAI / onlineMoveGuard 与全部熔断重连状态机，语义收敛为：
+ * **本地皮卡鱼 → 旧 TS AI 两层兜底，永远不联网**。
+ *
+ * 保留的只有一样东西：引擎来源标签（'pikafish-local' / 'pikafish-starting' / 'legacy'），
+ * UI 靠它如实显示"这一步是谁算的"。
+ * ============================================================================
+ * 【离线侧是"本地皮卡鱼"，不再是纯 TS 搜索】
+ *
+ * 本地实现是**本地皮卡鱼**（utils/chess/pikafish/）：Web 走 Worker+WASM，
+ * Android/iOS 走屏幕外 WebView，引擎与二进制随包内置，因此**完全断网可用**。
+ * 难度档位定义在 utils/chess/pikafishTier.ts（唯一来源，客户端自持）。
+ *
+ * 旧 TS AI（AIEngine.ts）是**最后的兜底**：仅在本地皮卡鱼不可用时启用
+ * （资产缺失/承载不支持/引擎崩溃）。详见 utils/chess/pikafish/offlineOrchestrator.ts。
  */
 
-import NetInfo from '@react-native-community/netinfo';
 import { getBestMoveAsync, getHintMoveAsync, type AIMoveResult } from './AIEngine';
 import {
-  toFenString,
-  getValidMoves,
-  isMoveKingSafe,
-  makeMove,
-  buildEngineHistory,
-  isFenBoardWidthValid,
-  type GameState,
-  type PieceState,
-} from './GameEngine';
-import { RED_SIDE, BLACK_SIDE, type AIDifficulty, type SideTag } from './types';
-import {
-  fetchOnlineMove,
-  OnlineAiBusyError,
-  OnlineAiError,
-  OnlineAiNetworkError,
-  OnlineAiTimeoutError,
-  type EngineHistory,
-  type OnlineMove,
-} from './onlineAI';
-import { isMoveBanned } from './RuleEngine';
-import { assertOnlineMoveSide, OnlineMoveGuardError } from './onlineMoveGuard';
-import { getPlayerId } from '@/utils/playerIdentity';
-import { getOnlineServerUrl } from '@/utils/serverConfig';
-
-export type AISource = 'online' | 'offline';
+  requestOfflineMove,
+  takeOfflinePonder,
+  OfflineSearchAbortedError,
+} from './offlineAiAdapter';
+import { getOfflineEngine } from './pikafish';
+import { isMoveKingSafe, type GameState } from './GameEngine';
+import type { AIDifficulty } from './types';
 
 export interface HybridMoveResult extends AIMoveResult {
-  source: AISource;
+  /**
+   * 走法来源引擎：
+   *   · 'pikafish-local'=**客户端本地皮卡鱼**、'pikafish-starting'=引擎仍在启动
+   *     （这一步暂由兜底 AI 算出，会自动升级）、'legacy'=旧 TS AI 兜底
+   * 带 engine 是为了区分"真引擎"与"兜底"——两者棋力差一个量级，
+   * UI 必须能让用户看出当前用的是哪一档（否则升级后毫无感知）。
+   */
+  engine?: string;
   depth?: number;
   timeMs?: number;
-  /** 在线走法来源引擎：'book'=开局库（depth 恒为 0）；'pikafish'=皮卡鱼搜索；离线无此字段 */
-  engine?: string;
 }
+
 
 /**
- * 在线 AI 可用性状态（供 UI 展示"重连中"等提示）。
- * - 'online'：最近一次在线请求成功，可放心直连
- * - 'probing'：曾失败但已不在熔断期，正在/即将重新探测
- * - 'circuit'：熔断中（连续超时/网络故障），暂走本地 AI
- * - 'invalid_move'：服务端在线可达、走法也返回了，但被本地合法性/规则守卫拒收。
- *   网络与服务都是好的，只是这一着的用法有异常——必须显式暴露，否则会退化成
- *   "看着一切正常、实际全程本地 AI"且毫无提示的死角。
- */
-export type OnlineAiStatus = 'online' | 'probing' | 'circuit' | 'invalid_move';
-
-/** 缓存的客户端标识前缀（持久化玩家 ID），仅用于让不同请求的 clientId 相互可区分 */
-let cachedPlayerId: string | null = null;
-let requestSeq = 0;
-
-/**
- * 生成**每次请求唯一**的 clientId。
- *
- * 服务端 inflightClients 是进程内 Set，同一 clientId 同时只允许一个在飞；
- * 槽位要等引擎算完（`finally` 里 await 之后）才释放。客户端超时会 abort 但不会让
- * 服务端立刻算完，所以若复用固定 clientId：超时 → 冷却 → 重试 恰好撞上自己上一次的
- * 槽位 → 429 busy → 再次熔断，形成无法自愈的活锁（表现为"一直用本地AI、似乎没有重连"）。
- */
-function makeRequestId(): string {
-  requestSeq += 1;
-  const base = cachedPlayerId || 'anon';
-  return `${base}#${Date.now().toString(36)}${requestSeq.toString(36)}`;
-}
-
-/** 异步取玩家 ID，仅作 clientId 前缀；失败不阻断在线调用（退化为 anon 前缀） */
-async function ensurePlayerIdPrefix(): Promise<void> {
-  if (cachedPlayerId) return;
-  try {
-    cachedPlayerId = await getPlayerId();
-  } catch {
-    cachedPlayerId = 'anon';
-  }
-}
-
-/** 在线 AI 单步超时（毫秒）。超时即回退本地，避免对局停滞。
- *
- * 由 6000 下调到 2000：线上实测皮卡鱼 hard 的 p50 为 523ms、max 550ms，6 路并发最慢
- * 819ms，2s 仍有 2~3 倍余量；而 6s 的代价是弱网下每一步都干等 6 秒才落子，
- * 用户体验上是"卡死"。2s 让弱网快速回落，交互不再长时间空转。 */
-const ONLINE_TIMEOUT_MS = 2000;
-/** 连续失败多少次后触发熔断（仅统计超时/网络故障，服务端忙不计入）。 */
-const FAILURE_THRESHOLD = 2;
-/** 熔断冷却时长（毫秒）：期间直接走本地，冷却后半开重试在线。 */
-const CIRCUIT_COOLDOWN_MS = 30000;
-/** 服务端返回 busy 时的退避重试间隔基数（毫秒）与最大重试次数：服务健康，不该熔断。
- *  指数退避 700 / 1400 / 2800ms（BUSY_MAX_RETRY=3，即最多 4 次尝试）。 */
-const BUSY_RETRY_DELAY_MS = 700;
-const BUSY_MAX_RETRY = 3;
-/** 冷却后半开健康探测的超时（毫秒）：只打 /api/v1/health，毫秒级即可判定。 */
-const PROBE_TIMEOUT_MS = 3000;
-/** NetInfo 状态缓存时长（毫秒）：避免每步都做一次系统网络查询。 */
-const NETINFO_TTL_MS = 3000;
-/** 对局历史长度上限：服务端 moves 上限 512 且 startFen ≤200 字符，超长请求会被 400 静默丢弃。 */
-const MAX_HISTORY_MOVES = 500;
-/** 服务端 busy 退避重试期间为 true，供 UI 显示"服务端繁忙，重试中"。 */
-let busyRetrying = false;
-
-function setBusyRetrying(value: boolean): void {
-  if (busyRetrying === value) return;
-  busyRetrying = value;
-  notifyStatusChange();
-}
-
-let consecutiveFailures = 0;
-let circuitOpenUntil = 0;
-let everSucceeded = false;
-let probeInFlight: Promise<boolean> | null = null;
-
-/** 最近一次「在线走法被本地守卫拒收」的原因；null 表示当前没有该异常。 */
-let lastInvalidMoveReason: string | null = null;
-/** 长对局提示（moveHistory 超过上限时给出），供 UI 展示"建议求和或重开"。 */
-let longGameNotice: string | null = null;
-/** 状态变更订阅者：让 UI 在熔断/恢复/拒收时无需等待下一次走子即可刷新角标。 */
-type StatusListener = (status: OnlineAiStatus) => void;
-const statusListeners = new Set<StatusListener>();
-/** 主动重连定时器句柄（熔断后自愈用）；非浏览器环境下为普通计时器。 */
-let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-
-let netInfoCache: { at: number; state: { isConnected: boolean | null; isInternetReachable: boolean | null } | null } | null = null;
-
-/** 读取网络状态（短 TTL 缓存）。检测本身异常时返回 null 表示"未知，仍尝试在线"。 */
-async function readNetInfo() {
-  const now = Date.now();
-  if (netInfoCache && now - netInfoCache.at < NETINFO_TTL_MS) return netInfoCache.state;
-  try {
-    const state = await NetInfo.fetch();
-    const next = { isConnected: state.isConnected, isInternetReachable: state.isInternetReachable };
-    netInfoCache = { at: now, state: next };
-    return next;
-  } catch {
-    // 检测失败：不缓存（下次重试），并按"未知"处理
-    netInfoCache = { at: now, state: null };
-    return null;
-  }
-}
-
-/** 轻量健康探测：确认服务端可达，用于熔断后半开自愈。 */
-async function probeServerHealth(): Promise<boolean> {
-  if (probeInFlight) return probeInFlight;
-  probeInFlight = (async () => {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), PROBE_TIMEOUT_MS);
-    try {
-      const base = await getOnlineServerUrl();
-      const resp = await fetch(`${base}/api/v1/health`, { signal: controller.signal });
-      if (!resp.ok) return false;
-      const data = await resp.json();
-      return data?.status === 'ok';
-    } catch {
-      return false;
-    } finally {
-      clearTimeout(timer);
-    }
-  })().finally(() => {
-    probeInFlight = null;
-  });
-  return probeInFlight;
-}
-
-/**
- * 判断本次是否允许尝试在线 AI。
- * 熔断期直接走本地；冷却结束先做一次健康探测，探测通过才放行真正的走子请求。
- */
-async function isOnlineAllowed(): Promise<boolean> {
-  const now = Date.now();
-  if (now < circuitOpenUntil) {
-    return false;
-  }
-  // 半开：曾熔断且冷却刚结束 → 主动探测恢复
-  if (everSucceeded === false && consecutiveFailures > 0) {
-    const healthy = await probeServerHealth();
-    if (!healthy) {
-      // 探测未通过则继续熔断（不要每次走子都白等一次探测）
-      circuitOpenUntil = now + CIRCUIT_COOLDOWN_MS;
-      return false;
-    }
-    recordOnlineSuccess();
-  }
-  const state = await readNetInfo();
-  // 明确未连接/不可达 → 不尝试在线；null（未判定/检测失败）时仍尝试，由超时兜底
-  if (state) {
-    if (state.isConnected === false) return false;
-    if (state.isInternetReachable === false) return false;
-  }
-  return true;
-}
-
-function recordOnlineFailure(): void {
-  consecutiveFailures += 1;
-  if (consecutiveFailures >= FAILURE_THRESHOLD) {
-    circuitOpenUntil = Date.now() + CIRCUIT_COOLDOWN_MS;
-    consecutiveFailures = 0;
-    scheduleReconnect();
-  }
-  notifyStatusChange();
-}
-
-function recordOnlineSuccess(): void {
-  consecutiveFailures = 0;
-  everSucceeded = true;
-  // 在线恢复正常，若曾熔断则立即解除
-  circuitOpenUntil = 0;
-  lastInvalidMoveReason = null;
-  cancelReconnect();
-  notifyStatusChange();
-}
-
-/**
- * 主动重连：熔断后**不要干等**下一次走子才去探测。
- *
- * 原实现只在 isOnlineAllowed() 里做半开探测，而 isOnlineAllowed 仅由走子/提示触发；
- * 玩家若在冷却期内结束对局或长时间不走子，界面就会一直停在"重连中"，看上去像
- * "无法重连"。这里在熔断瞬间排一个定时任务：冷却结束+1s 后主动打一次
- * /api/v1/health，探通就立即解除熔断并通知 UI，探不通就顺延一个冷却周期再试。
- */
-function scheduleReconnect(): void {
-  if (reconnectTimer) clearTimeout(reconnectTimer);
-  reconnectTimer = setTimeout(async () => {
-    reconnectTimer = null;
-    // 期间已恢复正常（例如玩家又走了一步且成功了）则无需再探
-    if (Date.now() < circuitOpenUntil) {
-      // 冷却尚未真正结束（例如中途又失败重新计时）→ 顺延
-      scheduleReconnect();
-      return;
-    }
-    const healthy = await probeServerHealth();
-    if (healthy) {
-      circuitOpenUntil = 0;
-      consecutiveFailures = 0;
-      everSucceeded = true;
-    } else {
-      // 服务仍不可达：重新进入一个冷却窗口，并继续排下一次探测
-      circuitOpenUntil = Date.now() + CIRCUIT_COOLDOWN_MS;
-      scheduleReconnect();
-    }
-    notifyStatusChange();
-  }, CIRCUIT_COOLDOWN_MS + 1000);
-}
-
-function cancelReconnect(): void {
-  if (reconnectTimer) {
-    clearTimeout(reconnectTimer);
-    reconnectTimer = null;
-  }
-}
-
-/** 状态变化广播：让 UI 的角标在熔断/恢复/拒收发生时立刻刷新，而不是等下一次走子。 */
-function notifyStatusChange(): void {
-  const status = getOnlineAiStatus();
-  for (const listener of statusListeners) {
-    try {
-      listener(status);
-    } catch (err) {
-      console.warn('[aiDispatcher] 状态订阅回调异常:', err);
-    }
-  }
-}
-
-/**
- * 订阅在线 AI 状态变化（返回取消订阅函数）。
- * 页面用它即时刷新角标，解决"重连中/在线走法异常"提示滞后到下一次走子才出现的问题。
- */
-export function subscribeOnlineAiStatus(listener: StatusListener): () => void {
-  statusListeners.add(listener);
-  return () => {
-    statusListeners.delete(listener);
-  };
-}
-
-/** 最近一次「在线走法被本地守卫拒收」的原因（无异常时返回 null），供 UI 展示。 */
-export function getOnlineAiInvalidReason(): string | null {
-  return lastInvalidMoveReason;
-}
-
-/** 对局过长提示（null 表示未超限），供 UI 展示"建议求和或重开"。 */
-export function getOnlineAiLongGameNotice(): string | null {
-  return longGameNotice;
-}
-
-/**
- * 引擎返回了可响应但走法不可用（坐标/规则校验失败）。
- * 归为引擎侧逻辑错误：重试无意义，但**不计入熔断**（网络与服务都是好的）。
- */
-class OnlineAiInvalidMoveError extends OnlineAiError {
-  /** 拒收的具体原因，直接进 lastInvalidMoveReason 供 UI 展示。 */
-  readonly reason: string;
-  constructor(reason: string) {
-    super(reason);
-    this.reason = reason;
-  }
-}
-
-/**
- * 入口守卫（归属方/回合/起点活子校验）。
- *
- * 实现放在无原生依赖的 onlineMoveGuard.ts（便于单测），这里只做一次错误类型折叠：
- * 守卫抛 OnlineMoveGuardError，而 runHybrid 是按 OnlineAiInvalidMoveError 分类的
- * （命中分支会记 lastInvalidMoveReason 并在 UI 暴露，且不计入熔断）。
- */
-function resolveOnlineMoveSource(
-  state: GameState,
-  move: { uci: string; fromCol: number; fromRow: number }
-): PieceState {
-  try {
-    return assertOnlineMoveSide(state, move);
-  } catch (err) {
-    if (err instanceof OnlineMoveGuardError) {
-      throw new OnlineAiInvalidMoveError(err.reason);
-    }
-    throw err;
-  }
-}
-
-/**
- * 调用在线 AI 一次，并把云端走法定位/校验到当前局面。
- * 成功返回可用的在线走法；失败按原因抛出，供 runHybrid 决定退避重试还是熔断。
- */
-async function requestOnlineMove(
-  state: GameState,
-  difficulty: AIDifficulty | 'hint',
-  priority: number
-): Promise<{ piece: PieceState; online: OnlineMove }> {
-  const fen = toFenString(state);
-
-  // 携带完整对局历史，使云端引擎在搜索中感知真实重复局面（长将/长捉/不变循环）。
-  // ⚠️ 守卫链（任一不过就只发 fen，宁可丢掉重复局面感知也不送出错误的局面）：
-  //  a) 行宽异常会让服务端 WASM 越界写内存并打崩 worker 池；
-  //  b) 回退不自洽时 buildEngineHistory 直接返回 null。
-  // 关键前提：服务端在 moves 非空时**完全忽略 fen**，只按 startFen+moves 重建局面，
-  // 任何一个字节不准都会让引擎在"另一个局面"里搜索并返回非法走法。
-  let history: EngineHistory | null = null;
-  if (!isFenBoardWidthValid(fen)) {
-    console.warn('[aiDispatcher] 本地 FEN 行宽异常，仅发送 fen 以免打崩服务端引擎');
-  } else {
-    history = buildEngineHistory(state);
-  }
-
-  await ensurePlayerIdPrefix();
-  // clientId 每次尝试唯一：服务端忙是"同 clientId 在飞"导致，唯一化后基本不会命中；
-  // 仍命中时重试也必然是新槽位，不会再被自己挡住。
-  const online = await fetchOnlineMove(
-    fen,
-    difficulty,
-    ONLINE_TIMEOUT_MS,
-    priority,
-    makeRequestId(),
-    history ?? undefined
-  );
-  // 归属方/回合 + 起点活子校验（见 onlineMoveGuard：服务端可能返回对方的着法）
-  const piece = resolveOnlineMoveSource(state, online);
-  if (!isOnlineMoveLegal(state, piece, online.toCol, online.toRow)) {
-    throw new OnlineAiInvalidMoveError(
-      `走法 ${online.uci} 在当前局面不合法（源 ${piece.id}，落点 (${online.toCol},${online.toRow})）`
-    );
-  }
-  if (!isOnlineMoveKingSafe(state, piece.id, online.toCol, online.toRow)) {
-    throw new OnlineAiInvalidMoveError(
-      `走法 ${online.uci} 会让己方将/帅继续被攻击（送将），已丢弃并回退本地 AI`
-    );
-  }
-  if (!isOnlineMoveRuleSafe(state, piece.id, online.toCol, online.toRow)) {
-    throw new OnlineAiInvalidMoveError(`走法 ${online.uci} 触发禁着或长将长捉判负规则`);
-  }
-  return { piece, online };
-}
-
-/**
- * 执行一次「在线优先，失败回退本地」调用。
- * busy 走退避重试；超时/网络故障计入熔断；任何失败都立即回退本地 AI，保证对局不卡。
- */
-async function runHybrid(
-  state: GameState,
-  difficulty: AIDifficulty | 'hint',
-  priority: number,
-  offlineFallback: () => Promise<AIMoveResult | null>
-): Promise<HybridMoveResult | null> {
-  // 长对局保护：服务端 moves 上限 512（chinese-chess-server/src/routes/ai.ts:115 的
-  // `rawMoves.length <= 512` 与 :118 的 UCI_RE 逐条校验），再长服务端会 400。
-  // 超过上限直接只走本地 AI，并把提示交给 UI（建议求和或重开），
-  // 避免每步都白跑一次注定失败的在线请求 + 每步都闪一次"在线走法被拒"。
-  if (state.moveHistory.length > MAX_HISTORY_MOVES) {
-    const notice = `本局已走 ${state.moveHistory.length} 步，超过 ${MAX_HISTORY_MOVES} 步上限，已切回本地AI`;
-    if (longGameNotice !== notice) {
-      longGameNotice = notice;
-      notifyStatusChange();
-    }
-    const offline = await offlineFallback();
-    return offline ? { ...offline, source: 'offline' } : null;
-  }
-  // 新一局（回到限步以内）时清掉长对局提示：它是进程级状态，不能跨对局残留
-  if (longGameNotice !== null) {
-    longGameNotice = null;
-    notifyStatusChange();
-  }
-
-  if (await isOnlineAllowed()) {
-    let error: unknown = null;
-    for (let attempt = 0; attempt <= BUSY_MAX_RETRY; attempt++) {
-      try {
-        const { piece, online } = await requestOnlineMove(state, difficulty, priority);
-        const accepted: AIMoveResult = {
-          pieceId: piece.id,
-          fromCol: online.fromCol,
-          fromRow: online.fromRow,
-          toCol: online.toCol,
-          toRow: online.toRow,
-          score: 0,
-        };
-        // 出口断言（第二道）：requestOnlineMove 内部已挡送将，这里再确认一次，
-        // 保证"交到界面的走法"一定是安全的——即便将来有人改守卫顺序也不会漏。
-        if (!rejectMoverUnsafe(state, accepted)) {
-          throw new OnlineAiInvalidMoveError(
-            `走法 ${online.uci} 会让己方将/帅继续被攻击（送将）`
-          );
-        }
-        recordOnlineSuccess();
-        return {
-          ...accepted,
-          source: 'online',
-          depth: online.depth,
-          timeMs: online.timeMs,
-          engine: online.engine,
-        };
-      } catch (err) {
-        error = err;
-        // 服务端忙：服务健康，仅排队 → 指数退避后重试，不熔断。
-        // 总等待约 700+1400+2800=4.9s，是"宁可多等几拍也要拿到在线走法"的取舍：
-        // 服务端 busy 说明此刻正被别人占用，通常一两拍就空出来了。
-        if (err instanceof OnlineAiBusyError && attempt < BUSY_MAX_RETRY) {
-          setBusyRetrying(true);
-          await new Promise((r) => setTimeout(r, BUSY_RETRY_DELAY_MS * 2 ** attempt));
-          continue;
-        }
-        break;
-      }
-    }
-    setBusyRetrying(false);
-    // 失败分类：仅「超时」与「网络故障」计入熔断；
-    // 服务端忙（服务健康仅排队）与引擎逻辑错误都不熔断，否则会掐掉唯一能出棋的路径
-    if (error instanceof OnlineAiTimeoutError || error instanceof OnlineAiNetworkError) {
-      recordOnlineFailure();
-    } else if (error instanceof OnlineAiInvalidMoveError) {
-      // 网络与服务都健康，但走法被本地守卫拒收 —— 记下原因并在 UI 暴露，
-      // 否则就是"状态一切正常、实际全程本地 AI"且无任何提示的死角
-      lastInvalidMoveReason = error.reason;
-      console.warn('[aiDispatcher] 在线走法未通过本地校验，回退本地 AI:', error.reason);
-      notifyStatusChange();
-    } else if (error instanceof OnlineAiError) {
-      console.warn('[aiDispatcher] 在线 AI 失败但不熔断:', (error as Error).name, (error as Error).message);
-    }
-  }
-  // 回退：本地离线 AI。同样过出口断言——本地搜索本就不会产送将着法（逐层
-  // isSideInCheck 过滤），这里只在"未来改动破坏了那个前提"时兜住，宁可返回 null
-  // （界面提示无可用着法）也不把非法着法落进盘面。
-  const offline = rejectMoverUnsafe(state, await offlineFallback());
-  if (!offline) return null;
-  return { ...offline, source: 'offline' };
-}
-
-/**
- * 校验云端走法在当前局面下合法：
- * 1. 起点棋子必须**存在、存活、且属于当前走棋方**（防止 FEN 不同步或服务端在错误
- *    局面上搜索时，把对方棋子/空格当成己方着法）；
- * 2. 落点必须在该棋子的走法形状内（getValidMoves 只判形状，**不做王安全过滤**）；
- * 3. 该着法不得送将（走后己方将/帅仍被攻击）。
- *
- * ⚠️ 第 2 条用 getValidMoves（只判棋子自身走法，见 GameEngine getSelectableMoves 的
- * 注释），所以第 3 条必须单独判——第 2、3 条合起来才是完整的"合法着法"口径。
- * 任一不满足即视为在线失败，回退本地，杜绝非法落子破坏局面。
- */
-function isOnlineMoveLegal(state: GameState, piece: PieceState, toCol: number, toRow: number): boolean {
-  const pieceIsMover = state.sideTag === RED_SIDE ? piece.id >= 16 : piece.id < 16;
-  if (!pieceIsMover) return false;
-  return !!getValidMoves(state, piece.id)[toCol]?.[toRow];
-}
-
-/**
- * 走法是否不送将（走后己方将/帅不再被攻击，含将帅照面）。
- *
- * 为什么在线走法必须再过这一关（2026-09 实测）：
- * 服务端 Pikafish 是标准象棋引擎，其合法着法生成**不含吃将**——当对方将/帅已处于
- * 可被直接吃掉的位置时，它不会去吃，而是照常走别的着法（实测 5/5 局面如此）。
- * 更靠近线一点：客户端把含送将着法的历史发给服务端后，皮卡鱼会**拒绝重放**该步，
- * 于是服务端在「送将之前」的局面（轮到对方）上搜索，并把**对方的着法**当作己方
- * 着法返回（实测：请求红方着法，返回的却是 (4,4)->(4,5) 这种黑方起点的着法）。
- * 那种着法有时恰好也能通过 getValidMoves（起点上真有己方活子、落点也符合棋子走法），
- * 于是被当作"在线走法"直接采纳，落出一个引擎根本没打算给的着法。
- * 因此这里用 isMoveKingSafe 再筛一道，不满足就回退本地 AI。
- */
-function isOnlineMoveKingSafe(state: GameState, pieceId: number, toCol: number, toRow: number): boolean {
-  return isMoveKingSafe(state, pieceId, toCol, toRow);
-}
-
-/**
- * 统一出口过滤：任何来源（在线/本地）的着法在交给界面落子前，都必须确认它不会送将。
+ * 统一出口过滤：着法在交给界面落子前，必须确认它不会送将。
  *
  * 本地 AI 与本地提示的搜索本就逐层用 isSideInCheck 过滤（见 AIEngine），正常不会
  * 产出送将着法；这里仍做一道出口断言，因为送将的后果不是"下得差一点"，而是
@@ -524,82 +70,138 @@ function rejectMoverUnsafe(state: GameState, move: AIMoveResult | null): AIMoveR
 }
 
 /**
- * 规则守卫：模拟应用云端走法，若该着法使走子方因「长将/长捉」被判负，则视为不可用。
+ * 离线执行：优先本地皮卡鱼，失败再退到旧 TS AI。
  *
- * 正常情况下服务端引擎携带对局历史搜索，已会主动规避此类违规着法；此守卫是兜底防线，
- * 覆盖开局库命中（开局库不感知历史）等极端场景，避免 AI 走出立即判负的着法。
- * 走子方因重复局面被判和（不变作和）或获胜（对方违规）属于正常结果，不予拦截。
- * 长将长捉超限期间（规则二）超限着法同样被 AI 择优剔除：这类着法已被客户端 handleMove
- * 与服务端 lanGame.ts 禁住，AI 若走进去不是「陷入僵局」而是直接被规则拒绝。云端开局库不感知超限状态。
+ * 为什么要**两层**：本地皮卡鱼需要加载 6MB 引擎 + 实例化 WASM（冷启动有耗时），
+ * 且在极少数环境（资产缺失、CSP 拦 Worker、WebView 起不来）根本不可用。
+ * 若直接依赖它，一次失败就会让对局卡在「AI 回合」——玩家点不动棋子、也没有下一步。
+ * 旧 TS AI 永远可用（纯 JS，无外部资产），因此它必须留在最后一层。
  *
- * @returns true=走法可用；false=走子方会因此着法被判负或触发超限僵局，应回退本地
+ * 取消（AbortError / OfflineSearchAbortedError）**不**降级：
+ * 那意味着"用户悔棋/重开/离场了"，此时应静默丢弃，而不是让兜底 AI 白算一步。
  */
-function isOnlineMoveRuleSafe(state: GameState, pieceId: number, toCol: number, toRow: number): boolean {
-  // 超限着法剔除（走子方为超限方且该着法在超限列表内）——择着偏好，非落子限制
-  if (isMoveBanned(state, pieceId, toCol, toRow)) return false;
-  const moverSide: SideTag = state.sideTag;
+async function runOffline(
+  state: GameState,
+  tier: AIDifficulty | 'hint',
+  purpose: 'move' | 'hint'
+): Promise<{ move: AIMoveResult; engine: string; depth: number; timeMs: number } | null> {
+  const startedAt = Date.now();
   try {
-    const sim = makeMove(state, pieceId, toCol, toRow);
-    if (!sim.isGameOver) return true;
-    const reason = sim.gameOverReason;
-    if (reason !== 'changjiang' && reason !== 'changzhuo') return true;
-    const moverLost =
-      (moverSide === RED_SIDE && sim.newState.gameStatus === 'black_win') ||
-      (moverSide === BLACK_SIDE && sim.newState.gameStatus === 'red_win');
-    return !moverLost;
+    const outcome = await requestOfflineMove(state, tier, purpose);
+    // requestOfflineMove 已过三重守卫；这里再确认一次送将（与在线路径同构的出口断言）
+    if (!rejectMoverUnsafe(state, outcome)) return null;
+    return {
+      move: outcome,
+      // 引擎标签由「编排器对**这一步**盖的章」决定（outcome.engine），
+      // 而不是事后查全局状态（2026-10 审计 P1 竞态修复）：
+      // 事后查状态在"引擎恰好在兜底搜索期间启动完成"时，会把 TS 兜底算出的着法
+      // 标成"皮卡鱼（绿灯）"。getStatus() 现在只用来区分兜底的两种**性质**——
+      // 引擎还在启动/重试（会自动升级）vs 已判永久不可用（本局一直兜底）。
+      engine: resolveOfflineEngineLabel(outcome.engine),
+      depth: outcome.depth,
+      timeMs: outcome.timeMs || Date.now() - startedAt,
+    };
+  } catch (err) {
+    if (err instanceof OfflineSearchAbortedError || isAbortLike(err)) {
+      // 取消：调用方应丢弃，不产生任何着法
+      return null;
+    }
+    console.warn('[aiDispatcher] 本地皮卡鱼未给出可用着法，回退兜底 TS AI:', describeError(err));
+  }
+
+  // 兜底：旧 TS AI（提示走 hard 预算；产品难度各档有自身预算）
+  const fallbackTier = tier === 'hint' ? 'hard' : tier;
+  const fallback = tier === 'hint' ? await getHintMoveAsync(state) : await getBestMoveAsync(state, fallbackTier);
+  if (!fallback) return null;
+  const safe = rejectMoverUnsafe(state, fallback);
+  if (!safe) return null;
+  return { move: safe, engine: 'legacy', depth: 0, timeMs: Date.now() - startedAt };
+}
+
+function isAbortLike(err: unknown): boolean {
+  return err instanceof Error && err.name === 'AbortError';
+}
+
+/**
+ * 把「这一步由谁算出」＋「引擎当前状态」翻译成 UI 标签。
+ *
+ * 输入 `servedBy` 是编排器为**本次搜索**盖的章（'pikafish' | 'legacy'），
+ * 是"谁算的"的唯一权威来源；`getStatus()` 只用来在**兜底**情形下区分性质。
+ *
+ * · 'pikafish-local'    —— 这一步确实由本地皮卡鱼算出（绿灯）
+ * · 'pikafish-starting' —— 这一步是兜底，且引擎仍在启动/冷却重试（会自动升级）
+ * · 'legacy'            —— 这一步是兜底，且引擎已判永久不可用（本局一直兜底）
+ *
+ * 为什么不能只查 getStatus()（2026-10 审计 P1 竞态）：
+ * 兜底 TS 搜索可能持续 0.5~2.5s，期间引擎可能刚好启动完成，于是搜索**结束后**
+ * 查到的状态是 'pikafish'，而这一步实际是 TS 算的 —— 界面就会给兜底着法点绿灯、
+ * 显示"皮卡鱼（难度）"，虚报棋力来源一个量级。按盖章判定则不受时序影响。
+ */
+function resolveOfflineEngineLabel(
+  servedBy?: 'pikafish' | 'legacy'
+): 'pikafish-local' | 'pikafish-starting' | 'legacy' {
+  // 这一步由真引擎算出：与当前状态无关，恒为"皮卡鱼已就绪"
+  if (servedBy !== 'legacy') return 'pikafish-local';
+  // 兜底：用状态区分"会自动升级"与"已永久降级"
+  try {
+    const s = getOfflineEngine().getStatus().source;
+    return s === 'pikafish' || s === 'starting' ? 'pikafish-starting' : 'legacy';
   } catch {
-    // 模拟异常时保守放行（合法性已由 isOnlineMoveLegal 校验）
-    return true;
+    return 'legacy';
   }
 }
 
+function describeError(err: unknown): string {
+  return err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+}
+
 /**
- * 获取混合 AI 的最佳走法。
- * 联网且在线 AI 可用 → 返回云端走法（source='online'）；
- * 否则回退本地 AI（source='offline'）。
+ * 获取 AI 的最佳走法（纯本地，永不联网）。
+ *
+ * 2026-10 服务端去 AI 化后，原先的 `getHybridBestMove`（混合：本地优先 + 在线兜底）
+ * 与 `getHybridBestMoveLocal`（残局专用、显式纯本地）**语义已完全相同** ——
+ * 两者都只会走本地皮卡鱼 → 旧 TS AI。因此这里合并为一个入口，
+ * 避免调用方再按"要不要联网"做无意义的区分。
+ *
+ * 返回的 `engine` 标明这一步究竟是谁算的：
+ * 'pikafish-local' / 'pikafish-starting' / 'legacy'。
  */
-export async function getHybridBestMove(
+export async function getBestMoveOffline(
   state: GameState,
   difficulty: AIDifficulty
 ): Promise<HybridMoveResult | null> {
-  return runHybrid(state, difficulty, 0, () => getBestMoveAsync(state, difficulty));
+  const offline = await runOffline(state, difficulty, 'move');
+  if (!offline) return null;
+  return {
+    ...offline.move,
+    engine: offline.engine,
+    depth: offline.depth,
+    timeMs: offline.timeMs,
+  };
 }
 
 /**
- * 获取"提示"走法（混合调度，与 AI 走子同一套在线/离线调用逻辑）。
+ * 获取"提示"走法（纯本地，永不联网）。
  *
- * 与 AI 走法的差异：
- * - 固定最高强度且完全确定：联网走服务端皮卡鱼 hint（深度 8、纯最佳、确定性，同一局面结果恒定），
- *   离线走 getHintMoveAsync（hard 深度）；
- * - 高优先级：联网请求携带 priority=1，服务端引擎池优先调度，交互式提示更快响应；
- * - 同样具备网络预判 / 超时 / 熔断 / 离线回退能力，弱网不卡手。
+ * 固定最高强度且完全确定：走**本地皮卡鱼 hint 档**（multiPV=1、depth=8、纯最佳，
+ * 同一局面结果恒定），搜索前清置换表。
  *
- * 联网且在线可用 → 返回云端走法（source='online'）；否则回退本地提示搜索（source='offline'）。
+ * 先取后台预计算：玩家思考期间已经在算（或已算完），复用比重新搜索更快，
+ * 且完全离线也有效。预计算失败/被拒再落到现场搜索。
  */
-export async function getHybridHintMove(state: GameState): Promise<HybridMoveResult | null> {
-  return runHybrid(state, 'hint', 1, () => getHintMoveAsync(state));
-}
-
-/**
- * 供 UI 展示当前在线 AI 状态：
- * - 'circuit'：熔断中（连续超时/网络故障），正在走本地 AI，冷却结束会自动探测恢复；
- * - 'probing'：冷却已过，将先做健康探测再决定是否联网；
- * - 'invalid_move'：网络与服务都健康，但最近一次在线走法被本地守卫拒收（引擎与本地局面不同步）；
- * - 'online'：最近一次在线请求成功。
- */
-export function getOnlineAiStatus(): OnlineAiStatus {
-  if (Date.now() < circuitOpenUntil) return 'circuit';
-  if (lastInvalidMoveReason !== null) return 'invalid_move';
-  if (!everSucceeded && consecutiveFailures > 0) return 'probing';
-  return 'online';
-}
-
-/** 供调试/展示：当前是否处于熔断状态。 */
-export function isCircuitOpen(): boolean {
-  return Date.now() < circuitOpenUntil;
-}
-
-/** 供调试/展示：当前是否正在等待服务端 busy 退避重试。 */
-export function isOnlineAiBusyRetrying(): boolean {
-  return busyRetrying;
+export async function getHintMoveOffline(state: GameState): Promise<HybridMoveResult | null> {
+  const pondered = takeOfflinePonder(state);
+  if (pondered) {
+    const p = await pondered;
+    if (p && rejectMoverUnsafe(state, p)) {
+      // 标签用预计算结果自带的 engine（编排器在算那一步时盖的章），
+      // 而不是此刻重查状态：预计算可能在引擎降级/升级**之后**才完成，
+      // 重查状态会把"谁算的"搞错（2026-10 审计 P1）。
+      return { ...p, engine: resolveOfflineEngineLabel(p.engine) };
+    }
+    // 预计算失败/被拒 → 落到下面的现场搜索
+  }
+  const offline = await runOffline(state, 'hint', 'hint');
+  if (!offline) return null;
+  return { ...offline.move, engine: offline.engine, depth: offline.depth, timeMs: offline.timeMs };
 }

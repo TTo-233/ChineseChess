@@ -9,20 +9,24 @@
  * 为什么存在这个脚本：
  *   dist/index.js 是现网部署产物，历史上只能靠 scripts/patch-dist.mjs 往产物里手打补丁。
  *   源码复原到 src/ 之后补丁会在源码层归位、patch-dist.mjs 将退役，因此必须有一个
- *   **留在仓库里的回归脚本**，防止这 6 条加固行为在将来被改回漏洞：
+ *   **留在仓库里的回归脚本**，防止这些加固行为在将来被改回漏洞：
  *
- *   补丁一  长将长捉不拦截：超限不再拒绝落子、不再按违规次数判负（静态断言覆盖）。
- *   补丁二  畸形 FEN 行宽校验：行宽 ≠ 9 的 FEN 在进入 Pikafish WASM 之前被 400 拦下，
- *           否则 WASM 越界写内存、4 个 worker 一起崩。
+ *   补丁一  长将长捉：**已由规则二取代**（commit 73d10ff）。当前契约是「达到阈值后再走
+ *           超限着法即禁着并提示」（客户端先拦、服务端权威裁决）；仍保留的一半是
+ *           「不按违规次数判负」。见场景 E（此前误按旧语义断言，实为假绿灯，2026-10 已修正）。
  *   补丁七  会话凭证鉴权（【S-1 / §3.1】）：创建/加入房间时签发 sessionToken，
  *           之后所有写操作必须出示它。只知道 roomId + playerId 不足以冒充他人
  *           （改造前任何人都能替对方 reconnect 清零断线判负、ready 取消准备、
- *           leave 把对方踢出并直接判负）。
+ *           leave 把对方踢出并直接判负）。鉴权比较必须按 UTF-8 字节数，见场景 F。
  *   补丁八  悔棋由服务端快照回退（【S-2 / §3.2】）：不再采纳客户端上传的目标局面。
  *   补丁九  旧协议完整局面上传已下线（【S-8 / §3.8】）：POST /move 只收着法；
  *           初始局面由服务端 startPlayingRoom() 自建，客户端无从改写。
  *   补丁五  被拒绝的动作回推权威状态（由 A2/A3 的隐含前提覆盖：拒绝后客户端仍能拿到权威局面）。
  *   补丁六  房间名「最小空缺优先」：销毁房间后其编号被复用，而不是只增不减。
+ *
+ *   （原「补丁二 畸形 FEN 行宽校验」随 2026-10 服务端去 AI 化移除：该校验只存在于
+ *     /api/v1/ai/move，防畸形 FEN 打崩 Pikafish WASM；服务端已无任何接收 FEN 的接口，
+ *     守护对象消失，保留断言只会是假绿灯。）
  *
  * 断言清单（对应源码层加固）：
  *   A 新协议走子（服务端权威裁决）：合法着法 200 且 moveHistory +1；非法走法 400 且棋盘不变；
@@ -33,10 +37,12 @@
  *     上传 proposedState 也不再有影响（端点已不接受该字段）。
  *   S8 旧协议下线（补丁九）：POST /move 收到完整 gameState 或伪造 gameOver/winner 一律 400，
  *     房间不终局、棋盘未被污染。
- *   C 畸形 FEN 校验：合法 FEN 不返回 invalid_fen；行数/行宽非法的 FEN 返回 400 + invalid_fen。
  *   D 房间名最小空缺优先：连建 3 房（房间1/2/3）→ 销毁「房间1」→ 新建重新得到「房间1」，
  *     而不是「房间3」（旧实现 let n = rooms.size + 1 的结果）。D1 只是基准守卫，D3 才是判据。
- *   E 长将长捉不拦截：dist/index.js 全文不含 isMoveBanned（出现即说明拦截逻辑回到了产物里）。
+ *   E 长将长捉规则二禁着：dist 含 getMoveBanReason + banReasonNotice（禁着在位），
+ *     且不含 recordBanViolation（不按违规次数判负）。
+ *   F 鉴权 token 按字节长度比较（2026-10 审计 P0）：同字符数多字节 token 被拒为 401/403
+ *     而非 5xx；合法 token 对照放行。
  *
  *   S2b 悔棋深度自适应：轮到对方（发起方刚走完、对方未落子）时发起悔棋 → depth=1，
  *     同意后只退 1 手且回到发起方回合；轮到自己时 → depth=2，退 2 手。
@@ -63,7 +69,6 @@ require(path.join(__dirname, '..', 'dist', 'index.js'));
 const ruleEngine = require(path.join(__dirname, '..', 'ruleEngine.cjs'));
 
 const BASE = `http://127.0.0.1:${PORT}/api/v1/lan`;
-const AI_BASE = `http://127.0.0.1:${PORT}/api/v1/ai`;
 const DIST_PATH = path.join(__dirname, '..', 'dist', 'index.js');
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -84,16 +89,6 @@ async function post(p, body, token) {
 }
 async function get(p) {
   const res = await fetch(`${BASE}${p}`);
-  let json = null;
-  try { json = await res.json(); } catch { /* 非 JSON 响应 */ }
-  return { status: res.status, json };
-}
-async function postAi(body) {
-  const res = await fetch(`${AI_BASE}/move`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
   let json = null;
   try { json = await res.json(); } catch { /* 非 JSON 响应 */ }
   return { status: res.status, json };
@@ -339,6 +334,32 @@ async function scenarioSessionAuth() {
   ok('B7 房间负载不含 sessionToken', !roomStr.includes('sessionToken'),
     '房间负载中出现了 sessionToken 字段');
 
+  // B8 房间明文密码仅对房主可见（2026-10 审计 P1）
+  // 缺陷：GET /rooms/:id 无鉴权即返回 room.password 明文，任何匿名者 GET 一下就能拿到
+  // 密码并直接入房，密码房的加入校验形同虚设。现在仅「持 token 的房主」可见。
+  const pwdRoom = await post('/rooms', { playerName: 'B8-host', playerId: 'bp-8', password: '123456' });
+  assert.strictEqual(pwdRoom.status, 200, `建密码房失败: ${JSON.stringify(pwdRoom.json)}`);
+  const pwdRoomId = pwdRoom.json.roomId;
+  const hostToken = pwdRoom.json.sessionToken;
+
+  const anonView = await get(`/rooms/${pwdRoomId}`);
+  ok('B8 匿名 GET 房间详情不带明文密码（password 为 null）',
+    anonView.json?.room?.password === null || anonView.json?.room?.password === undefined,
+    `anon password=${JSON.stringify(anonView.json?.room?.password)}`);
+  ok('B8b 匿名仍能看到 hasPassword（客户端据此弹出密码输入框）',
+    anonView.json?.room?.hasPassword === true,
+    `hasPassword=${JSON.stringify(anonView.json?.room?.hasPassword)}`);
+
+  const hostView = await new Promise(resolve => {
+    fetch(`${BASE}/rooms/${pwdRoomId}`, { headers: { 'x-session-token': hostToken } })
+      .then(async r => resolve({ status: r.status, json: await r.json().catch(() => null) }))
+      .catch(() => resolve({ status: 0, json: null }));
+  });
+  ok('B8c 房主持 token 仍能看到明文密码（设置弹窗回显不被破坏）',
+    hostView.json?.room?.password === '123456',
+    `host password=${JSON.stringify(hostView.json?.room?.password)}`);
+  await leaveAll(pwdRoomId, [{ id: 'bp-8', token: hostToken }]);
+
   // 收尾
   await leaveAll(roomId, [{ id: pa, token: ta }, { id: pb, token: tb }]);
 }
@@ -574,56 +595,16 @@ async function scenarioLegacyProtocolRemoved() {
 }
 
 /**
- * C. 畸形 FEN 校验（补丁二）
- * 行宽 ≠ 9 或行数 ≠ 10 的 FEN 必须在进入 Pikafish WASM 之前被 400 invalid_fen 拦下。
+ * C. 畸形 FEN 校验 —— **随服务端去 AI 化一并移除**（2026-10）
+ *
+ * 历史背景：该加固原本在 `/api/v1/ai/move` 里，作用是「行宽/行数非法的 FEN 不进入
+ * Pikafish WASM」，因为畸形 FEN 会让 WASM 越界写内存、打崩整个 worker 池。
+ *
+ * 现状：AI 路由与引擎池都已删除，且排查确认**服务端已没有任何接收 FEN 的接口**
+ * （src/ 下已无 fen 相关代码；在线对局的局面由服务端用同源规则引擎自建，
+ * 不走客户端传入的 FEN）。既然没有入口，这条校验连同其测试都不再有守护对象，
+ * 保留只会测一个不存在的路由，属于假绿灯 —— 因此整体移除，不留空壳。
  */
-async function scenarioMalformedFen() {
-  console.log('\n[C] 畸形 FEN 行宽校验（补丁二）');
-  const START_FEN = 'rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w';
-
-  // C1 合法 FEN：只断言「没有被 invalid_fen 拒绝」。
-  // 引擎/WASM 在本机缺失时可能返回 5xx（engine_error），那属于环境问题而非本补丁的失效；
-  // 因此这里既接受 200（开局库命中或引擎算完），也接受不含 invalid_fen 的 5xx。
-  const good = await postAi({ fen: START_FEN, difficulty: 'easy', clientId: `verify-fen-${Date.now()}` });
-  const goodErr = good.json?.error;
-  ok('C1 合法 FEN 未被 invalid_fen 拒绝', goodErr !== 'invalid_fen',
-    `status=${good.status} body=${JSON.stringify(good.json)}`);
-  if (good.status === 200) {
-    console.log(`    · 合法 FEN 返回 200（engine=${good.json?.engine}）`);
-  } else {
-    console.log(`    · 合法 FEN 返回 ${good.status} error=${goodErr}（引擎不可用的环境降级，仅断言未命中 invalid_fen）`);
-  }
-
-  // C1b 中局合法 FEN：从开局库里取一条非初始局面的真实记录（棋盘上已有吃子、空行宽度各异），
-  //     确认形状校验不会误伤真实局面——只靠 C1 的初始局面无法排除「校验器把中局当畸形」。
-  let midFen = null;
-  try {
-    const book = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'ai', 'openingBook.json'), 'utf8'));
-    midFen = Object.keys(book).find(k => k !== START_FEN);
-  } catch (err) {
-    console.log(`    · 跳过 C1b：读取开局库失败 ${err && err.message}`);
-  }
-  if (midFen) {
-    const mid = await postAi({ fen: midFen, difficulty: 'easy', clientId: `verify-fen-mid-${Date.now()}` });
-    ok('C1b 中局合法 FEN 未被 invalid_fen 拒绝', mid.json?.error !== 'invalid_fen',
-      `fen=${midFen} status=${mid.status} body=${JSON.stringify(mid.json)}`);
-    console.log(`    · 中局 FEN 返回 ${mid.status}（engine=${mid.json?.engine}）`);
-  }
-
-  // C2 行数非法：只有 9 行
-  const tooFewRows = START_FEN.split('/').slice(0, 9).join('/') + ' w';
-  const badRows = await postAi({ fen: tooFewRows, difficulty: 'easy' });
-  ok('C2 只有 9 行的畸形 FEN 被 400 invalid_fen 拒绝',
-    badRows.status === 400 && badRows.json?.error === 'invalid_fen',
-    `status=${badRows.status} body=${JSON.stringify(badRows.json)}`);
-
-  // C3 行宽非法：最后一行只有 8 列
-  const narrowRow = START_FEN.replace(/RNBAKABNR w$/, 'RNBAKABN w');
-  const badWidth = await postAi({ fen: narrowRow, difficulty: 'easy' });
-  ok('C3 行宽为 8 的畸形 FEN 被 400 invalid_fen 拒绝',
-    badWidth.status === 400 && badWidth.json?.error === 'invalid_fen',
-    `status=${badWidth.status} body=${JSON.stringify(badWidth.json)}`);
-}
 
 /**
  * D. 房间名最小空缺优先（补丁六）
@@ -677,18 +658,77 @@ async function scenarioRoomNameMinGap() {
 }
 
 /**
- * E. 长将长捉不拦截（补丁一）——静态断言
- * 补丁语义：删掉服务端对禁着的二次拦截与「连续 3 次判负」。
- * dist 里一旦重新出现 isMoveBanned 调用，说明拦截逻辑回到了产物里。
+ * E. 长将长捉「规则二强制变招」（补丁一 已被规则二取代）——静态断言
+ *
+ * 历史沿革（2026-10 审计修正，此前这里的断言方向是反的）：
+ *   补丁一时代的语义是「超限不拦截落子、不按违规次数判负」；
+ *   此后 commit 73d10ff「规则二强制变招」改变了它——达到阈值后再走超限着法即**禁着并提示**，
+ *   客户端 lanBattle 先拦一层（省一次往返），服务端这里是权威裁决（防绕过客户端改状态）。
+ *   于是当前**正确**的行为恰恰是「拦截存在」，而旧断言 `!src.includes('isMoveBanned')`
+ *   因为实现改用 getMoveBanReason 而**恒为真**——它对内联 loader/改名都不敏感，
+ *   既拦不住「拦截逻辑被误删」，也拦不住「判负计数被加回来」，是一条假绿灯。
+ *
+ * 现在断言当前真实契约：
+ *   · 禁着判定必须存在（getMoveBanReason + banReasonNotice，缺一即规则二失效）；
+ *   · 按违规次数判负必须不存在（recordBanViolation，补丁一仍要守的那半条）。
  */
-function scenarioNoBanInterception() {
-  console.log('\n[E] 长将长捉不拦截（补丁一，静态断言）');
+function scenarioBanRule() {
+  console.log('\n[E] 长将长捉规则二禁着（静态断言）');
   const src = fs.readFileSync(DIST_PATH, 'utf8');
-  ok('E1 dist/index.js 不含 isMoveBanned（长将长捉拦截逻辑又回到了产物里）',
-    !src.includes('isMoveBanned'),
-    '产物里重新出现了 isMoveBanned：服务端会再次拒绝客户端能走的着法（400「禁着，请变招」）');
-  ok('E2 dist/index.js 不含已废弃的违规判负计数（recordBanViolation）',
-    !src.includes('recordBanViolation'));
+  ok('E1 dist/index.js 含 getMoveBanReason（规则二禁着判定在位）',
+    src.includes('getMoveBanReason'),
+    '产物里找不到 getMoveBanReason：服务端不再拦截超限着法，绕过客户端的直接 POST 就能继续长将/长捉');
+  ok('E2 dist/index.js 含 banReasonNotice（禁着提示文案在位，两端同源）',
+    src.includes('banReasonNotice'),
+    '产物里找不到 banReasonNotice：客户端拿不到可展示的禁着原因');
+  ok('E3 dist/index.js 不含已废弃的违规判负计数（recordBanViolation）',
+    !src.includes('recordBanViolation'),
+    '产物里出现了 recordBanViolation：又按违规次数判负了');
+}
+
+/**
+ * F. 鉴权比较必须按 UTF-8 字节数（2026-10 审计 P0 回归守卫）
+ *
+ * 缺陷：tokenEquals 曾用 `a.length !== b.length`（JS 字符数）预比较，而 timingSafeEqual
+ * 要求**字节数**相等。服务端签发的 token 是纯 ASCII，两者数值相同；但攻击者可送
+ * 「字符数相同、全多字节」的 token（如 43 个汉字），此时字符数相等、字节数不等
+ * （129 ≠ 43）→ timingSafeEqual 抛 RangeError：
+ *   · HTTP 侧 → 500（服务端自身故障，客户端会引导用户重试）；
+ *   · WS 握手侧 → 异常逃逸到 uncaughtException，连接既不 welcome 也不 error，
+ *     且异常点在「注册进连接池」之前 → 空闲清理定时器永远碰不到它 → 未鉴权即可无限堆积僵尸连接。
+ * 断言：同字符数多字节 token 必须被当成「无效凭证」返回 401/403，绝不 5xx。
+ */
+async function scenarioTokenByteLength() {
+  console.log('\n[F] 鉴权 token 按字节长度比较（P0 回归守卫）');
+  const created = await post('/rooms', { playerName: 'F', playerId: 'fp-1' });
+  assert.strictEqual(created.status, 200, `建房失败: ${JSON.stringify(created.json)}`);
+  const roomId = created.json.roomId;
+  const realToken = created.json.sessionToken;
+  assert.ok(realToken, '建房响应未签发 sessionToken');
+
+  // 构造「与真实 token 字符数相同、但全为多字节字符」的恶意凭证
+  const evil = '\u6c49'.repeat(realToken.length);
+  assert.strictEqual(evil.length, realToken.length, '前置：两者字符数必须相同');
+  assert.notStrictEqual(
+    Buffer.byteLength(evil, 'utf8'),
+    Buffer.byteLength(realToken, 'utf8'),
+    '前置：两者字节数必须不同（否则构造不出该场景）'
+  );
+
+  // 投递通道必须是 JSON body 而不是请求头：HTTP 头只允许 latin-1 字节串，
+  // Node 的 fetch 会直接抛「Cannot convert argument to a ByteString」，
+  // 根本无法构造该输入。body 走 UTF-8 编码，多字节 token 原样抵达
+  // （readSessionToken 的读取顺序：header → body → query，body 是真实客户端也用到的通道），
+  // 攻击者同样可以这么发——这正是原缺陷可被未鉴权触发的原因。
+  const res = await post(`/rooms/${roomId}/ready`, { ready: true, sessionToken: evil });
+  ok('F1 同字符数多字节 token 被拒为 401/403（不是 5xx）',
+    res.status === 401 || res.status === 403,
+    `期望 401/403，实际 ${res.status}${res.status >= 500 ? ' —— timingSafeEqual 又在按字符数预比较了' : ''}`);
+
+  // 对照：真实 token 必须被放行，排除「一律拒绝」的假阳性
+  const good = await post(`/rooms/${roomId}/ready`, { ready: true, sessionToken: realToken });
+  ok('F2 对照：合法 token 正常放行（排除一律拒绝的假阳性）',
+    good.status === 200, `status=${good.status} body=${JSON.stringify(good.json)}`);
 }
 
 async function main() {
@@ -700,9 +740,9 @@ async function main() {
   await scenarioUndoSnapshot();
   await scenarioUndoDepthAdaptive();
   await scenarioLegacyProtocolRemoved();
-  await scenarioMalformedFen();
   await scenarioRoomNameMinGap();
-  scenarioNoBanInterception();
+  scenarioBanRule();
+  await scenarioTokenByteLength();
 
   console.log(`\n全部通过：${passed} 项断言`);
   process.exit(0);

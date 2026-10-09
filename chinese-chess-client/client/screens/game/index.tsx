@@ -41,10 +41,19 @@ import {
   makeMove,
   undoMove,
   getWinnerSideTag,
+  hasAnyLegalMoveForSide,
   type GameState,
 } from '@/utils/chess/GameEngine';
-import { getBestMoveAsync, precomputeHint, cancelHintPonder, recordHistoryHash, clearHistoryHash, computeZobristHash } from '@/utils/chess/AIEngine';
-import { getHybridBestMove, getHybridHintMove, getOnlineAiStatus, isOnlineAiBusyRetrying, getOnlineAiInvalidReason, getOnlineAiLongGameNotice, subscribeOnlineAiStatus, type AISource, type HybridMoveResult, type OnlineAiStatus } from '@/utils/chess/aiDispatcher';
+// 注意：AIEngine 只保留"兜底路径"与局面哈希工具的引用——
+// 人机走子、残局、提示、后台预计算现在都走本地皮卡鱼（见 offlineAiAdapter），
+// 旧 TS 搜索仅在本地引擎不可用时由 aiDispatcher 内部启用。
+import { cancelHintPonder, recordHistoryHash, clearHistoryHash, computeZobristHash } from '@/utils/chess/AIEngine';
+import {
+  precomputeOfflineHint,
+  cancelOfflinePonder,
+  cancelOfflineSearch,
+} from '@/utils/chess/offlineAiAdapter';
+import { getBestMoveOffline, getHintMoveOffline, type HybridMoveResult } from '@/utils/chess/aiDispatcher';
 import { isMoveBanned, enumerateLegalMoves, getMoveBanReason, banReasonNotice } from '@/utils/chess/RuleEngine';
 import { playSound, playJiangJunSound, unloadAllSounds, preloadSounds, preloadGameEndSounds } from '@/utils/SoundManager';
 import { RED_SIDE, BLACK_SIDE } from '@/utils/chess/types';
@@ -58,9 +67,18 @@ import {
   saveEndgameBattle,
   loadEndgameBattle,
   deleteEndgameBattle,
+  builtinLevelToLaunch,
   type EndgameLaunchParams,
 } from '@/utils/EndgameProgress';
 import { FONT } from '@/utils/typography';
+import { ENDGAME_AI_TIER } from '@/utils/chess/pikafishDifficulty';
+
+/**
+ * AI 未给出着法时允许的最大重试次数（见 triggerAIMove 的 else 分支）。
+ * 取小值：正常对局恒为 0 次；只有"兜底 AI 瞬时算不出"才可能用到，
+ * 再不行就明确提示玩家重开，绝不能无限重排把主线程烧满。
+ */
+const AI_NO_MOVE_MAX_RETRY = 2;
 
 // 主题色 - 浅色复古系
 const COLORS = {
@@ -104,8 +122,10 @@ export default function GameScreen() {
   const [currentEndgame, setCurrentEndgame] = useState<EndgameLaunchParams | null>(initialEndgame);
   const isEndgame = !!currentEndgame;
 
-  // 残局闯关固定大师难度；人机对战按传入难度
-  const difficulty: Difficulty = isEndgame ? 'hard' : ((params.difficulty || 'medium') as Difficulty);
+  // 残局闯关固定 ENDGAME_AI_TIER（本地皮卡鱼「进阶」）；人机对战按传入难度。
+  // 档位常量与 home 屏入口文案共用同一来源（utils/chess/pikafishDifficulty），
+  // 避免"改了棋力但卡片文案没跟着改"。
+  const difficulty: Difficulty = isEndgame ? ENDGAME_AI_TIER : ((params.difficulty || 'medium') as Difficulty);
   const shouldContinue = params.continueGame || false;
   const shouldContinueEndgame = initialEndgame?.continueBattle || false;
 
@@ -137,11 +157,15 @@ export default function GameScreen() {
   } | null>(null);
   const [isFlipped, setIsFlipped] = useState(initialPlayerSide === 'black');
   const [aiThinking, setAiThinking] = useState(false);
-  // AI 引擎来源指示：最近一步 AI 走棋的引擎（null=尚未走棋，默认按本地 AI 展示）
-  const [aiSource, setAiSource] = useState<AISource | null>(null);
-  // 皮卡鱼返回的搜索深度（仅在线时有值），用于角标展示"深度level"
-  const [aiDepth, setAiDepth] = useState<number | null>(null);
-  // 在线走法来源引擎：'book'=开局库（此时 depth 恒为 0，不应展示"深度0"）；'pikafish'=皮卡鱼搜索
+  /**
+   * AI 连续"未给出着法"的重试计数（见 triggerAIMove 的 else 分支）。
+   * 正常对局恒为 0：只用于兜住"兜底 AI 也罕见地算不出着法"的瞬时故障，
+   * 避免一次失败就把对局永久锁在 AI 回合；成功落子/换局时清零。
+   */
+  const aiNoMoveRetryRef = useRef(0);
+  // 最近一步由哪个引擎算出：'pikafish-local' / 'pikafish-starting' / 'legacy'（null=尚未走棋）
+  // 注：此前还有一个 aiDepth 状态（皮卡鱼搜索深度），是服务端在线皮卡鱼时代"云端皮卡鱼（深度N）"
+  // 角标的遗留；角标改用纯本地的引擎名+难度后它只写不读，已作为死状态移除。
   const [aiEngine, setAiEngine] = useState<string | null>(null);
   const [moveCount, setMoveCount] = useState(0);
   const [capturedRed, setCapturedRed] = useState(0);
@@ -165,6 +189,7 @@ export default function GameScreen() {
   useEffect(() => {
     return () => {
       cancelHintPonder();
+      cancelOfflinePonder();
     };
   }, []);
 
@@ -359,20 +384,6 @@ export default function GameScreen() {
   // 父级（useGameBoardLayout 内部）setState，进而触发整页重渲染。
   const stableSetBoardSize = useCallback(setBoardSize, [setBoardSize]);
 
-  // 在线 AI 状态订阅：熔断/恢复/服务端繁忙/走法被拒都会主动广播，
-  // 这里把它转成 state 触发重渲染——否则角标只能等下一次走子才刷新，
-  // 会出现"熔断了但界面毫无变化、一直本地 AI 且看不到任何提示"的死角。
-  const [onlineAiStatusState, setOnlineAiStatusState] = useState<OnlineAiStatus>(() => getOnlineAiStatus());
-  const [onlineAiStatusTick, setOnlineAiStatusTick] = useState(0);
-  useEffect(() => {
-    const unsubscribe = subscribeOnlineAiStatus((status) => {
-      setOnlineAiStatusState(status);
-      // busy / invalid_move / longGameNotice 不在 status 枚举里，用 tick 强制刷新
-      setOnlineAiStatusTick((n) => n + 1);
-    });
-    return unsubscribe;
-  }, []);
-
   // 动画
   const shakeAnim = useRef(new Animated.Value(0)).current;
 
@@ -388,7 +399,7 @@ export default function GameScreen() {
       return () => clearTimeout(timer);
     }
     if (gameState.gameStatus === 'playing' && gameState.sideTag === playerSideTag) {
-      precomputeHint(gameState); // 残局闯关提示同样后台预计算，点击"提示"即时命中
+      precomputeOfflineHint(gameState); // 残局闯关同样后台预计算，点击"提示"即时命中
     }
   }, [loaded]);
 
@@ -416,24 +427,21 @@ export default function GameScreen() {
     // 开一张代数票据：计算期间若发生重开/悔棋/翻转等重置，本次结果作废
     const ticket = beginMoveTicket();
     setAiThinking(true);
+    // 正式走子优先级最高：先中止后台预计算，别让 ponder 占着唯一的引擎实例
+    cancelOfflinePonder();
 
     try {
-      // 残局闯关：为保证预置残局可行，AI 走子固定使用本地大师难度 AI（不联网皮卡鱼），
-      // 仅用户"提示"走皮卡鱼；人机对战：混合 AI（联网优先皮卡鱼，弱网/离线回退本地）。
-      let aiMove: HybridMoveResult | null;
-      if (isEndgame) {
-        const offline = await getBestMoveAsync(currentState, difficulty);
-        aiMove = offline ? { ...offline, source: 'offline' } : null;
-      } else {
-        aiMove = await getHybridBestMove(currentState, difficulty);
-      }
+      // AI 走子统一走本地：本地皮卡鱼（Web/原生均可离线跑），失败再退旧 TS AI。
+      // ⚠️ 2026-10 服务端去 AI 化后，人机对战与残局闯关**共用同一条路径** ——
+      //    此前残局走 getHybridBestMoveLocal、人机走可联网的混合调度，
+      //    那个"联网兜底"端点已不存在，保留区分只会让人误以为还能联网。
+      let aiMove = await getBestMoveOffline(currentState, difficulty);
 
       // 计算返回时局面已被重置（重开/悔棋/翻转/退出）→ 丢弃结果
       if (!isTicketLive(ticket)) return;
 
       if (aiMove) {
-        setAiSource(aiMove.source);
-        setAiDepth(aiMove.depth ?? null);
+        aiNoMoveRetryRef.current = 0; // 本轮成功出招：重试计数归零
         setAiEngine(aiMove.engine ?? null);
 
         // 长将长捉超限时的 AI 择优（方案 10 娱乐向改造）：落子本身不再被拦截，
@@ -538,8 +546,41 @@ export default function GameScreen() {
             savePveReplay(newState, !aiWon); // 按真实胜负保存复盘
           }
         } else {
-          // AI 走棋完成，轮到玩家：后台预计算提示（搜索核心与预算不变，质量无损）
-          precomputeHint(newState);
+          // AI 走棋完成，轮到玩家：后台预计算提示（现在走本地皮卡鱼，不占 JS 主线程）
+          precomputeOfflineHint(newState);
+        }
+      } else {
+        // ================================================================
+        // 【2026-10 审计 P2】AI 没能给出着法时的出口（此前**完全没有** else 分支）
+        //
+        // 旧行为：aiMove 为 null 时既不落子也不重新排定，而 finally 只把 aiThinking
+        // 复位 —— 局面停在「轮到 AI」，玩家点自己的棋子被"不是你的回合"挡住，
+        // 触发 AI 的 effect 依赖数组又只有 [loaded] 不会重跑，界面毫无提示，
+        // 只能靠重开（残局黑先、或仅走一步时连悔棋都被禁用）逃生。
+        //
+        // 正常对局不可达：makeMove 已穷举绝杀/困毙（走棋方无着法必置终局），
+        // 自定义残局 FEN 也已在 validateEndgameFen 入口校验「走棋方须有合法着法」。
+        // 这里只兜住"兜底 AI 也罕见地算不出着法"的残余可能，做两件事：
+        //   1) 该方确实已无合法着法 → 局面本已终局，明确告知并引导重开，
+        //      **不**在此处自造胜负/结算流程（那会与正常终局的存档、残局评级脱节）；
+        //   2) 否则视为瞬时故障 → 有限重试，避免一次失败锁死整局。
+        // ================================================================
+        if (currentState.gameStatus === 'playing') {
+          const aiHasMove = hasAnyLegalMoveForSide(currentState, currentState.sideTag);
+          if (!aiHasMove) {
+            console.error('[game] AI 回合但该方已无任何合法着法（终局局面），对局无法继续');
+            showRuleNotice('当前局面已无棋可走，请重新开始本局');
+          } else if (aiNoMoveRetryRef.current < AI_NO_MOVE_MAX_RETRY) {
+            aiNoMoveRetryRef.current += 1;
+            console.warn(
+              `[game] AI 未给出着法，重试第 ${aiNoMoveRetryRef.current} 次`,
+              aiMove
+            );
+            scheduleAIMove(currentState, 400);
+          } else {
+            console.error('[game] AI 连续多次未能给出着法，停止重试');
+            showRuleNotice('AI 暂时无法出招，请重开本局');
+          }
         }
       }
     } catch (error) {
@@ -549,7 +590,7 @@ export default function GameScreen() {
       // 避免旧流程的 finally 覆盖新流程（如重开后排定的新 AI 走子）的 aiThinking
       if (isTicketLive(ticket)) setAiThinking(false);
     }
-  }, [difficulty, triggerMoveEffect, savePveReplay, isEndgame, aiSideTag, currentEndgame, endgameHintLeft, showRuleNotice, beginMoveTicket, isTicketLive]);
+  }, [difficulty, triggerMoveEffect, savePveReplay, isEndgame, aiSideTag, currentEndgame, endgameHintLeft, showRuleNotice, beginMoveTicket, isTicketLive, scheduleAIMove]);
 
   // triggerAIMove 的最新引用转交排定器：排定器是稳定引用，读 ref 才能避免
   // 「每次 triggerAIMove 重建都让所有排定失效」的死循环式重排定。
@@ -664,6 +705,7 @@ export default function GameScreen() {
 
     clearHint(); // 走子后提示失效
     cancelHintPonder(); // 玩家走棋：立即中止后台提示预计算，算力让给 AI 思考
+    cancelOfflinePonder(); // 同上，但针对本地皮卡鱼预计算（不占主线程，但要释放唯一引擎）
     const { newState, captured, isCheck, isGameOver, gameOverReason } = makeMove(
       gameState, pieceId, toCol, toRow
     );
@@ -797,7 +839,7 @@ export default function GameScreen() {
     setLastMove(null);
     if (state.sideTag === playerSideTag) {
       // 悔棋后轮到玩家：后台预计算提示（内部会先取消旧局面的预计算）
-      precomputeHint(state);
+      precomputeOfflineHint(state);
     } else {
       // 空盘且 AI 先手：让 AI 重新走开局第一步
       scheduleAIMove(state, 500);
@@ -921,13 +963,10 @@ export default function GameScreen() {
     const nextIndex = currentEndgame.levelIndex + 1;
     const nextLevel = BUILTIN_ENDGAMES[nextIndex];
     if (!nextLevel) return;
-    const next: EndgameLaunchParams = {
-      levelIndex: nextIndex,
-      customId: '',
-      name: nextLevel.name,
-      comment: nextLevel.comment,
-      fen: nextLevel.fen,
-    };
+    // 复用统一的工厂函数，而不是手工拼字段 —— 手工拼过的版本漏了 tier，
+    // 导致"下一关"的说明弹窗永久丢失难度角标（2026-10 审计 P3）。
+    // 该工厂与选关页进入关卡时用的是同一份实现，字段不会再漂移。
+    const next: EndgameLaunchParams = builtinLevelToLaunch(nextIndex, nextLevel);
     setCurrentEndgame(next);
     startNewGame({
       endgameFen: next.fen,
@@ -967,19 +1006,18 @@ export default function GameScreen() {
     const reqId = ++hintReqRef.current;
     setHintLoading(true);
     try {
-      // 提示走混合调度（与 AI 走子同一套调用逻辑）：联网优先服务端皮卡鱼 hard（纯最佳、确定性、
-      // 高优先级插队），网络不可用/超时/熔断时回退本地提示搜索。区别于 AI 走法的多样化与反循环策略。
-      const best = await getHybridHintMove(gameState);
+      // 提示与 AI 走子走同一套本地调度，但档位不同：提示固定走本地皮卡鱼的 hint 档
+      //（multiPV=1、纯最佳、确定性——同一局面两次提示结果恒定），且优先复用
+      // 玩家思考期间的后台预计算结果。区别于 AI 走法的多样化与反循环策略。
+      const best = await getHintMoveOffline(gameState);
       // 计算期间局面已变化（走子/悔棋/换边等）或已有新请求 → 丢弃结果
       if (reqId !== hintReqRef.current) return;
       if (!best) return;
 
       // 兜底：提示着法同样不得送将。
-      // 本地提示搜索走 isSideInCheck 过滤、本来不含送将；但"提示"在线优先请求服务端
-      // 皮卡鱼，而实测过一种病态局面——历史里含送将着法时皮卡鱼拒绝重放，会在"送将
-      // 之前"的局面上搜索并返回**对方的着法**，那种着法有时恰能通过落子形状校验。
-      // aiDispatcher 已在出口拦一道（rejectMoverUnsafe），这里再按落子入口同一判据兜底，
-      // 避免把一步必然被拦的着法标成"推荐走法"。
+      // 本地提示搜索按 isSideInCheck 过滤、本不含送将，aiDispatcher 出口也已拦一道
+      //（rejectMoverUnsafe）；这里再按落子入口同一判据兜底，避免把一步必然被拦的
+      // 着法标成"推荐走法"。
       if (!isMoveKingSafe(gameState, best.pieceId, best.toCol, best.toRow)) return;
 
       // 残局闯关：成功给出提示才消耗一次次数（计算失败/局面已变不扣次）
@@ -994,61 +1032,23 @@ export default function GameScreen() {
 
   const difficultyLabel = { easy: '入门', medium: '进阶', hard: '大师' }[difficulty];
 
-  // AI 标识角标文案：绿指示灯=皮卡鱼（在线，含搜索深度）；灰指示灯=本地AI（离线，含难度）
-  // 首步 AI 走棋前来源未知，默认按本地 AI 展示，走棋后立即刷新为真实来源
-  const aiIsOnline = aiSource === 'online';
-  // 在线 AI 连接状态：熔断中（走本地，稍后自动探测恢复）/ 冷却后将先探测再决定是否联网
-  // 修复"较长时间仍保持本地AI、似乎没有重连"的观感——明确告知用户系统在自救
-  const onlineAiStatus = onlineAiStatusState;
-  // 服务端繁忙退避中：说明"还在连，只是服务端此刻排队"，与"连不上"要区分开
-  const onlineAiBusy = isOnlineAiBusyRetrying();
-  const onlineAiInvalidReason = getOnlineAiInvalidReason();
-  const longGameNotice = getOnlineAiLongGameNotice();
-  // 角标之外的说明条文案：把静默降级的原因讲清楚（拒收原因 / 对局过长 / 繁忙重试）。
-  // 用 GameNotice 横幅承载（覆盖在棋盘中央、不阻塞落子），不新增常驻行，
-  // 避免打乱棋盘高度预算（useBoardLayoutBudget 的 topFlowHeight）。
-  // 主文案控制在 12 字以内：窄屏（手机竖屏）提示条每行只排得下十来字，主文案再长
-  // 就得挤成三四行、把棋盘中心糊住；更细的原因放在 detail 里，由 GameNotice 断行。
-  // key 只跟文案走：同一原因反复出现时不重复弹横幅（常驻指示靠角标，避免刷屏）；
-  // 靠 onlineAiStatusTick 消费掉"订阅有更新"这一信号（状态枚举外的变化靠角标读数体现）。
-  void onlineAiStatusTick;
-  const onlineAiNoticeText = onlineAiInvalidReason
-    ? '在线走法异常，改用本地'
-    : longGameNotice
-      ? '对局过长，建议求和'
-      : onlineAiBusy
-        ? '服务端繁忙，正在重试'
-        : null;
-  const onlineAiNoticeItem: GameNoticeItem | null = useMemo(
-    () =>
-      onlineAiNoticeText
-        ? {
-            key: `online-ai-${onlineAiNoticeText}`,
-            text: onlineAiNoticeText,
-            // 细分原因（拒收原因 / 超限步数）放 detail：主文案一行说完，
-            // 细节由 GameNotice 摘掉尾部「（…）」诊断注解后断行排版
-            ...(onlineAiInvalidReason ? { detail: onlineAiInvalidReason } : {}),
-            ...(longGameNotice ? { detail: longGameNotice } : {}),
-            duration: 2600,
-          }
-        : null,
-    [onlineAiNoticeText, onlineAiInvalidReason, longGameNotice]
-  );
-  // 开局库命中时服务端 depth 恒为 0，展示"开局库"而非误导性的"深度0"；
-  // 皮卡鱼搜索才展示真实深度（且深度>0 才显示，兜底避免异常 0 值）
-  const aiChipLabel = aiIsOnline
-    ? (aiEngine === 'book'
-        ? '皮卡鱼（开局库）'
-        : (aiDepth != null && aiDepth > 0 ? `皮卡鱼（深度${aiDepth}）` : '皮卡鱼'))
-    : [
-        `本地AI（${difficultyLabel}）`,
-        onlineAiBusy ? '服务端繁忙，重试中' : null,
-        onlineAiStatus === 'invalid_move' ? '在线走法被拒' : null,
-        onlineAiStatus === 'circuit' ? '重连中' : null,
-        onlineAiStatus === 'probing' ? '探测中' : null,
-      ]
-        .filter(Boolean)
-        .join('·');
+  // AI 标识角标文案：如实显示"最近这一步是谁算的"（2026-10 服务端去 AI 化）。
+  //
+  // ⚠️ 这里曾有一套在线状态角标（重连中 / 探测中 / 服务端繁忙 / 在线走法被拒），
+  //    随服务端 AI 一并移除：AI 现在永远在本地跑，没有"连不连得上"可言。
+  //    继续挂着那些后缀只会让用户以为 AI 出了故障（正是 2026-10 实测到的误导）。
+  //
+  // 首步 AI 走棋前 aiEngine 还是 null，此时引擎通常已在后台启动/就绪，
+  // 显示"皮卡鱼启动中"而不是"基础AI"——否则开局第一眼就看到"基础"，
+  // 会让用户以为引擎没起来（它其实正在起来，且会自动升级）。
+  const aiChipLabel =
+    aiEngine === 'pikafish-local'
+      ? `皮卡鱼（${difficultyLabel}）`
+      : aiEngine === 'legacy'
+        // 引擎判定不可用，本局都用兜底
+        ? `基础AI（${difficultyLabel}）`
+        // 引擎还在加载/重试，或尚未走第一步 —— 这段时间是基础 AI 在出招（会自动升级）
+        : `皮卡鱼启动中（${difficultyLabel}）`;
 
   // ===== 底部操作栏配置（2026-10 改造：三模式从左到右的按键集合）=====
   // 人机对战：菜单 / 提示 / 悔棋 / 重开（"翻转"按用户要求移入「菜单」弹出列表）
@@ -1133,11 +1133,11 @@ export default function GameScreen() {
           {/* 内容垂直居中（boardPadTop 由纵向预算给出） */}
           <View style={[styles.boardContainer, { paddingTop: boardPadTop }]}>
             {/* AI 标识角标行：棋盘上方独立行，左对齐（参照联机对战对手名称角标样式），
-                实时指示当前 AI 引擎来源——绿色指示灯=云端皮卡鱼（含深度），灰色指示灯=本地AI（含难度）。
+                实时指示当前 AI 引擎来源——绿色指示灯=皮卡鱼已就绪，灰色指示灯=基础AI（含难度）。
                 残局模式下补一枚说明图标：标题栏 2026-10 下线后，说明弹窗的入口就地挪到这里。 */}
             <View style={[styles.aiNameRow, alignedRowStyle]} pointerEvents="box-none">
               <View style={styles.aiNameChip}>
-                <View style={[styles.aiNameChipDot, aiIsOnline && styles.aiNameChipDotOnline]} />
+                <View style={[styles.aiNameChipDot, aiEngine === 'pikafish-local' && styles.aiNameChipDotPikafish]} />
                 <Text style={styles.aiNameChipText} numberOfLines={1}>
                   {aiChipLabel}
                 </Text>
@@ -1188,7 +1188,7 @@ export default function GameScreen() {
               不阻塞落子、3s 后自动淡出；绝杀特效展示期间让位避免与结算文字重叠。
               在线 AI 提示走同一通道（优先级低于规则提示：规则提示优先，规则提示没有时才显示）。 */}
           <GameNotice
-            notice={jueShaVisible ? null : (ruleNotice ?? onlineAiNoticeItem)}
+            notice={jueShaVisible ? null : ruleNotice}
             centerY={ruleNoticeCenterY}
             onHide={hideRuleNotice}
           />
@@ -1353,18 +1353,19 @@ const styles = StyleSheet.create({
     borderColor: COLORS.border,
     paddingVertical: 4,
     paddingHorizontal: 10,
-    // 角标文案会随在线状态追加状态后缀（如"·重连中""·在线走法被拒"），放宽上限避免截断
+    // 角标文案含引擎名与难度（如"皮卡鱼（进阶）"），放宽上限避免截断
     maxWidth: '86%',
   },
-  // 指示灯：默认灰色=本地AI
+  // 指示灯：默认灰色=基础AI
   aiNameChipDot: {
     width: 6,
     height: 6,
     borderRadius: 3,
     backgroundColor: '#9E9E9E',
   },
-  // 绿色指示灯=云端皮卡鱼
-  aiNameChipDotOnline: {
+  // 绿色指示灯=皮卡鱼已就绪（2026-10 服务端去 AI 化后不再有"在线"含义，
+// 此处沿用绿色表示"引擎就绪"；样式名由 ...DotOnline 改为 ...DotPikafish）
+  aiNameChipDotPikafish: {
     backgroundColor: '#2E7D32',
   },
   aiNameChipText: {

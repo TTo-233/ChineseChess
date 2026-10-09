@@ -147,8 +147,12 @@ async function scenarioReturnClearsCountdown() {
   console.log('\n[场景 3] 回到前台立即撤销断线等待，不按旧计时误判负');
   const { roomId, pa, ta, tb } = await setupPlayingRoom('back');
 
-  // 真断线：心跳停止超过 HEARTBEAT_TIMEOUT(10s)
-  await advanceWithForegroundHeartbeat(20_000, roomId, [tb]);
+  // 真断线：心跳停止超过 HEARTBEAT_TIMEOUT —— 该阈值已由 10s 放宽到 30s
+  // （见 src/routes/lanGame.ts:123 与上方 118-121 行的说明：判定真断线慢 20s，
+  //  换「切后台不被误判」；客户端心跳周期同步放宽到 8s）。
+  // ⚠️ 这里必须推进 **超过 30s**：此前写的是 20_000 且注释标着 (10s)，阈值上调后未同步，
+  //    导致本场景在「进入断线等待」这一步就失败（基线核实为既有失败，非某次改动引入）。
+  await advanceWithForegroundHeartbeat(40_000, roomId, [tb]);
   await ticks(2);
   const disconnected = await roomState(roomId);
   ok('心跳超时 → 进入断线等待', disconnected.disconnectedPlayerId === pa, `disconnected=${disconnected.disconnectedPlayerId}`);

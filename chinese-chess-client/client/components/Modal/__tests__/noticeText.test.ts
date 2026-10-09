@@ -48,8 +48,8 @@ describe('noticeText · 字位折算', () => {
 
 describe('noticeText · 断行', () => {
   test('中文逐字断行，任何一行都不超过行宽', () => {
-    const out = wrapNoticeText('在线走法与本地局面不同步，已改用本地AI', 10);
-    expect(out).toBe('在线走法与本地局面不\n同步，已改用本地AI');
+    const out = wrapNoticeText('在线走法与本地局面不同步，已改用基础AI', 10);
+    expect(out).toBe('在线走法与本地局面不\n同步，已改用基础AI');
     assertNoLineExceeds(out, 10);
   });
 
@@ -98,7 +98,7 @@ describe('noticeText · 行数上限与省略号', () => {
   });
 
   test('超行数时截断并加省略号，且末行不超宽', () => {
-    const raw = '在线走法与本地局面不同步，已改用本地AI走法异常，请尽快变招';
+    const raw = '在线走法与本地局面不同步，已改用基础AI走法异常，请尽快变招';
     const out = condenseNoticeText(raw, 8, 2);
     const lines = out.split('\n');
     expect(lines).toHaveLength(2);

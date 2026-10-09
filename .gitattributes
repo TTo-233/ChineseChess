@@ -7,3 +7,24 @@
 # Windows 批处理脚本保留 CRLF（cmd.exe 对 LF 结尾的标签/goto 处理不可靠）
 *.bat text eol=crlf
 *.cmd text eol=crlf
+
+# ---------------------------------------------------------------------------
+# 引擎产物与源二进制：必须按原字节存取，禁止任何 EOL 归一化（2026-10 审计补充）
+#
+# 为什么显式标注（而不是依赖 text=auto 的 NUL 探测豁免）：
+#   · pikafish.wasm / pikafish.nnue / pikafish.data 是二进制，靠 NUL 探测虽能豁免，
+#     但那是"探测结果"而非"约定"，换 git 版本/配置可能变；
+#   · pikafish.worker.bin 与 pikafish.html 是**文本**（内联的 Emscripten loader + base64），
+#     完全不含 NUL，因此**会**被 text=auto 纳入 EOL 归一化。当前工作树是纯 LF，
+#     所以今天没有差异；但一旦有人以 CRLF 检出/写回，verify-pikafish-engine-assets
+#     的「逐字节比对 / 逐字符包含 loader」两道断言就会失败。
+#   · pikafish.cjs（engine-source）同理：它是被原样内联进产物的源文本。
+# 标注 binary/-text 后，git 只做原字节存取，上述断言在任何机器上都成立。
+# ---------------------------------------------------------------------------
+*.wasm  binary
+*.nnue  binary
+*.data  binary
+# 以下三个是「必须按原字节存取」的文本类产物（名字在本仓库内唯一，用 basename 匹配即可）：
+pikafish.cjs        -text
+pikafish.worker.bin -text
+pikafish.html       -text

@@ -28,7 +28,17 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\pack.ps1 all     # 或 cli
    $t = [System.IO.File]::ReadAllText($p, [System.Text.Encoding]::UTF8)
    [System.IO.File]::WriteAllText($p, $t, (New-Object System.Text.UTF8Encoding($true)))
    ```
-2. **服务端出包前会强制校验 dist 与源码一致**。`chinese-chess-server/dist/index.js` 由 `chinese-chess-server/src/` 经 `node build.js`（esbuild 0.27.2）生成；历史遗留的 6 条加固（长将长捉不拦截、畸形 FEN 行宽校验、初始局面上传收紧、被拒动作回推权威状态、房间名最小空缺优先）现在全部在源码里。`dist` 与源码不一致时 `pack.ps1 server` / `pack.sh server` 会阻塞出包，并提示先在 `chinese-chess-server/` 下执行 `node build.js`。
+2. **服务端出包前会强制校验 dist 与源码一致**。`chinese-chess-server/dist/index.js` 由 `chinese-chess-server/src/` 经 `node build.js`（esbuild 0.27.2）生成；历史遗留的加固（初始局面上传收紧、被拒动作回推权威状态、房间名最小空缺优先等）现在全部在源码里。`dist` 与源码不一致时 `pack.ps1 server` / `pack.sh server` 会阻塞出包，并提示先在 `chinese-chess-server/` 下执行 `node build.js`。
+
+   > **关于「长将长捉」**：旧加固描述的「超限不拦截落子」**已被规则二取代**
+   > （commit 73d10ff「规则二强制变招：达到阈值后再走超限着法即禁着并提示」）。
+   > 当前契约是 **达到阈值后再走超限着法即禁着**：客户端 `lanBattle` 先拦一层
+   > （省一次往返），服务端 `lanGame.ts` 用 `getMoveBanReason` 做权威裁决
+   > （防绕过客户端改状态）；两端共用同一份 `ruleEngine.cjs`，口径不会分叉。
+   > 仍然保留的那半条是 **不按违规次数判负**（`recordBanViolation` 不得回到产物里）。
+   > 回归断言见 `verify-server-hardening.cjs` 场景 E —— 2026-10 审计修正过它：
+   > 此前按旧语义写成「产物不得含 `isMoveBanned`」，因实现改名而**恒为真**（假绿灯），
+   > 现已改为断言当前契约（含 `getMoveBanReason`/`banReasonNotice`、不含 `recordBanViolation`）。
 
 ### 已解决：中文文件名在 zip 里乱码
 

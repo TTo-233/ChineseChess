@@ -29,6 +29,14 @@ const ASSET_MIME_TYPES = {
   '.gif': 'image/gif',
   '.webp': 'image/webp',
   '.svg': 'image/svg+xml',
+  // 本地引擎产物（assets/engines）：自包含的 classic Worker 与离线 HTML 页。
+  // 各约 6MB（内联了 WASM + 4MB NNUE 的 base64），**不能**走源码转译，
+  // 否则 base64 会被 Babel 逐字符处理，启动极慢且内存峰值高；必须原样透传。
+  '.wasm': 'application/wasm',
+  '.nnue': 'application/octet-stream',
+  // .bin = 引擎 worker 脚本。经典 Worker 由浏览器按 URL 直接执行，不依赖 MIME，
+  // 这里给一个明确类型避免部分服务器返回 text/plain 之外的怪值。
+  '.bin': 'text/javascript',
 };
 
 const MONOREPO_ROOT = path.resolve(__dirname, '..');
@@ -67,15 +75,61 @@ function devAssetMiddleware(req, res, next) {
   }
   if (!stat.isFile()) return next();
 
-  console.log(`[Asset Fix] Serving ${relPath}`);
+  /**
+   * 缓存策略：no-cache（= 每次带 ETag 重新校验，不是"不缓存"）。
+   *
+   * 这里原本是 `no-store`，而它会强制浏览器**每次都重新下载整个文件**。
+   * 本地引擎产物有 4~6MB，于是每次刷新页面都要重传一遍——这也是"首次启动慢"
+   * 的直接原因之一（实测 6.06MB 在本地 dev server 上要 ~3.6s）。
+   *
+   * 改成 no-cache + ETag 后：
+   *   · 内容没变 → 304，只走几百字节的头部，重载几乎瞬时；
+   *   · 重新生成了产物（mtime/size 变化）→ ETag 变化 → 自动取新版，开发时不失真。
+   * 之所以不用 max-age 长缓存：这些产物在开发期会随 gen:pikafish-host 重新生成，
+   * 强缓存会让开发者看到旧引擎且难以察觉。
+   */
+  const etag = `W/"${stat.size.toString(16)}-${stat.mtimeMs.toString(16)}"`;
+  if (req.headers['if-none-match'] === etag) {
+    res.statusCode = 304;
+    res.end();
+    return;
+  }
+
   res.setHeader('Content-Type', mime);
   res.setHeader('Content-Length', String(stat.size));
-  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('ETag', etag);
+  res.setHeader('Cache-Control', 'no-cache');
   fs.createReadStream(absPath).pipe(res);
 }
 
 // 安全地获取 Expo 的默认排除列表
 const existingBlockList = [].concat(config.resolver.blockList || []);
+
+/**
+ * 【本地皮卡鱼引擎产物：必须原样透传，绝不能进转译管线】
+ *
+ * assets/engines 下的两个文件各约 6MB（内联 base64 的 WASM + 4MB NNUE）：
+ *   · pikafish.worker.bin —— classic Worker 脚本
+ *   · pikafish.html        —— 原生端离线引擎页（html 本身就在 assetExts 里）
+ *
+ * 做法是**用非源码扩展名**（.bin / .html），并把它们登记进 assetExts：
+ *   Metro 只转译 sourceExts 里的扩展名，assetExts 里的文件按原字节作为静态资源提供。
+ * 因此那两段巨型 base64 不会被 Babel/JSX 管线逐字符处理——
+ * 否则启动会慢到数十秒、内存峰值数百 MB，而且**没有任何报错**。
+ *
+ * 注意：worker 脚本用 .bin 后缀不影响 `new Worker(url)`：它只当作 URL，
+ * 浏览器不关心扩展名。⚠️ 切勿改用 blockList —— 那会让文件**无法被 require 解析**
+ * （blockList 的语义是"从模块图里删掉"，不是"跳过转译"），导致 require 直接失败。
+ *
+ * .html 已在 Expo 默认 assetExts 中（见上面的 ASSET_MIME_TYPES 注释区），
+ * 无需重复登记；这里只补 .wasm/.nnue/.bin。
+ */
+config.resolver.assetExts = [].concat(config.resolver.assetExts || [], [
+  'wasm',
+  'nnue',
+  'bin', // 引擎 worker 脚本（内容是 JS，但必须按资源原样透传）
+]);
+
 
 config.resolver.blockList = [
   ...existingBlockList,
@@ -100,6 +154,7 @@ config.resolver.blockList = [
   // 5. pnpm 临时目录（避免 ENOENT 错误）
   /.*node_modules\/\.pnpm\/.*_tmp_\d+.*/,
 ];
+
 
 const DEFAULT_BACKEND_PORT = '9091';
 const BACKEND_PORT = process.env.SERVER_PORT || DEFAULT_BACKEND_PORT;

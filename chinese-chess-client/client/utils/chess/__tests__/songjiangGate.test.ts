@@ -53,7 +53,6 @@ import {
   type GameState,
   createFromFen,
 } from '../GameEngine';
-import { assertOnlineMoveSide } from '../onlineMoveGuard';
 
 import { fen, type FenChar } from './boardFixtures';
 import { RED_SIDE, BLACK_SIDE, type SideTag } from '../types';
@@ -346,41 +345,3 @@ describe('送将被拦：轮次、着法历史、选中态都不变', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// 3. 在线着法的归属方 / 回合校验
-// ---------------------------------------------------------------------------
-
-describe('在线 AI 着法：归属方与回合校验', () => {
-  test('起点为空点 → 拒收', () => {
-    const state = createInitialState();
-    state.sideTag = BLACK_SIDE;
-    expect(() => assertOnlineMoveSide(state, { uci: 'e5e4', fromCol: 4, fromRow: 5 }))
-      .toThrow(/无活子/);
-  });
-
-  test('起点是对方棋子（服务端在错误局面上返回了对方的着法）→ 拒收', () => {
-    const state = createInitialState();
-    state.sideTag = BLACK_SIDE;
-    // (7,7) 是红炮（id 29）：轮到黑方，却返回红方棋子的着法（服务端在送将前的局面上搜索）
-    expect(() => assertOnlineMoveSide(state, { uci: 'h3e3', fromCol: 7, fromRow: 7 }))
-      .toThrow(/不属于当前走棋方/);
-  });
-
-  test('起点是己方棋子 → 放行并返回该子', () => {
-    const state = createInitialState();
-    state.sideTag = BLACK_SIDE;
-    // (7,2) 是黑炮（id 10）：轮到黑方，归属正确
-    const piece = assertOnlineMoveSide(state, { uci: 'h7e7', fromCol: 7, fromRow: 2 });
-    expect(piece.id).toBe(10);
-    expect(piece.id < 16).toBe(true);
-  });
-
-  test('起点是己方棋子但已阵亡 → 拒收', () => {
-    const state = createInitialState();
-    state.sideTag = RED_SIDE;
-    const rookId = state.pieces.findIndex((p) => p.alive && p.col === 0 && p.row === 9);
-    state.pieces[rookId].alive = false;
-    expect(() => assertOnlineMoveSide(state, { uci: 'a0a1', fromCol: 0, fromRow: 9 }))
-      .toThrow(/无活子/);
-  });
-});

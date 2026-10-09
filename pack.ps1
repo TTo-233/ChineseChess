@@ -19,7 +19,7 @@ Set-Location $Root
 # ⚠️ 不要往这里随手加东西：入包内容 = 用户拿到手就能跑的东西。
 #    库里被跟踪的文件都在用（含 patches/、verify-*.mjs 自检脚本、部署说明、.bat 启动器），
 #    误排会让部署包缺件；这里只排「本机产生的、与运行无关的」垃圾。
-#    服务端 dist/index.js 与 ai/ 是唯一可运行主体与引擎，绝不能排。
+#    服务端 dist/index.js 是唯一可运行主体，绝不能排。
 $ExcludeCommon = @(
   '--exclude', '.DS_Store',
   '--exclude', 'Thumbs.db',
@@ -39,6 +39,12 @@ $ExcludeCommon = @(
   '--exclude', '.idea',
   '--exclude', '*.iml',
   '--exclude', '.git',
+  # 【I-24】差分闸门 verify-server-diff.cjs 会在 chinese-chess-server/.verify-old/ 下
+  # 留一份「旧产物」（约 1.4MB 的 index.js）。正常跑完会清理，但 --keep、被强杀
+  # （该脚本在 win32 自己用 taskkill /f /t）或中途 throw 都可能留下它。
+  # 它是一份**旧的 dist**，随「自包含部署包」发出去极易被误用，故一律排除。
+  '--exclude', '.verify-old',
+  '--exclude', '.verify-tmp',
   # 【I-12】环境配置绝不入包：本仓库大量读 process.env.EXPO_PUBLIC_* / SERVER_PORT，
   # 客户端 .gitignore 里也把 .env 列为忽略项，说明工作机上很可能存在这类文件。
   '--exclude', '.env',
@@ -115,6 +121,12 @@ function New-ClientZip {
     # `python scripts/board_assets.py build --all` 重新生成索引色 PNG，
     # 不是运行所需，不随部署包分发。
     '--exclude', 'chinese-chess-client/client/assets/boards/_source',
+    # 皮卡鱼引擎**源**二进制（engine-source/，约 4.8MB）只用于
+    # `node client/scripts/gen-pikafish-host.mjs` 重新生成 assets/engines/*，
+    # 以及逐字节溯源校验（verify-pikafish-engine-assets）。生成的产物
+    # （assets/engines/，含同样的 wasm/nnue）已随包分发，运行不需要源目录，
+    # 故不重复携带这 4.8MB。仓库内仍保留它，校验脚本照常工作。
+    '--exclude', 'chinese-chess-client/client/engine-source',
     'chinese-chess-client'
   )
   & tar @tarArgs
@@ -128,10 +140,11 @@ function New-ServerZip {
   # 服务端 dist/index.js 现在由 chinese-chess-server/src/ 经 `node build.js` 生成（esbuild）。
   #    打包前强制校验「已提交的 dist/index.js 与重新构建的结果一致」，这样：
   #      - dist 被手工改过 / 被旧产物覆盖过 → 直接阻塞出包；
-  #      - 6 条加固（长将长捉不拦截、畸形 FEN 行宽、初始局面上传收紧、被拒动作回推权威状态、
+  #      - 6 条加固（长将长捉不拦截、初始局面上传收紧、被拒动作回推权威状态、
   #        房间名最小空缺优先）都在 src/ 里，不可能像以前那样「补丁丢了却照样出包」。
   #    校验放在删旧包之前（switch 里调用 Assert-ServerDistFresh），失败时上一版可用包仍在。
-  # 注意：服务端 dist/index.js 是唯一可运行主体，ai\ 为引擎与开局库，必须保留
+  # 注意：服务端 dist/index.js 是唯一可运行主体，必须保留。
+  # （2026-10 去 AI 化：原 ai\ 引擎与开局库已随服务端 AI 一并移除，客户端包已不再依赖它们。）
   $out = "chinese-chess-server_$Date.zip"
   if (Test-Path $out) { Remove-Item $out }
   Remove-OldZip 'chinese-chess-server'

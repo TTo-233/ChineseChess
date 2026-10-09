@@ -246,3 +246,39 @@ describe('getEndgameLevel', () => {
     expect(getEndgameLevel(1000)).toBeNull();
   });
 });
+
+/**
+ * 终局性校验（2026-10 审计 P2）
+ *
+ * 一个"摆得完全合规"的局面也可能是**已经结束**的：走棋方无论走哪一步都会送将
+ * （已被绝杀/困毙）。这种局面若被当作残局起点，两个引擎都返回"无可用着法"(null)，
+ * 而对局界面在 AI 回合拿不到着法时既不落子也不重新排定 → 棋盘彻底点不动。
+ *
+ * 内置 100 关不受影响（上一条用例已覆盖），可达路径是**用户导入的自定义 FEN**，
+ * 所以闸门必须设在 validateEndgameFen 这个入口上。
+ */
+describe('validateEndgameFen 终局性校验', () => {
+  it('走棋方已无合法着法（黑先、黑将被将死）→ 拒绝', () => {
+    // 黑将(0,4)被红车(0,0)沿底线照将；红车(1,0)封住整条第 1 行三处逃口；
+    // 黑方仅剩将且无法吃子/垫子 → 绝杀，黑先无一步可走。
+    // 红帅放(9,3)避开与黑将同列（同列且中间无子会被"飞将"规则另拦一条）。
+    const fen = 'R3k4/R8/9/9/9/9/9/9/9/3K5 b';
+    const err = validateEndgameFen(fen);
+    expect(err).not.toBeNull();
+    expect(err).toContain('合法着法');
+  });
+
+  it('对照：同一局面撤掉封口的那只车（黑将有逃口）→ 通过', () => {
+    // 与上例只差第 1 行的红车：黑将可逃到第 1 行，因此存在合法着法，必须放行。
+    // 这一对照证明拦截真的来自"走棋方无着法"，而不是别的格式检查误伤。
+    const fen = 'R3k4/9/9/9/9/9/9/9/9/3K5 b';
+    expect(validateEndgameFen(fen)).toBeNull();
+  });
+
+  it('内置 100 关全部通过（新校验不得误伤既有题库）', () => {
+    const bad = BUILTIN_ENDGAMES.map(
+      (l, i) => `${i + 1} ${l.name}: ${validateEndgameFen(l.fen)}`
+    ).filter((s) => !s.endsWith(': null'));
+    expect(bad).toEqual([]);
+  });
+});

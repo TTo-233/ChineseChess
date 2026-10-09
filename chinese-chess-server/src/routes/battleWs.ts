@@ -334,98 +334,124 @@ export function attachBattleWebSocket(server: Server): void {
       // 忽略解析失败，后续按缺失处理
     }
 
-    if (!roomId) {
-      rejectHandshake(ws, 400, '缺少 roomId');
-      return;
-    }
-
-    const room = rooms.get(roomId);
-    if (!room) {
-      rejectHandshake(ws, 404, '房间不存在');
-      return;
-    }
-
-    if (role === 'spectator') {
-      // 观战者连接：仅对战中/已结束的房间可旁观（与 HTTP /spectate 保持一致）
-      if (!spectatorId) {
-        rejectHandshake(ws, 400, '缺少观战者标识');
-        return;
-      }
-      if (room.phase === 'waiting') {
-        rejectHandshake(ws, 400, '对局尚未开始，暂无法观战');
+    // 【2026-10 审计 P0】整个握手主体必须兜底 try/catch：
+    // 一旦鉴权/房间查找/状态写入在握手途中抛出未捕获异常（实测案例：tokenEquals
+    // 曾因按字符数而非字节数预比较，遇到多字节 token 抛 RangeError），
+    // 连接会既不 welcome 也不 error 地悬挂 —— 且异常点若在「注册进 roomSockets」
+    // 之前（鉴权就在注册之前），空闲清理定时器（只遍历 roomSockets）永远碰不到它，
+    // 未鉴权者即可无限堆积僵尸连接。这里统一：任何异常 → 拒绝握手（回 403 文案）
+    // → 主动关闭连接，绝不留悬挂 socket；服务端自身故障只进日志。
+    try {
+      if (!roomId) {
+        rejectHandshake(ws, 400, '缺少 roomId');
         return;
       }
 
-      // 与 HTTP /spectate 同一准入口径：席位不完整时拒绝，避免观战者进入「空局」
-      if (!hasCompleteSeating(room)) {
-        rejectHandshake(ws, 400, '对局已有玩家离开，观战已结束');
+      const room = rooms.get(roomId);
+      if (!room) {
+        rejectHandshake(ws, 404, '房间不存在');
         return;
       }
-      // 注册到连接池 + 观众列表（幂等 upsert，重连时续期）
-      if (!roomSockets.has(roomId)) roomSockets.set(roomId, new Set());
-      roomSockets.get(roomId)!.add(ws);
-      socketMeta.set(ws, { roomId, role, spectatorId, lastActivity: Date.now() });
 
-      pruneSpectators(room);
-      const existing = room.spectators.find(s => s.id === spectatorId);
-      if (existing) {
-        existing.lastSeen = Date.now();
+      if (role === 'spectator') {
+        // 观战者连接：仅对战中/已结束的房间可旁观（与 HTTP /spectate 保持一致）
+        if (!spectatorId) {
+          rejectHandshake(ws, 400, '缺少观战者标识');
+          return;
+        }
+        if (room.phase === 'waiting') {
+          rejectHandshake(ws, 400, '对局尚未开始，暂无法观战');
+          return;
+        }
+
+        // 与 HTTP /spectate 同一准入口径：席位不完整时拒绝，避免观战者进入「空局」
+        if (!hasCompleteSeating(room)) {
+          rejectHandshake(ws, 400, '对局已有玩家离开，观战已结束');
+          return;
+        }
+        // 注册到连接池 + 观众列表（幂等 upsert，重连时续期）
+        if (!roomSockets.has(roomId)) roomSockets.set(roomId, new Set());
+        roomSockets.get(roomId)!.add(ws);
+        socketMeta.set(ws, { roomId, role, spectatorId, lastActivity: Date.now() });
+
+        pruneSpectators(room);
+        const existing = room.spectators.find(s => s.id === spectatorId);
+        if (existing) {
+          existing.lastSeen = Date.now();
+        } else {
+          room.spectators.push({ id: spectatorId, name: '观众', lastSeen: Date.now() });
+        }
+        room.lastActivity = Date.now();
+
+        // 下发初始状态快照，随后广播观众人数变化
+        // 【P4】welcome 走**全量**载荷：观战者刚接入，必须拿到完整棋谱与 ruleState
+        //（其本地不重放对局，只靠服务端下发）
+        sendJson(ws, { type: 'welcome', data: buildFullGameStatePayload(room) });
+        broadcastRoom(room);
       } else {
-        room.spectators.push({ id: spectatorId, name: '观众', lastSeen: Date.now() });
-      }
-      room.lastActivity = Date.now();
+        // 玩家连接
+        // 【S-1 / §3.1】必须出示 sessionToken：改造前这里只校验「playerId 是否在房内」，
+        // 于是任何知道 roomId + playerId 的人都能建立一条"合法"玩家连接，
+        // 复位对方的 connected/lastHeartbeat/hidden，直接抵消断线判负倒计时，
+        // 并在随后的消息通道里以对方身份走棋、认输、同意悔棋。
+        if (!playerId) {
+          rejectHandshake(ws, 400, '缺少 playerId');
+          return;
+        }
+        if (!sessionToken) {
+          rejectHandshake(ws, 400, '缺少会话凭证');
+          return;
+        }
+        const player = findPlayerByToken(room, sessionToken);
+        if (!player) {
+          rejectHandshake(ws, 403, '身份校验失败，请重新进入房间');
+          return;
+        }
+        // 防御：token 与 playerId 指向不同成员时直接拒绝，避免出现"凭 A 的 token 报 B 的名"
+        if (player.id !== playerId) {
+          rejectHandshake(ws, 403, '身份校验失败，请重新进入房间');
+          return;
+        }
 
-      // 下发初始状态快照，随后广播观众人数变化
-      // 【P4】welcome 走**全量**载荷：观战者刚接入，必须拿到完整棋谱与 ruleState
-      //（其本地不重放对局，只靠服务端下发）
-      sendJson(ws, { type: 'welcome', data: buildFullGameStatePayload(room) });
-      broadcastRoom(room);
-    } else {
-      // 玩家连接
-      // 【S-1 / §3.1】必须出示 sessionToken：改造前这里只校验「playerId 是否在房内」，
-      // 于是任何知道 roomId + playerId 的人都能建立一条"合法"玩家连接，
-      // 复位对方的 connected/lastHeartbeat/hidden，直接抵消断线判负倒计时，
-      // 并在随后的消息通道里以对方身份走棋、认输、同意悔棋。
-      if (!playerId) {
-        rejectHandshake(ws, 400, '缺少 playerId');
-        return;
-      }
-      if (!sessionToken) {
-        rejectHandshake(ws, 400, '缺少会话凭证');
-        return;
-      }
-      const player = findPlayerByToken(room, sessionToken);
-      if (!player) {
-        rejectHandshake(ws, 403, '身份校验失败，请重新进入房间');
-        return;
-      }
-      // 防御：token 与 playerId 指向不同成员时直接拒绝，避免出现"凭 A 的 token 报 B 的名"
-      if (player.id !== playerId) {
-        rejectHandshake(ws, 403, '身份校验失败，请重新进入房间');
-        return;
-      }
+        // 注册到连接池
+        if (!roomSockets.has(roomId)) roomSockets.set(roomId, new Set());
+        roomSockets.get(roomId)!.add(ws);
+        socketMeta.set(ws, { roomId, role, playerId, sessionToken, lastActivity: Date.now() });
 
-      // 注册到连接池
-      if (!roomSockets.has(roomId)) roomSockets.set(roomId, new Set());
-      roomSockets.get(roomId)!.add(ws);
-      socketMeta.set(ws, { roomId, role, playerId, sessionToken, lastActivity: Date.now() });
+        // 恢复连接层在线标记：仅表示 socket 上线，不清除断线等待记录 ——
+        // 「重连成功」以玩家显式调用 POST /rooms/:id/reconnect（真正回到对局页面）为准，
+        // 避免 App 在后台 socket 自动重连时对端的断线倒计时被误取消
+        player.connected = true;
+        player.lastHeartbeat = Date.now();
+        player.lastWsAt = Date.now();
+        // 新连接建立：清掉上一次的后台标记（随后客户端心跳会按真实可见性重新上报）
+        player.hidden = false;
+        player.hiddenSince = 0;
+        room.lastActivity = Date.now();
 
-      // 恢复连接层在线标记：仅表示 socket 上线，不清除断线等待记录 ——
-      // 「重连成功」以玩家显式调用 POST /rooms/:id/reconnect（真正回到对局页面）为准，
-      // 避免 App 在后台 socket 自动重连时对端的断线倒计时被误取消
-      player.connected = true;
-      player.lastHeartbeat = Date.now();
-      player.lastWsAt = Date.now();
-      // 新连接建立：清掉上一次的后台标记（随后客户端心跳会按真实可见性重新上报）
-      player.hidden = false;
-      player.hiddenSince = 0;
-      room.lastActivity = Date.now();
-
-      // 下发初始状态快照，随后广播连接状态变化
-      // 【P4】welcome 走**全量**载荷：重连方（或首次进入）的客户端本地局面可能已过期，
-      // 必须拿到完整 moveHistory 才能重建棋谱（悔棋/复盘都依赖它）
-      sendJson(ws, { type: 'welcome', data: buildFullGameStatePayload(room) });
-      broadcastRoom(room);
+        // 下发初始状态快照，随后广播连接状态变化
+        // 【P4】welcome 走**全量**载荷：重连方（或首次进入）的客户端本地局面可能已过期，
+        // 必须拿到完整 moveHistory 才能重建棋谱（悔棋/复盘都依赖它）
+        sendJson(ws, { type: 'welcome', data: buildFullGameStatePayload(room) });
+        broadcastRoom(room);
+      }
+    } catch (err) {
+      // 兜底：握手主体任何异常都不得留下悬挂连接（见上）。发 error 帧（best effort，
+      // 发不出去也无妨）并强制关闭；close 会触发 handleDisconnect，把可能已写入的
+      // 半程状态（connected 标记、连接池条目）一并清理。
+      try {
+        sendJson(ws, { type: 'error', ...failBody(403, '身份校验失败，请重新进入房间') });
+      } catch {
+        /* 连接可能已不可写，忽略 */
+      }
+      console.error('[WS] 握手处理异常:', err instanceof Error ? err.message : err);
+      try {
+        ws.terminate();
+      } catch {
+        /* 忽略 */
+      }
+      handleDisconnect(ws);
+      return;
     }
 
     ws.on('pong', () => {

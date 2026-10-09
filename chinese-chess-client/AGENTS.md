@@ -83,19 +83,34 @@ pnpm lint      # = tsc --noEmit
 
 ```
 src/index.ts
-src/routes/{lanGame,ai,battleWs}.ts
-src/services/{pikafish,openingBook}.ts
+src/routes/{lanGame,battleWs}.ts
+src/routes/actionOutcome.ts
 ```
 
-历史上前身是「没有源码、只能手工往 dist 里打补丁」的部署产物，6 条加固由 `scripts/patch-dist.mjs`
-注入到产物里；**现在这 6 条加固都已归位到源码，`patch-dist.mjs` 已删除**：
+**服务端只承载在线对局**（房间、同步、权威裁决）。AI 走子完全在客户端本地跑
+（本地皮卡鱼 → 旧 TS AI 兜底），服务端不再有任何 AI 代码或引擎二进制
+（2026-10 去 AI 化：原 `src/routes/ai.ts`、`src/services/{pikafish,openingBook}.ts`
+与 `ai/` 目录均已移除，`/api/v1/ai/*` 返回 404）。
 
-1. 长将长捉超限不拦截落子、不按违规次数判负
-2. 畸形 FEN 行宽校验（进入 Pikafish WASM 前拦截）
-3. 初始局面上传收紧（仅房内玩家、且仅在本局尚无着法时可上传）
-4. 请求体驱动的终局副作用（与第 3 条同源，成对生效）
-5. 被拒绝的动作也回推权威状态（避免客户端停在乐观更新）
-6. 房间名最小空缺优先（自动房名复用被释放的编号）
+历史上前身是「没有源码、只能手工往 dist 里打补丁」的部署产物，加固由 `scripts/patch-dist.mjs`
+注入到产物里；**现在都已归位到源码，`patch-dist.mjs` 已删除**：
+
+1. 长将长捉「规则二强制变招」：达到阈值后再走超限着法即**禁着并提示**
+   （客户端 `lanBattle` 先拦一层，服务端 `getMoveBanReason` 权威裁决；两端同源），
+   且**不按违规次数判负**
+2. 初始局面上传收紧（仅房内玩家、且仅在本局尚无着法时可上传）
+3. 请求体驱动的终局副作用（与第 2 条同源，成对生效）
+4. 被拒绝的动作也回推权威状态（避免客户端停在乐观更新）
+5. 房间名最小空缺优先（自动房名复用被释放的编号）
+
+> 关于第 1 条的沿革：旧补丁的语义是「超限**不拦截**落子」，后被
+> commit 73d10ff「规则二强制变招」取代——现在**拦截**超限着法。两端共用同一份
+> `ruleEngine.cjs`，所以客户端先拦、服务端裁决，口径一致、不会出现
+> 「客户端让走、服务端拒绝」的割裂。回归断言见
+> `chinese-chess-server/scripts/verify-server-hardening.cjs` 场景 E。
+
+> 原第 2 条「畸形 FEN 行宽校验」随去 AI 化一并移除：它只存在于 `/api/v1/ai/move`
+> （防畸形 FEN 打崩 Pikafish WASM），而服务端现已无任何接收 FEN 的接口，校验失去守护对象。
 
 **改完源码必须重新构建：在 `chinese-chess-server/` 下执行 `node build.js`。**
 闸门挂在以下环节，`dist` 与 `src/` 不一致时会立刻以非零退出失败（CI 调用任一即可阻塞流水线）：

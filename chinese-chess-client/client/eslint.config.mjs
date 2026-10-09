@@ -25,6 +25,11 @@ export default [
       'eslint.config.*',
       'metro.config.*',
       './scripts/**',
+      // 皮卡鱼引擎**源**二进制 —— 由上游 Emscripten 生成的产物（2026-10 从服务端迁来）
+      //    它不是本项目手写代码，内含大量上游风格（require/__dirname/process、
+      //    TODO 注释、非本项目正则习惯）。对其套用本仓库规则会产生上百条无意义报错，
+      //    且修改它会破坏引擎行为与 sha256 一致性。构建产物由 gen-pikafish-host.mjs 生成。
+      'engine-source/**',
     ],
   },
   regexp.configs["flat/recommended"],

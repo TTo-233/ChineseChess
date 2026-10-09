@@ -74,3 +74,4 @@ export function getValidMoves(state: GameState, pieceId: number): boolean[][] {
  * 服务端业务代码**不得**用它做走法合法性校验（那正是 4ccdae5 之后的漏洞）。
  */
 export const getSelectableMovesForParity = getRawValidMoves;
+

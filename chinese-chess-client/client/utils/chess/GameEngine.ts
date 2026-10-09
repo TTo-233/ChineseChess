@@ -159,7 +159,7 @@ export function getValidMoves(state: GameState, pieceId: number): boolean[][] {
  * 该判据直接复用 afterMoveStillJiangJun —— 与 hasAnyLegalMove / isJueSha /
  * isKunBi 以及 AIEngine 的 isSideInCheck 完全同一口径，保证：
  *   盘上永远不会出现"该方被将且轮到该方"的局面，绝杀/困毙判定与引擎搜索一致，
- *   在线引擎也不会再收到它拒绝重放的历史（见 buildEngineHistory）。
+ *   引擎也不会再收到它拒绝重放的历史（见 buildEngineHistory）。
  *
  * 四类必须拦截的情况（均有单测覆盖，见 __tests__/songjiang.test.ts）：
  *   1. 暴露阻挡：移开挡在己方将/帅与敌子之间的子（discovered check）；
@@ -815,20 +815,21 @@ export function buildEngineHistory(state: GameState): { startFen: string; moves:
 }
 
 /**
- * 从历史起点逐步重放，求「最长的引擎可重放片段」并组装在线引擎请求载荷。
+ * 从历史起点逐步重放，求「最长的引擎可重放片段」并组装引擎请求载荷。
  *
- * ⚠️ 这是「明明网络正常却全程走本地 AI」的**第二根因**（第一根因是 undoInPlace 的
- * 回退缺陷，已修）。机制如下：
+ * ⚠️ 这段推理原本针对「在线引擎」：客户端的走法生成 `getSelectableMoves`
+ *   **故意不过滤**「走完后己方将/帅仍被攻击（含照面/飞将段）」——这是产品语义
+ *   （允许玩家主动送将、照面），见本文件 isJiangJun 上方注释与
+ *   MoveCheck.afterMoveStillJiangJun 注释。而皮卡鱼的
+ *   `position fen <startFen> moves ...` 重放**会**过滤这条：一旦某步走完己方仍被将，
+ *   引擎就拒绝应用该步，棋盘永远停在上一步（K-1）。于是：
+ *   · 引擎会在「错误的局面」上搜索，返回的着法往往不适用于当前局面；
+ *   · 这类走法被 aiDispatcher 的守卫（isMoveKingSafe 等）静默拒掉 → 回落兜底 AI，
+ *     而界面与日志都不报错，表现为「引擎明明在跑、棋却很弱」。
  *
- * 客户端的走法生成 `getSelectableMoves` **故意不过滤**「走完后己方将/帅仍被攻击
- * （含照面/飞将段）」——这是产品语义（允许玩家主动送将、照面），见本文件 isJiangJun
- * 上方注释与 MoveCheck.afterMoveStillJiangJun 注释。而皮卡鱼的
- * `position fen <startFen> moves ...` 重放**会**过滤这条：一旦某步走完己方仍被将，
- * 引擎就拒绝应用该步，棋盘永远停在上一步（K-1）。于是：
- *   · 后续所有着法都在错误局面上产生 → 客户端本地守卫（isOnlineMoveLegal /
- *     isOnlineMoveRuleSafe）逐条静默拒掉 → 每步都回落本地 AI；
- *   · 这类失败被记为 OnlineAiInvalidMoveError，**既不熔断也不重试**，
- *     getOnlineAiStatus() 仍返回 'online'，用户只看到「一直本地AI」而没有「重连中」。
+ * ⚠️ 2026-10 服务端去 AI 化后，本函数**仍被本地引擎使用**（offlineAiAdapter 传历史
+ *   给本地皮卡鱼），因此上述判断与自检逻辑全部保留，只是作用对象从"云端引擎"
+ *   变成了"本地引擎"——问题本质（引擎重放口径严于客户端着法生成）完全一样。
  *
  * 实测（_review/probe_pikafish_selfcheck.cjs，12/12 断点，且引擎 `go perft 1`
  * 均不收录该着法）：每个断点都恰好是「走完该步后己方仍被将」；在生成对局时加上

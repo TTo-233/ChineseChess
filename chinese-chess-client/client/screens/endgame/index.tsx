@@ -43,6 +43,7 @@ import {
   type EndgameLaunchParams,
 } from '@/utils/EndgameProgress';
 import { FONT } from '@/utils/typography';
+import { getPikafishTier, ENDGAME_AI_TIER } from '@/utils/chess/pikafishDifficulty';
 import {
   TITLE_BAR_PADDING_HORIZONTAL,
   TITLE_BAR_PADDING_VERTICAL,
@@ -69,7 +70,8 @@ const CROWN_COLORS = {
   bronze: '#B5763A',
 } as const;
 
-// 残局分档角标配色：入门最浅，越往后越重，与「大师级 AI + 皇冠评级」的调性一致
+// 残局分档角标配色：入门最浅，越往后越重，与「皇冠评级」的调性一致
+// （AI 档位由 ENDGAME_AI_TIER 决定，见 utils/chess/pikafishDifficulty）
 const TIER_COLORS: Record<EndgameTier, { bg: string; text: string }> = {
   入门: { bg: '#E8F0E4', text: '#4A7A3F' },
   进阶: { bg: '#F5EBD8', text: '#8A6212' },
@@ -78,10 +80,11 @@ const TIER_COLORS: Record<EndgameTier, { bg: string; text: string }> = {
 };
 
 // 玩法说明（标题行右侧标识点击后弹窗展示）
+// AI 难度文案与 game 屏实际档位同源（ENDGAME_AI_TIER），改档位时这里自动跟着变
 const RULE_LINES = [
   '从第 1 关开始依次解锁，必须从第一关开始闯关',
   '共 100 关，已按实测难度由易到难排序：入门 → 进阶 → 经典 → 其他，各 25 关，卡片左上角标即分档',
-  '大师级 AI 难度，红方先行',
+  `${getPikafishTier(ENDGAME_AI_TIER).label} AI 难度，红方先行`,
   '对局中禁止使用翻转',
   '每关限 3 次提示，次数用尽后按钮不可用',
   '通关评级：0 次提示金冠 · 1 次银冠 · 其余铜冠',

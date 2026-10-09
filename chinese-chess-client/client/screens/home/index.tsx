@@ -21,6 +21,7 @@ import { loadProgress } from '@/utils/EndgameProgress';
 import { BUILTIN_ENDGAMES } from '@/utils/chess/endgames';
 import { preloadChessAssets } from '@/utils/preloadAssets';
 import { FONT } from '@/utils/typography';
+import { getPikafishTier, ENDGAME_AI_TIER } from '@/utils/chess/pikafishDifficulty';
 
 // 主题色 - 浅色复古系
 const COLORS = {
@@ -159,7 +160,8 @@ export default function HomeScreen() {
             <View style={styles.entryInfo}>
               <Text style={styles.entryTitle}>残局闯关</Text>
               <Text style={styles.entryDescription}>
-                已通过 {endgamePassed}/{BUILTIN_ENDGAMES.length} 关 · 大师难度
+                {/* 难度文案与 game 屏实际使用的档位同源（ENDGAME_AI_TIER），不再硬编码 */}
+                已通过 {endgamePassed}/{BUILTIN_ENDGAMES.length} 关 · {getPikafishTier(ENDGAME_AI_TIER).label}难度
               </Text>
             </View>
             <FontAwesome6 name="chevron-right" size={16} color={COLORS.textMuted} />

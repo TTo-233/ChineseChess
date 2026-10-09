@@ -221,8 +221,8 @@ export default function PveSetupScreen() {
               </TouchableOpacity>
             ))}
           </View>
-          <Text style={styles.hybridHint}>
-            联网挑战皮卡鱼，无网砍瓜又切菜
+          <Text style={styles.engineHint}>
+            皮卡鱼引擎内置在本机运行，断网也能用，棋力不受网络影响
           </Text>
         </View>
 
@@ -361,7 +361,8 @@ const styles = StyleSheet.create({
     color: COLORS.textMuted,
     opacity: 0.7,
   },
-  hybridHint: {
+  // 引擎说明文案的样式（旧名 hybridHint 来自已删除的"混合调度/联网兜底"体系）
+  engineHint: {
     marginTop: 12,
     fontSize: FONT.caption,
     lineHeight: 18,

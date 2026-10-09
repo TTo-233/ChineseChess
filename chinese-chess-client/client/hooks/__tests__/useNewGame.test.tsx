@@ -30,7 +30,8 @@ const mockCreateFromFen = jest.fn();
 const mockComputeZobristHash = jest.fn();
 const mockClearHistoryHash = jest.fn();
 const mockRecordHistoryHash = jest.fn();
-const mockPrecomputeHint = jest.fn();
+const mockPrecomputeOfflineHint = jest.fn();
+const mockNotifyOfflineNewGame = jest.fn();
 
 jest.mock('@/utils/chess/GameEngine', () => ({
   createInitialState: (...args: unknown[]) => mockCreateInitialState(...args),
@@ -41,7 +42,15 @@ jest.mock('@/utils/chess/AIEngine', () => ({
   computeZobristHash: (...args: unknown[]) => mockComputeZobristHash(...args),
   clearHistoryHash: (...args: unknown[]) => mockClearHistoryHash(...args),
   recordHistoryHash: (...args: unknown[]) => mockRecordHistoryHash(...args),
-  precomputeHint: (...args: unknown[]) => mockPrecomputeHint(...args),
+}));
+
+// ⚠️ 提示预计算已从「旧 TS AI」迁到「本地皮卡鱼」（2026-10 审计 P1-8：
+//    useNewGame 仍在调 AIEngine.precomputeHint，而提示早已改由本地引擎出，
+//    那条链路的跑分结果不会被消费，只白占主线程）。
+// 这里 mock 的是新的 offlineAiAdapter 入口。
+jest.mock('@/utils/chess/offlineAiAdapter', () => ({
+  precomputeOfflineHint: (...args: unknown[]) => mockPrecomputeOfflineHint(...args),
+  notifyOfflineNewGame: (...args: unknown[]) => mockNotifyOfflineNewGame(...args),
 }));
 
 /** 引擎只需返回一个可写的占位局面 */
@@ -105,7 +114,8 @@ beforeEach(() => {
   mockComputeZobristHash.mockReset().mockReturnValue('HASH');
   mockClearHistoryHash.mockReset();
   mockRecordHistoryHash.mockReset();
-  mockPrecomputeHint.mockReset();
+  mockPrecomputeOfflineHint.mockReset();
+  mockNotifyOfflineNewGame.mockReset();
 });
 
 describe('模块级建局面纯函数', () => {
@@ -193,7 +203,7 @@ describe('startNewGame', () => {
     it('玩家先走：后台预计算提示，不排 AI 走子', () => {
       const args = makeArgs();
       mountHook(args).api.startNewGame(standard);
-      expect(mockPrecomputeHint).toHaveBeenCalledTimes(1);
+      expect(mockPrecomputeOfflineHint).toHaveBeenCalledTimes(1);
       expect(args.scheduleAIMove).not.toHaveBeenCalled();
     });
 
@@ -203,7 +213,7 @@ describe('startNewGame', () => {
       api.startNewGame({ ...standard, aiFirst: true });
       expect(args.scheduleAIMove).toHaveBeenCalledTimes(1);
       expect(args.scheduleAIMove).toHaveBeenCalledWith(expect.objectContaining({ id: 'initial' }));
-      expect(mockPrecomputeHint).not.toHaveBeenCalled();
+      expect(mockPrecomputeOfflineHint).not.toHaveBeenCalled();
     });
   });
 
@@ -253,7 +263,7 @@ describe('startNewGame', () => {
       const args = makeArgs();
       mountHook(args).api.startNewGame({ ...standard, endgameFen: fen, aiFirstByFen: true });
       expect(args.scheduleAIMove).toHaveBeenCalledTimes(1);
-      expect(mockPrecomputeHint).not.toHaveBeenCalled();
+      expect(mockPrecomputeOfflineHint).not.toHaveBeenCalled();
     });
 
     it('aiFirstByFen：FEN 走棋方为红（w）时玩家先走', () => {
@@ -263,7 +273,7 @@ describe('startNewGame', () => {
         endgameFen: fen.replace(' b ', ' w '),
         aiFirstByFen: true,
       });
-      expect(mockPrecomputeHint).toHaveBeenCalledTimes(1);
+      expect(mockPrecomputeOfflineHint).toHaveBeenCalledTimes(1);
       expect(args.scheduleAIMove).not.toHaveBeenCalled();
     });
 
@@ -288,7 +298,7 @@ describe('startNewGame', () => {
       const args = makeArgs();
       mountHook(args).api.startNewGame({ ...standard, aiFirst: false, aiFirstByFen: true });
       expect(args.scheduleAIMove).not.toHaveBeenCalled();
-      expect(mockPrecomputeHint).toHaveBeenCalledTimes(1);
+      expect(mockPrecomputeOfflineHint).toHaveBeenCalledTimes(1);
     });
   });
 
