@@ -165,47 +165,72 @@ switch (moveQiZi) {
 | 服务端必须维护 `占位 id → 真实 id` 映射 | `room.jieqiSecret.identity: number[]`（下标=占位 id，值=真实 id） |
 | 棋子贴图会显示成「占位类型」 | `ChessBoard` 新增 prop，暗子改渲染背面图（见 §8） |
 
-#### ⚠️ 占位 id 的生命周期（本方案最易实现错的一处）
+#### ⚠️ 占位 id 的生命周期（本方案最易实现错的一处，已在实现中被实测推翻并修正）
 
 关键约束：`pieces` 是**固定 32 格、以 id 为下标**的数组（`pieces[id].id === id`），
-棋盘 `qiPan` 里存的也是 id。所以「占位 id」与「真实 id」**共用同一个 32 格命名空间**，不能并存。
+棋盘 `qiPan` 里存的也是 id。而「占位 id」与「真实 id」**是同一套 1–15 / 17–31**。
 
-本方案采用**占位即退役**制：
+> **🔴 实测结论（2026-10，实现阶段推翻本节原设计）**
+>
+> 原设计为「占位即退役」：揭开时退役占位 id、升起真实 id。**该设计在本仓库不可行。**
+>
+> 实测：任一初始局面下，**30 枚暗子的真实身份无一例外落在另一个仍在盘上的暗子的
+> 占位 id 上**（id 集合完全重合，碰撞率 30/30，与种子无关）。
+> 也就是说「升起真实 id」必然撞车并破坏 `pieces[id].id === id` 的下标语义 ——
+> 即棋盘上会出现两枚子共享同一 id、将帅判定与崩溃防护全部失真。
+>
+> 参照实现（`lichlzh/pikafish-jieqi` 的 `core/position.cpp`）正是因此**从不换 id**：
+> 它按格存储棋种，另用 `hidden_[square]` 平行数组记录「该格背面朝上」，
+> 有效棋种由 `effectiveTypeAt(square)` 解析。**本方案改为与之同构。**
+
+**修正后的设计：盘面 id 永不改变，只额外记录「已翻开的真实棋种」。**
 
 ```
-揭开瞬间（在 makeMove 内）：
-  占位 23（实际是兵）的格子 → 退役 pieces[23]（alive=false）
-  同一格        → 升起   pieces[27] = {col,row,alive:true}
-  hiddenMask[27] = false（真实 id 本来就未标隐藏，无需翻转）
+GameState 新增两个与 id 平行、长度 32 的数组：
+  hiddenMask[id]    = true  → 该子当前背面朝上（未翻开）
+  revealedType[id]  = 棋种  → 该子已翻开，值即其真实身份；null = 未翻开
+
+走法/攻击一律按「有效棋种」解析（jieqi.ts 的 effectiveTypeOf / effectiveIdOf）：
+  未翻开暗子 → 用 id 自身的棋种（= 所在棋位的棋种）  ← 规则 2「暗子按棋位走」
+  已翻开     → 用 revealedType[id] 的真实棋种
+
+揭开瞬间（makeMove 内）只有两次字段写入，不碰 pieces：
+  revealedType[pieceId] = identity.hiddenType[pieceId]
+  hiddenMask[pieceId]   = false
+  moveHistory 追加 { pieceId, revealedType }   // 供 UI 动画与精确 undo
 ```
 
-这样做的好处是**揭开之后全局再无特殊处理**：该子从此就是个普通的、
-带真实 id 的明子，`calcShi`/`calcXiang`/`PIECE_VALUES`/将军判定/UI 全部沿用现有逻辑。
+由此得到的四条不变式：
 
-必须随之满足的三条不变式：
+1. **盘面 id 恒定**：`qiPan` 里的值与 `pieces` 下标永远一致（回归测试
+   `jieqiSetup.test.ts` 的「id 冲突回归」用例钉死，翻开前后 `pieces[].id` 序列全等）；
+2. **无需槽位预算**：不存在命名空间耗尽，原 §`jieqiSlotBudget` 一节作废；
+3. **悔棋天然正确**：`undo` 只需把 `revealedType` 写回 `null`、`hiddenMask` 写回 `true`，
+   没有置换需要复原；
+4. **同棋种等价**：`effectiveIdOf` 把真实棋种映射到**该方同类棋子的代表 id**
+   （车→车、马→马…），同类走法与攻击范围完全一致，故取哪一个都一样；
+   卒/兵分属两方，故映射按方进行。
 
-1. **任一时刻不存在两个活子共用同一 id**；
-2. `hiddenMask[retiredId]` 一并清 `false`（占位退役后棋盘上已无该 id）；
-3. 退役格复用现有 R-2 崩溃防护路径（`pieces[i] = {col:-1,row:-1,alive:false}`）
-   ——`isJiangJun` 与 `afterMoveStillJiangJun` 都有缺席子防护，新机制复用即可。
+> 代价：已翻开的子不能沿用「真实 id」路径，而是多一次查表。
+> 这是可接受的 —— 揭棋的 AI 与 UI 都需要按棋种渲染，本来就要查。
 
 #### ⚠️ 暗子**不是**攻击者（与直觉相反，必须显式实现）
 
 **未翻开的暗子不能将军。** 理由：暗子只有移动才会翻开，而移动前它从未动过，
 不可能产生攻击。因此攻击扫描必须**跳过 `hiddenMask[id] === true` 的子**。
 
-这与「暗子按占位 id 的走法」是两件独立的事：
+这与「暗子按棋位棋种走法」是两件独立的事：
 
 | | 走法（能否动、往哪走） | 攻击（是否算将军） |
 | --- | --- | --- |
-| 未翻开的暗子 | 按**占位 id**（= 位置型） | **不攻击** —— 必须跳过 |
-| 已翻开的子 | 按**真实 id** | 正常攻击 |
+| 未翻开的暗子 | 按**所在棋位的棋种** | **不攻击** —— 必须跳过 |
+| 已翻开的子 | 按**真实棋种** | 正常攻击 |
 
-因此 `isJiangJun`（`GameEngine.ts:245-268`）与 `afterMoveStillJiangJun`（`MoveCheck.ts:408-429`）
+因此 `isJiangJun`（`GameEngine.ts`）与 `afterMoveStillJiangJun`（`MoveCheck.ts`）
 **都要拿到 `hiddenMask` 并跳过暗子**。前者是纯 `GameEngine` 改动；
 后者需要给 `fillPathPoints`/`afterMoveStillJiangJun` **加参数**（`piecePositions` 已经是
 只含 `{col,row,alive}` 的瘦结构，正好追加一个 `hidden: boolean` 字段即可，
-调用点：`GameEngine.ts:188`、`AIEngine.ts` 的 `generatePseudoMoves` 及其评估路径 —— 需逐一核对）。
+调用点：`GameEngine.ts`、`RuleEngine.ts` 的攻击图构建路径 —— 需逐一核对）。
 
 > ⚠️ 这一条若漏实现，后果是**开局即白脸将判负**：占位「车」在底线与对方将帅照面，
 > 会被 `afterMoveStillJiangJun` 判成飞将，把所有合法着法全部判非法。
@@ -258,11 +283,10 @@ export type GameVariant = 'xiangqi' | 'jieqi';
 ```ts
 /** 服务端私有：暗子真相（room.jieqiSecret，绝不序列化） */
 interface JieqiSecret {
-  /** identity[占位 id] = 该暗子的真实棋子 id；仅当 hiddenMask[id] 为 true 时有意义。
-   *  暗子揭开后该占位 id 即退役（真实 id 换 id 顶上），故此表只存「未翻开暗子」的真相。 */
-  identity: number[];
-  /** 已用于「吃暗子升新暗子」的占位 id 栈（实现 §5.4 的槽位复用） */
-  freeSlots: number[];
+  /** hiddenType[占位 id] = 该暗子的真实**棋种**；仅当 hiddenMask[id] 为 true 时有意义。
+   *  已翻开的子其真相已写入 GameState.revealedType，故此表只存「未翻开暗子」的真相。
+   *  ⚠️ 存棋种而非 id —— 理由见 §3.1「实测结论」，id 方案会 30/30 撞车。 */
+  hiddenType: (JieqiPieceType | null)[];
   /** 初始摆子的随机种子（用于复盘还原；不外发） */
   seed: number;
 }
@@ -282,15 +306,18 @@ interface JieqiPublicSetup {
 
 ```ts
 export interface MoveRecord {
-  pieceId: number;  // 标准象棋 = 真实 id；揭棋 = 真实 id（权威层），公开层另存
+  pieceId: number;  // 标准象棋 = 真实 id；揭棋 = 盘面 id（**不因翻开而变**，见 §3.1）
   // ... 现有 5 个字段不动
-  /** 该手是否为暗子移动（走完自动翻开） */
-  flippedPieceId?: number;
+  /** 该手若「走子即翻开」，记下翻开后的真实**棋种**；undefined = 未翻开 */
+  revealedType?: JieqiPieceType;
 }
 ```
 
-`flippedPieceId` 供**客户端动画**使用：「哪个子翻开成什么字」。
-注意它**必须只包含公开可见的信息**——即翻开后的真实身份本来就是公开的，所以安全。
+`revealedType` 供**客户端动画**使用：「哪个子翻开成了什么字」。
+注意它**只包含公开可见的信息** —— 翻开后的棋子本来就是明子，所以安全。
+
+由于 `pieceId` 在揭棋下**不因翻开而改变**，历史可完整重放，
+`undo` 也只需把 `revealedType` 写回 `null`（无置换需要复原）。
 
 ### 4.4 暗子占位 id 的映射表
 
@@ -307,8 +334,9 @@ export interface MoveRecord {
 | 九宫正中 | 1 | 帅 `16` / 将 `0` ——**明子，不参与洗牌** |
 
 > 注：上表 id 同时也是这些格子上「真实身份恰好相同」时的标准 id。
-> 由于采用**占位即退役**制（§3.1），占位 id 只需在暗子存续期间写在盘上；
-> 揭开后该 id 退役、真实身份占位顶上，故两种 id 在同一时刻不会并存于同一格。
+> 由于**盘面 id 永不改变**（§3.1 修正后的设计），上表 id 从开局到终局一直写在盘上，
+> 身份变化只反映在 `revealedType` 上。故不存在「两种 id 并存」的问题，
+> 也不存在槽位预算/耗尽。
 
 ---
 
@@ -321,37 +349,43 @@ export interface MoveRecord {
 现有 `calcXiang`（`MoveCheck.ts:199`）用行带判河界；`calcShi`（`:223`）锁九宫。
 揭棋下，**已翻开的**士/象放宽。
 
-**由于「占位即退役」制（§3.1），揭开后的子带真实 id，且 `hiddenMask` 为 `false`** ——
-所以这两个函数只需要在「当前子不是暗子」时走放宽分支。改法很轻：
+**由于盘面 id 永不改变（§3.1 修正后的设计），只有「已翻开」的子需要按真实棋种走**。
+放宽条件因此是 `variant === 'jieqi' && 该子已翻开 && 真实棋种 ∈ {士, 象}`：
 
-- `calcShi`：放宽条件 = `variant === 'jieqi' && !hiddenMask[moveQiZi]`；
-- `calcXiang`：同理。
+- `calcShi` / `calcXiang`：接收调用方算好的 `crossRiver` 布尔量；
+- 该量由 `jieqi.ts` 的 `crossRiverOf(state, id)` 给出：
+  象棋恒 `undefined`（新分支永不进入），未翻开暗子给 `false`（不享放宽），
+  已翻开的士/象给 `true`。
 
-由 `fillPathPoints` 按 `variant` + `hiddenMask[moveQiZi]` 传入。
+> 注：未翻开的暗子**不享**过河放宽，这与规则原文「揭开后的士、象可以过河」一致；
+> 回归用例见 `jieqiVariantIsolation.test.ts` 的对照组。
+
+由 `fillPathPoints` 把 `crossRiver` + `effectiveId` 一起传给分支函数。
 
 > ⚠️ 这是本方案**唯一**触碰三端唯一真源文件的地方。
 > `MoveCheck.ts` 现有分支的输出**必须逐点不变**（由 §12 的 `jieqiVariantIsolation` 回归铁闸钉死）。
 
 ### 5.2 `GameEngine.makeMove` —— 走子即翻开（核心改动点）
 
-现有 `makeMove`（`GameEngine.ts:436-534`）里追加揭棋分支：
+现有 `makeMove`（`GameEngine.ts`）里追加揭棋分支：
 
 ```ts
-// 揭棋：暗子移动后自动翻开（占位即退役制，见 §3.1）
-// 1. makeMove 入口读 state.hiddenMask[pieceId]
-//    · true  → 走法校验用【占位 id】(qiPan 上已经是它，走法天然正确)
-//              落子后：退役 pieces[pieceId]、按真实身份升起新 piece
+// 揭棋：暗子移动后自动翻开（见 §3.1）
+// 1. 入口读 state.hiddenMask[pieceId]
+//    · true  → 走法按盘面 id（= 棋位棋种），走法校验天然正确
+//              落子后 revealedType[pieceId] = identity.hiddenType[pieceId]
+//                       hiddenMask[pieceId]   = false
 //    · false → 完全走现有逻辑
-// 2. newState.hiddenMask[newPieceId] = false
-// 3. moveHistory 记 flippedPieceId（= 退役的占位 id），客户端据此播翻开动画
+// 2. moveHistory 记 revealedType，客户端据此播翻开动画
 ```
 
-**关键不变式**：`qiPan` 上写的**始终是「当前生效 id」**——
-暗子阶段写占位 id，翻开后写真实 id。这样 `getPathPoints`、`isTongBang`、UI 渲染
-全都自动正确，无需任何一处知道「真实身份」的存在。
+**关键不变式**：`qiPan` 上写的**始终是同一个 id**（从头到尾不变），
+`pieces` 的下标语义与 `pieces[id].id === id` 全部保持。
+身份变化只落在 `revealedType` 这一层，故 `getPathPoints`、`isTongBang`、UI 渲染
+都无需知道「真实身份」的存在 —— 只有走点派发与棋种渲染需要查 `revealedType`。
 
-**注意 `moveHistory` 的语义扩展**：`pieceId` 字段对暗子记的是**占位 id**。
-标准象棋下该字段不变（无 `variant` 即无占位），故历史兼容。
+**被吃暗子（决策 A）**：只置 `alive=false`；揭棋下额外把 `col/row` 置 `-1`
+使其成为「缺席子」，真实身份**不写入任何公开字段**（铁律 A）。
 
 ### 5.3 `RuleEngine.positionKey` —— 局面指纹要含暗子态
 
@@ -373,27 +407,30 @@ const key = base + (state.variant === 'jieqi' ? hiddenBitmap(state.hiddenMask) :
 只需再补「暗子的真实身份分布」——由于洗牌均匀随机，同一可见局面下的身份分布可由
 「已翻开集合 + 剩余身份多重集」完全确定，故位图已足够，无需把真实身份写进指纹。
 
-### 5.4 暗子被吃的处理
+### 5.4 暗子被吃的处理（决策 A：吃子方不获得新子）
 
-吃暗子的一方拿到的是一枚**背面朝上的新暗子**：
+> **本节已按 §14 决策 #2（选项 A）定稿**，并已对照参考实现 `core/position.cpp`
+> 与腾讯规则页核实：`makeMove` 只把身份从 `pool_` 移入 `capturedDarkPool_`，
+> **吃子方不会获得任何新棋子**；规则只规定「输的一方看不到被吃暗子的身份」，
+> 从未提及吃子方补子。
 
-1. 被吃子置 `alive = false`；其真实身份回收进服务端身份池（**不外发**）；
-2. 吃子方升起一枚**新的暗子占位 id**，放在吃子方阵营内、`hiddenMask[newId] = true`；
-3. `jieqiSecret.identity[newId] = 从池中取出的一枚未使用真实身份`（`newId` 必须取自 `freeSlots` 退役栈）；
-4. 该新暗子的**占位 id 按 §5.5 的规则由落点决定**。
+吃暗子时：
 
-> 因为「暗子移动即翻开」，新暗子**只会在落点原地待着**，直到某一方移动它。
-> 所以「落点决定类型」的映射只需覆盖**己方阵营内的格子**（§5.5）。
+1. 被吃子置 `alive = false`；揭棋下额外把 `col/row` 置 `-1`（成为「缺席子」）；
+2. 其真实身份**对双方都不可见**，不写入任何公开字段（铁律 A 无例外）；
+3. **棋盘上直接少一枚，不补新暗子。**
 
-**32 格命名空间够用吗？** 每方最多 15 次「吃暗子升新暗子」。
-按占位退役制实现时，退役的是**占位 id**（可安全复用），而**真实 id 一旦升起就永久占用**。
-单方真实 id 上限 = 初始明子 1（将/帅）+ 15 次揭示 = 16，叠加对方 16 = **32，刚好用尽**。
+因此：
 
-> ⚠️ 实现必须**精确复用退役的占位 id**，绝不能再申请新格；
-> 且在 `hiddenMask[newId] = true` 之前要断言该格已退役且 `hiddenMask` 为 `false`。
-> 该断言进 §12 的槽位耗尽用例。
+- **32 格命名空间恒够用**，无需槽位预算与耗尽处理（原「槽位耗尽」一节作废）；
+- 被吃暗子的身份进入一个**只增不减的未知余量**：AI 的后验分布按
+  「初始多重集 − 已翻开集合」计算，被吃的那部分整体作为余量（见 §9.3）；
+- 无需 `freeSlots` 退役栈。
 
-### 5.5 被吃暗子落在己方阵营后，按哪种子力走？（**已定稿**）
+### 5.5 被吃暗子落在己方阵营后，按哪种子力走？（**决策 A 下不适用**）
+
+> 决策 A 确定吃子方不获得新暗子，故「落点决定占位棋种」的映射**不再需要**。
+> 本节保留仅为记录历史决策，**实现时不要照此编写**。
 
 这是揭棋规则里**唯一没有权威统一表述**的细节。两个官方规则文本都没写。
 本方案提议的默认约定（按**列**映射，与底线棋子类型一致，且把中路留给兵）：
@@ -404,7 +441,8 @@ const key = base + (state.variant === 'jieqi' ? hiddenBitmap(state.hiddenMask) :
 
 理由：① 覆盖全部 9 列；② 九路正中已被帅/将占据，不会与暗子冲突；③ 与「中路是兵道」的棋理直觉一致。
 
-✅ **已定稿**（§14 决策 #2）：按此表实现。若日后要改，只改这一张表。
+> ⛔ **决策 A 下本表不再实现**（吃子方不获得新暗子，故没有「落在己方阵营的新暗子」）。
+> 保留仅为记录，**不要照此编写代码**。
 
 ### 5.6 终局判定
 
@@ -426,7 +464,7 @@ const key = base + (state.variant === 'jieqi' ? hiddenBitmap(state.hiddenMask) :
 | `PATCH /settings`（`:1189`） | 同上，仅房主 + 仅 waiting |
 | `startPlayingRoom`（`:795`） | **唯一初始局面收口点**：`variant === 'jieqi'` 时走 `createJieqiInitialState(secret)`，否则走现有 `createInitialState` |
 | `actSide`（`:1277`） | 揭棋房**拒绝让子**（与现有让子房同款处理：`handicap` 非空即 400） |
-| `actMove`（`:1468`） | 揭棋分支：走法校验用**占位 id**（盘上就是它），落子时按退役/升起两段揭示身份 |
+| `actMove`（`:1468`） | 揭棋分支：走法按**盘面 id**（未翻开=棋位棋种），落子时写入 `revealedType` 完成翻开 |
 
 ### 6.2 初始摆子算法（`createJieqiInitialState`）
 
@@ -489,7 +527,7 @@ export function publicGameState(room: Room): Record<string, unknown>;
 
 现有 `BattleMove = { pieceId, toCol, toRow }`（`battleProtocol/types.ts:52`）。
 揭棋下客户端发的 `pieceId` 就是**盘上的占位 id**——它本来就是客户端唯一知道的东西。
-服务端拿到后按占位 id 校验走法，再按退役/升起两段揭示身份。
+服务端拿到后按盘面 id 校验走法，落子时写入 `revealedType` 完成翻开。
 
 **这是 §3.1 设计的直接红利：协议零改动，且客户端天然无法伪造身份。**
 
@@ -535,48 +573,118 @@ interface GameStatePayload {
 
 ### 8.1 路由与页面
 
+> 📌 **最终落地（2026-10 产品调整）：揭棋没有独立页，入口并入人机对战设置页。**
+> 见下方 8.1.1。下面这段是**原方案**，保留它只为记录决策沿革。
+
 ```
-client/app/jieqiSetup.tsx        → screens/jieqiSetup   （揭棋人机设置：难度/执棋方/先后手）
-client/app/jieqiGame.tsx         → screens/jieqiGame    （揭棋对局）
+client/app/jieqiSetup.tsx        → screens/jieqiSetup   （揭棋人机设置：难度/执棋方）
+                                     对局页复用 screens/game（传 variant=jieqi）
 ```
 
-在 `app/_layout.tsx` 的 `<Stack>` 里加两行（该文件 `:38-47`）。
-首页 `screens/home/index.tsx` 加一张入口卡片，沿用现有 `pushOnce` 800ms 防连点锁（`:56-61`）。
+> 📌 **实施修正：没有 `jieqiGame` 页，对局复用 `screens/game`。**
+> 原方案列了两页，但揭棋与象棋在对局页的交互模型完全一致
+> （选中/落子/吃子特效/悔棋/重开/换边/终局/规则提示/音效，一样不缺）。
+> 复制一份 1400 行的对局页只会制造**两套必然漂移的实现** ——
+> 而「同一语义多处实现，改一处漏一处」正是本仓库 `CODE_AUDIT.md §8` 记的失效模式。
+> 故改为给 `screens/game` 加 `variant` 开关：
+> - `params.variant === 'jieqi'` ⇒ 建揭棋局面、身份表进 `ref`；
+> - 身份表**不进 `GameState`**，故 `makeMove` 的第 5 参从 ref 取；
+> - 复盘按 §10 跳过（揭棋不支持复盘；续局已在后续任务中支持）。
+
+#### 8.1.1 入口合并到人机对战（最终形态）
+
+首页只剩**一张**「人机对战」入口卡片；揭棋不再单独占一张。
+进入 `screens/pveSetup` 后，第一行是「选择模式」：
+
+| 模式 | 差异 |
+| --- | --- |
+| **象棋** | 有「选择先后手」区；引擎文案讲皮卡鱼；无玩法说明标识 |
+| **揭棋** | **隐藏**「选择先后手」（红先由执棋方唯一决定）；标题右侧挂 (i) 玩法说明；引擎文案讲内置 AI 与暗子身份估算；底部补一行「与象棋各自保存一局、暂不支持复盘」 |
+
+**为什么合并**：两种玩法除模式本身外，设置项完全一致（执棋方 / AI 难度 / 开始对弈）。
+拆成两页会让「换玩法」变成「退回首页 → 点另一个入口」，多两步且要维护两份几乎相同的页面。
+
+**存档仍然分开**（这点必须守住）：
+
+| 玩法 | 存档键 | 对局页分流 |
+| --- | --- | --- |
+| 象棋 | `chess_game_save` | `saveGame` / `loadGame` / `deleteSave` |
+| 揭棋 | `chess_jieqi_save` | `saveJieqiGame` / `loadJieqiGame` / `deleteJieqiSave` |
+
+对局页 `screens/game` 已把这三对调用收成 `saveBattle` / `loadBattle` / `deleteBattleSave`
+三个小函数，按 `variant` 分流 —— **设置页也必须跟着当前模式切换**，
+否则会出现「在揭棋模式下读到象棋存档、点了续局却开出一局象棋」。
+
+⚠️ 切模式**必须立即重查存档**（`useFocusEffect` 依赖里带上 `mode`）：
+两个模式各存一局，沿用上一模式的续局摘要会显示错的那一局。
+
+设置页**不提供先后手开关**：揭棋规则 1 规定红先，玩家执黑天然就是后手，
+多一个开关只会让人以为可以改规则。也不提供让子（揭棋没有让子）。
+
+**玩法说明改挂标题栏**：揭棋这几条规则只在开局前有用，开局后没人在意；
+占着首屏一大块卡片会把它顶成「第一个要读的东西」，反而迟滞了选难度这一主要动作。
+改为标题右侧 (i) → 弹窗，与残局闯关选关页（`screens/endgame` 的 `headerTitleRow`）同一套样式。
 
 ### 8.2 `ChessBoard` 暗子渲染
 
-**唯一改动点**在 `components/ChessBoard.tsx:796`：
+**唯一改动点**在 `components/ChessBoard.tsx` 棋子遍历处：
 
 ```tsx
-imageSource={getPieceImage(piece.id)}
+const isHidden = gameState.hiddenMask?.[piece.id] === true;
+imageSource={getJieqiPieceImage(
+  piece.id,
+  isHidden,
+  gameState.revealedType?.[piece.id],   // ← 已翻开子的**真实棋种**，缺了就退化成普通象棋
+  piece.id <= 15 ? 'black' : 'red',
+)}
 ```
 
-改为按 `hiddenMask` 选择背面图。既有先例可照抄——`ghostPieces` 层（`:749-784`）
-已经在做「用棋子图 + 非交互 + 半透明」的事，结构完全一致。
+> 🔴 **实施踩坑（真机才发现，667 条测试全绿也没拦住）**：
+> 首版 `getJieqiPieceImage(pieceId, isHidden)` 对「已翻开的子」回落到 `getPieceImage(pieceId)`。
+> 而揭棋的盘面 id **恒等于棋位棋种**（决策 A：id 永不因翻开而改变），
+> 所以翻开后取到的恰好是「该棋位本来的那张正面图」——
+> **棋盘上看起来就是普通象棋，揭棋的随机性完全不可见。**
+>
+> 引擎侧全对（身份表洗牌正常、`makeMove` 正常写 `revealedType`），
+> 错的是渲染层少传了一个参数。凡是「id 不变、身份另存」的模型，
+> **渲染都必须同时拿到 id 和真实身份**，只按 id 取图必然出错。
 
-新增 props：
-- `hiddenMask?: boolean[]` —— 与 `pieces` 对齐
-- `flipTargetSlot?: number | null` —— 刚落子准备翻开的子（播翻开动画）
+新增三个函数在 `utils/chess/pieceImages.ts`：
+- `getFaceDownImage(pieceId)` —— 背面图按阵营取黑/红两张；
+- `getJieqiPieceImage(pieceId, isHidden, revealedType, pieceSide)` —— 暗子取背面、
+  **已翻开取真实棋种的正面图**、将帅等明子按 id 取；
+- `getJieqiPieceName(pieceId, isHidden, revealedType)` —— **暗子返回 `null`**，
+  绝不给名字（那等于直接公布身份）。
 
-**注意 `PieceItem` 的 memo 比较器**（`:191-198`）目前只比较
-`isSelected/animX/animY/pieceSize/imageSource`。翻转瞬间 `imageSource` 会变 → 天然触发重渲染，
-**不需要改 memo**。
+背面表 `FACE_DOWN_IMAGES` 与正面表 `PIECE_IMAGES` **分开存放**：
+正面表保持「id → 该子正面图」的单一语义不变（象棋路径零改动），揭棋选图交给调用方。
+
+**`PieceItem` 的 memo 比较器**（`:191-198`）已包含 `imageSource`，
+翻转瞬间 `imageSource` 变化即天然触发重渲染，**不需要改 memo**（已验证）。
 
 ### 8.3 新增资源
 
-- `assets/pieces/face_down.png`（背面图，红黑通用或分两版）
+- `assets/pieces/face_down_black.png` / `face_down_red.png`（**分两版**，由用户提供原图）
+  - ⚠️ 原图是 1536×1536、**各约 3.8MB**；既有棋子图是 66×66、约 10KB。
+    直接入库会让包体暴涨 7.6MB（相对 13MB 的整包是 +58%）。
+    **必须缩到 66×66**（与既有棋子图同规格）。
+  - 缩放要在**预乘 alpha 空间**做：先 `RGB *= A/255` 再 LANCZOS 缩放、缩放后再反预乘。
+    直接对 RGBA 缩放会让半透明边缘出现**黑晕**（本仓库在棋盘图上已经踩过这个坑，
+    见 `client/AGENTS.md` 的「为什么必须 FASTOCTREE」）。实测 1536² → 66² 后为 8KB/张。
 - 翻开音效：复用现有 `SoundManager` 的 `select` / `go`，**不新增音频**（避免包体膨胀）
-- **必须**在 `utils/preloadAssets.ts:47-55` 的预热循环里加入背面图
-  ——该文件当前硬编码 `for (let id = 0; id < 32; id++)`，新资源漏了会有首帧解码延迟
+- **必须**在 `utils/preloadAssets.ts` 的预热里显式加入背面图 —— 该文件当前只循环
+  `getPieceImage(id)`（正面表），背面图不在其中。
+  漏登记**不会报错**，只会在揭棋首帧出现图片未缓存导致的空白/闪烁 —— 真机上很难复现。
 
-### 8.4 Hook 拆分（不得内联进巨型文件）
+### 8.4 Hook 拆分（实施结果）
 
-参照现有 `useNewGame.ts` 的形态，新建：
-
-| Hook | 职责 |
-| --- | --- |
-| `useJieqiNewGame` | 初始摆子、翻转动画触发、重开 |
-| `useJieqiMove` | 选中/落点/揭子/吃暗子，封装 §5 的落子顺序 |
+> 📌 **实施修正：没有新建 `useJieqiNewGame` / `useJieqiMove`。**
+> 原方案担心「内联进巨型文件」，但两个 Hook 的职责都已被既有结构正确覆盖：
+> - 重开/换局 → 复用 `hooks/useNewGame.ts`（它**本就是**为了收敛「同一重置序列的三份副本」
+>   而抽出来的），只给它加 `variant` / `onIdentity` 两个选项；
+> - 落子 → 直接用 `GameEngine.makeMove`（揭棋的翻开语义已在引擎内，页面不需要再包一层）。
+>
+> 再抽一层只会把「同一语义两处实现」的风险从页面挪到 Hook，并没有降低任何风险。
 
 ### 8.5 约束遵守清单（`client/AGENTS.md`）
 
@@ -728,6 +836,26 @@ E[eval] = Σ P(占位 id → 真实身份) × PIECE_VALUES[真实身份]
    **提示（hint）功能必须关掉随机采样**，否则同一局面两次提示不同，会重现现有 `hint` 通道
    「纯最佳确定性」的同类问题。
 
+#### 9.3.1 实施结果与三处必要修正
+
+落地时发现原设计**少算了三处**，均已补：
+
+| # | 修正 | 位置 | 为什么必须 |
+| --- | --- | --- | --- |
+| 1 | **走点派发也要走揭棋口径** | `AIEngine.generatePseudoMoves` | 引擎自己的 `fillPathPoints(i, …)` 只传了 `moveQiZi`，于是搜索树里**已翻开的士/象拿不到过河放宽**、且走法不按真实棋种。须与 `GameEngine`/`RuleEngine` 同口径传 `crossRiver` + `effectiveId` |
+| 2 | **MVV-LVA 也必须用期望价值** | 同上 | 吃子排序若仍用 `PIECE_VALUES[target]`，会把盖着的马当成车而抢吃，排序整体失真 |
+| 3 | **`aiDispatcher` / `offlineAiAdapter` 必须短路** | 3 个入口 | **皮卡鱼只懂象棋**。喂揭棋 FEN 会拿到垃圾着法；而 `runOffline` 的兜底路径是给「引擎暂时不可用」设计的，揭棋是**永久**能力缺失 —— 走兜底会让界面把 TS AI 的着法标成「皮卡鱼（启动中）」，虚报棋力 |
+
+另有一处**必须深拷贝**：`cloneForSearch` 若只浅拷 `hiddenMask/revealedType`，
+搜索树里的 `applyMove` 会**真的把调用方的暗子翻开**（页面上出现「无中生有」的翻牌）。
+
+#### 9.3.2 评估缓存
+
+`hiddenIdentityPosterior` 每个节点重算会让评估慢一个数量级（`evaluate` 对 32 枚棋子逐个取值）。
+同一局面内所有未读暗子**共用一份分布**，故按局面缓存「每方的期望价值」即可。
+缓存用 `WeakMap<GameState, Map<SideTag, number>>` —— 局面是即用即弃对象，缓存随之自动回收，
+不会在长对局中累积成内存泄漏。（`SideTag` 是 `boolean` 而非 `string`，故内层必须用 `Map`。）
+
 ### 9.4 强度预期（务必如实告知产品）
 
 现有本地 AI 的预算是 `TIME_BUDGET {easy:500, medium:1200, hard:2500}` ms、
@@ -751,37 +879,67 @@ E[eval] = Σ P(占位 id → 真实身份) × PIECE_VALUES[真实身份]
 
 ## 10. 存档 / 复盘 / 悔棋 / 观战
 
-### 10.1 存档（PVE 续局）
+### 10.1 存档（PVE 续局）——✅ **已实现**
 
-`utils/GameSave.ts` 存**完整 `GameState`**（含 `ruleState`）。
-揭棋下 `GameState` 新增的 `variant` / `hiddenMask` 会**自动**被 `JSON.stringify` 带上。
+> 📌 **本节结论已更新**：早期版本按「首版不落盘」记录（理由是身份表 `JieqiIdentity`
+> 不在 `GameState` 里，读回来的档会是一局「暗子身份全丢」的棋）。
+> **续局已在后续任务中实现**，做法是下面「方案 1：存身份表」。
+> 下面保留原始分析，因为它记录的**风险点**（分 key、校验）仍然是当前的实现依据。
 
-- ✅ `isValidGameSave`（`GameSave.ts:50`）的 32 子结构校验**天然通过**；
-- ⚠️ **必须新增一条校验**：揭棋存档的 `hiddenMask.length === 32`，
-  且「`hiddenMask[i] === true` 的子必须是活子」——否则坏档会让 UI 显示不存在的暗子。
-- ⚠️ 存档 key 是**单槽位**（`chess_game_save`）。象棋与揭棋**必须分 key**
-  （新增 `chess_jieqi_game_save`），否则揭棋存档会被象棋的「继续对局」读到而崩溃。
-  **这是最容易踩的坑**，因为 `isValidGameSave` 的校验恰好拦不住它。
+`utils/GameSave.ts` 存**完整 `GameState`**。揭棋下 `variant` / `hiddenMask` / `revealedType`
+会被 `JSON.stringify` 自动带上，所以从「结构能否存下」的角度看是通的。
 
-### 10.2 复盘
+**关键补充**：身份表不在 `GameState` 里，所以**必须显式落盘**，否则读回来的揭棋存档
+会是一局「暗子身份全丢」的棋 —— 玩家会以为引擎算错了，比不存档更糟。
+
+落地形态：
+
+- 存档新增可选字段 `jieqiIdentity?: { hiddenType: (JieqiPieceType|null)[]; seed: number }`；
+  ⚠️ 存的是**棋种**而非 id —— 与 §3.1 决策 A 的模型一致（盘面 id 恒等于棋位棋种，
+  只有「真实棋种」才是身份）。
+- `canResumeJieqi(save)` 作为**能否续局**的判据：老揭棋档（本次改造之前留下的、
+  缺身份表的）读得出但续不了，必须被挡住，否则会开出一局身份错乱的棋。
+- 对局页 `screens/game` 把 `saveGame`/`loadGame`/`deleteSave` 与
+  `saveJieqiGame`/`loadJieqiGame`/`deleteJieqiSave` 收成
+  `saveBattle`/`loadBattle`/`deleteBattleSave` 三个函数按 `variant` 分流，
+  避免在 5 处写三元。
+
+**分 key 是硬要求**（这是最容易踩的坑）：
+
+| 玩法 | 存档键 |
+| --- | --- |
+| 象棋 / 人机对战 | `chess_game_save` |
+| 揭棋 | `chess_jieqi_save` |
+| 残局闯关 | 另一套（`saveEndgameBattle` / `deleteEndgameBattle`） |
+
+若不分 key，揭棋存档会被象棋的「继续对局」读到而崩溃 ——
+且 `isValidGameSave` 的 32 子结构校验**恰好拦不住它**（结构上是合法的）。
+
+> 原始分析（另一种更干净的方案，未采用）：把洗牌改成由单个 seed 驱动确定性 PRNG，
+> 存档只存 seed，读档时重放洗牌 —— 不落盘任何身份。代价是洗牌要从 `crypto.randomInt`
+> 改为 `crypto.randomBytes` 产出长种子 + 确定性 PRNG 展开。
+> 现采用「存身份表」是因为它**不改动已验证的洗牌实现**，且身份表本来就已经生成好了。
+> 另需评估「退出 App 后身份仍在磁盘上」是否可接受（当前实现接受）。
+
+### 10.2 复盘——**首版不做**（现状仍如此）
 
 `replayStorage.ts` 的 `ReplayGame` **结构上无法表示揭棋**：它只存 `moves[]` + `firstMoveSide`，
-复盘时 `createInitialState` 重建（`screens/replayPlayer/index.tsx:71-85`），初始暗子身份无从还原。
+复盘时 `createInitialState` 重建（`screens/replayPlayer/index.tsx:71-85`），初始暗子身份无从还原 ——
+重放出来的盘面与玩家当初下的那盘**完全不是一回事**。
 
-方案：新增可选字段
-```ts
-/** 揭棋：初始摆子的完整真相（仅在终局后随结算下发，中局绝不下发） */
-jieqiFinalSecret?: { identity: number[]; seed: number };
-```
-**只存终局后的快照**，不存「种子」——因为摆子用的是 `crypto.randomInt`（§6.2），
-其输出**不可由单个种子复现**，所以复盘必须存摆子结果本身，而不是种子。
-中局进行中绝不下发该字段（§2.1 铁律 A）。
+故 `screens/game` 的终局复盘保存（`savePveReplay`）在揭棋下**直接 return 不存**。
 
-普通象棋存档这两个字段为 `undefined`，`replayPlayer` 的重建路径不变。
+> ⚠️ 注意：**续局（§10.1）已做，复盘（本节）仍不做**。两者容易混为一谈，
+> 但续局存的是「当前局面的完整快照 + 身份表」，而复盘要的是「从初始局面重放着法表」，
+> 后者的初始局面含随机洗牌，现有数据结构表达不了。
 
-> 备选方案（若产品要求「种子更小」）：把洗牌改成 `crypto.randomBytes` 产出**足够长的字节串**
-> 作为种子、之后用确定性 PRNG 展开。这样既保留密码学强度又能复现。
-> 但增加了实现复杂度，**首版建议直接存终局快照**（32 个整数，JSON 体积可忽略）。
+将来要做，同样是两条路：
+
+1. **只存终局快照**（推荐）：新增可选字段 `jieqiFinalSecret?: { identity: (JieqiPieceType|null)[]; seed: number }`，
+   **只在终局后随结算下发，中局绝不下发**（铁律 A）。
+   ⚠️ 注意存的是**棋种**而非 id —— 与 §3.1 的决策 A 模型一致。
+2. **改用 seed 洗牌**（更优）：摆子由 seed 确定性复现，则存档只存 seed 即可，
+   无需存储任何身份。
 
 ### 10.3 悔棋
 
@@ -834,17 +992,41 @@ pnpm -w validate
 
 ### 12.1 新增测试文件（`client/utils/chess/__tests__/`）
 
-| 文件 | 覆盖 |
-| --- | --- |
-| `jieqiSetup.test.ts` | 洗牌分布：15 枚身份不重复、与占位 id 的对应一致、帅/将恒为明子、红黑置换独立 |
-| `jieqiMove.test.ts` | **占位走法等价性**：对每个占位 id，断言「暗子走点」===「对应明子走点」（复刻原方案 §6 的黄金快照思路） |
-| `jieqiFlip.test.ts` | 暗子移动后翻开；占位 id 退役、真实 id 顶上；`flippedPieceId` 正确；揭开前后走法从占位切到真实 |
-| `jieqiAttack.test.ts` | **暗子不将军**：构造「底线占位车与对方将帅照面」，断言 `isJiangJun` 返回未被将、`afterMoveStillJiangJun` 不误判飞将 |
-| `jieqiSlotBudget.test.ts` | **槽位耗尽**：模拟一路吃满 15 枚暗子，断言始终无「两活子共用同一 id」、占位 id 均取自退役栈、真实 id 总占用 ≤ 32 |
-| `jieqiReveal.test.ts` | 暗子被吃：吃子方拿到新暗子且 `identity` 不外泄；被吃方也不可见 |
-| `jieqiVariantIsolation.test.ts` | **`variant` 缺省 = 'xiangqi'` 时，所有既有走法/终局/`positionKey` 指纹输出逐字符不变**（回归铁闸） |
-| `jieqiNoLeak.test.ts` | 对 `publicGameState` 的输出做 JSON 序列化，断言**不含任何未翻开暗子的真实 id**；**重点覆盖「吃暗子之后」**（依 §14.2 选 B，吃子方亦不可见） |
-| `jieqiAi.test.ts` | 身份后验为超几何分布：K=15 时单车概率 2/15；剩 1 枚时必为该身份 |
+| 文件 | 覆盖 | 状态 |
+| --- | --- | --- |
+| `jieqiSetup.test.ts` | 摆子 15 枚、占位棋种分布、`hiddenType` 多重集严格、种子可复现、翻开只写 `revealedType`、**id 恒定回归**、`undoMove` 精确还原、决策 A（吃子方不增枚 + 铁律 A）、6 局×60 步无 id 冲突、克隆深拷贝 | ✅ 17/17 |
+| `jieqiVariantIsolation.test.ts` | **`variant` 缺省 = 'xiangqi'` 时，既有走法/终局/`positionKey` 指纹输出逐点不变**（回归铁闸） | ✅ 9/9 |
+| `jieqiAttack.test.ts` | **暗子不将军**：占位车与对方将帅照面时 `isJiangJun` 不判将、`afterMoveStillJiangJun` 不误判飞将；翻开即刻恢复攻击身份；10 局×80 手随机对弈全程校验（优先吃子以保证覆盖到被将时刻） | ✅ 5/5 |
+| `jieqiNoLeak.test.ts` | **铁律 A**：`GameState` 及其派生（走棋历史/克隆/克隆之克隆/`positionKey`）序列化后不含未翻开真相；**重点覆盖「吃暗子之后」**；并断言 `identity` 不是 `GameState` 的键 | ✅ 6/6 |
+| `jieqiMoveRule.test.ts` | 走法等价性（22 个非士象占位逐点对拍：暗子 ≡ 同棋种明子）；士/象过河放宽**只**对已翻开者生效；`RULE_CONFIG` 阈值在揭棋下零调整；揭棋走 40 手规则状态自洽 | ✅ 7/7 |
+| `jieqiAi.test.ts` | 身份后验为**超几何分布**：初始 2/15（车）、翻开一枚后 1/14；未读暗子取同一份分布且归一化；`expectedHiddenValue` 数值正确；吃暗子后本方不增枚 | ✅ 7/7 |
+| `jieqiAiEngine.test.ts` | AIEngine 揭棋分支：搜索树里走暗子会翻开且 `cloneForSearch` 深拷贝隔离；提示（`pureBest`）两次结果一致（确定性翻牌）；AI 着法始终合法 | ✅ 9/9 |
+| `jieqiFlow.test.ts` | **端到端**：用与 `screens/game` 相同的调用序列（`buildJieqiInitialGameState` → `makeMove(identity)` → `aiDispatcher`）跑完整局，每次翻开恰好减少一枚暗子；重开重新洗牌；揭棋局面不走皮卡鱼路径 | ✅ 3/3 |
+| `jieqiRevealIdentity.test.ts` | **渲染必须显示真实棋种**：已翻开的子取到的图 = `getPieceImage(representativeId(revealedType))`，且**必须 ≠ `getPieceImage(id)`**；暗子取背面；暗子不给名字（铁律 A） | ✅ 5/5 |
+| `jieqiAttackIdentity.test.ts` | **走子前/走子后口径必须一致**：差分测试（`isMoveKingSafe` vs 走子后 `isJiangJun` 地真，272 个随机着法零分歧）+ 用户场景（占位炮/真身卒，上仕成炮架不得判送将）+ 各项正/对照 | ✅ 9/9 |
+
+> 🔴 `jieqiRevealIdentity` 与 `jieqiAttackIdentity` 都是**事后补的**：
+> 前者是真机发现「揭棋看起来就是普通象棋」，后者是真机发现「能上仕防御却被判送将」——
+> 当时 667/672 条测试全绿、引擎单测全过。
+> 两次都指向同一类漏洞：**测试只断言了状态/取值的正确性，没有断言「跨层消费方怎么用它」**
+> （渲染取了哪张图、送将判定用哪套攻击口径）。
+> 结论写进了 §13.0.2：**这类规则要给差分测试，不是给单条断言**。
+
+> 🔴 `jieqiRevealIdentity` 是**事后补的**：首版 667 条测试全绿、引擎全对，
+> 但真机上揭棋看起来就是普通象棋 —— 因为渲染层没把 `revealedType` 传给选图函数，
+> 而 id 恒等于棋位棋种（决策 A）。详见 §8.2。
+>
+> **教训**：这类「id 不变、身份另存」的模型，**渲染层必须同时拿到 id 与真实身份**。
+> 引擎单测覆盖不到「渲染取了哪张图」，所以必须有一条测试直接断言**图的来源**，
+> 而不能只断言 `revealedType` 的值正确。
+
+> ⛔ `jieqiSlotBudget.test.ts` **已作废**：决策 A（吃子方不获得新子）+ 盘面 id 恒定，
+> 不存在槽位复用与耗尽。其防回归价值已并入 `jieqiSetup.test.ts` 的
+> 「id 冲突回归」与「随机对弈无 id 冲突」用例。
+
+> 📌 **`jieqiNoLeak` 的口径说明**：`publicGameState`（服务端出站收口）属 P2 在线阶段，
+> 本阶段未实现，故该文件改为断言「**喂给收口函数的上游数据本身不含身份**」——
+> 即收口函数无身份可漏。这是比直接测收口更根本的一道闸，且现在就能防回归。
 
 ### 12.2 服务端测试（`chinese-chess-server/scripts/`）
 
@@ -877,15 +1059,87 @@ pnpm -w validate
 
 ## 13. 分阶段实施
 
+### 13.0 实施中发现的三个真实缺陷（已修，均有回归测试）
+
+这三个都不是「原方案写错了」，而是**揭棋这条新路径把既有代码里从未被触发的分支暴露了出来**。
+它们当时在象棋下不可达，所以既有用例测不出来。
+
+| # | 缺陷 | 位置 | 触发条件 | 后果 | 修复 |
+| --- | --- | --- | --- | --- | --- |
+| 1 | **过河放宽的象走法越界崩溃** | `MoveCheck.calcXiang` | 揭棋下**已翻开**的象/相走到第 7、8 路时，边界条件写成 `col < 8` / `col > 0`，而象跨 2 格 ⇒ `col+2` 可达 9/10 ⇒ `qiPan[9][…]` 越界 | `TypeError: Cannot read properties of undefined`，揭棋随机对弈**必然**踩到 | 边界收紧为 `col < 7` / `col > 1`（与同函数非放宽分支同口径）。象棋不可达该分支，故行为零变化 |
+| 2 | **AI 把暗子当攻击者** | `AIEngine.isSideInCheck` | 该函数用自建的 `isGeneralAttacked` 按**盘面 id** 推走点，不看 `hiddenMask` | 大量根本不存在的将军被算成将军，搜索评估全面失真，AI 下出莫名其妙的棋 | 揭棋分支直接复用引擎的 `isJiangJun`（已跳过暗子）；象棋仍走原路径 |
+| 3 | **攻击范围按盘面 id 派发 ⇒ 应将着法被误拦成「送将」** | `MoveCheck.afterMoveStillJiangJun` | 见下 | **用户实测**：对方将军时，本可以上仕防御，却被判「着法送将，请另走」 | 增加 `attackerMotion` 回调注入，与 `isJiangJun` 走同一套 `motionArgs` |
+
+#### 13.0.1 缺陷 3 详解：走子前/走子后口径分叉
+
+`afterMoveStillJiangJun`（**走子后**判「是否仍被将」）扫描攻击者时只传了盘面 id：
+
+```ts
+const thisPoints = getPathPoints(localQiZi, myQiPan, myPositions);   // ← 缺 effectiveId
+```
+
+而 `GameEngine.isJiangJun`（**走子前**）一直传真实身份（`motionArgs`）。
+决策 A 下盘面 id 恒等于**棋位棋种**，攻击性却由**真实身份**决定 ⇒ 两者口径分叉。
+
+差分探针（随机对弈枚举全部合法着法，与「走子后 `isJiangJun` 地真」逐条比对）：
+**修复前 272 个着法里 45 个分歧，修复后 0 个。**
+
+**这个分叉是双向的**，症状不止「误拦」一种：
+
+| 攻击者占位 → 真身 | 旧代码以为 | 实际 | 后果 |
+| --- | --- | --- | --- |
+| 炮 → 卒 | 炮能隔炮架将军 | 卒打不到 | **把本可的应将着法误拦成「送将」** ← 用户报的这条 |
+| 卒 → 炮 | 卒打不到 | 炮能隔子将军 | **漏判仍在被将** ⇒ 漏拦送将 |
+
+**修复**：`afterMoveStillJiangJun` 增加第 8 个参数 `attackerMotion`（回调注入，
+与既有 `hiddenAttacker` 同一模式，避免 `MoveCheck` 直接依赖 `jieqi.ts` 形成依赖环），
+由 `GameEngine.attackerMotionOf` / `RuleEngine.attackerMotionOf` 注入。
+象棋两者均返回 `undefined` ⇒ 新分支恒不进入，既有行为逐字节不变。
+
+已补齐的调用点：`isMoveKingSafe`、`hasAnyLegalMove`、`buildEngineHistory`（GameEngine）；
+`isPinnedMove`、`isPiecePinned`、`getValidMoves`（RuleEngine）。
+**`attackerMotion` 与 `hiddenAttacker` 必须成对注入** —— 只漏一个就会出现
+「走子前说被将、走子后说没被将」。
+
+> 📌 **一个反直觉的几何事实**（写测试时踩到）：
+> 「有没有子挡在中间」**不受棋种影响** —— 士挡在车与帅之间时，按车和按马都打不到帅。
+> 所以要制造口径分歧，必须让攻击者的棋种**改变可达性**（炮↔卒这类「隔子」特性差异），
+> 光靠阻挡是测不出来的。
+
+> 📌 **测试咬合验证**：本条回归测试写完后，我用「临时移除注入」逐条验证过它**确实会失败**。
+> 第一版写的「上仕挡住 4 路车」用例在旧代码下**照样通过**（因为阻挡不受棋种影响），
+> 属于假绿灯，已重写为「占位炮 / 真身卒，上仕成炮架」这个真正分歧的摆法。
+
+#### 13.0.2 贯穿三个缺陷的教训
+
+> **新增「某类子不参与/按另一套口径参与某判定」的规则时，必须把所有独立实现该判定的入口都找出来。**
+>
+> 本项目里同一个判定有多份实现：`isJiangJun` 有三处调用方
+> （`GameEngine` / `RuleEngine` / `AIEngine`）；「是否仍被将」有**两套**判据
+> （走子前的 `isJiangJun`、走子后的 `afterMoveStillJiangJun`）。
+> 漏改任何一份都会让揭棋与象棋（或走子前与走子后）判定分叉 ——
+> 而单测通常只覆盖了其中一份。
+>
+> **可操作的检查法**：对每个新判定，写一条**差分测试** ——
+> 让「口径 A 的结果」与「口径 B 独立重算的地真」在大量随机着法上逐条比对，
+> 要求分歧数为 0。缺陷 3 的探针正是这样做的（45 → 0）。
+> 只写「这个着法应该合法」的单条用例，很容易像第一版那样写成假绿灯。
+
+### 13.1 阶段划分与交付状态
+
 | 阶段 | 范围 | 是否动服务端 | 可交付 |
 | --- | --- | --- | --- |
-| **P0 规则底座** | `types.ts` 加 `variant`/`hiddenMask`；`MoveCheck`/`makeMove`/`positionKey` 的分支；洗牌函数；全部单测 | ❌ | 无（纯引擎） |
-| **P1 离线人机** | `jieqiSetup`/`jieqiGame` 两页 + 入口卡片；`ChessBoard` 暗子渲染；背面图资源 + 预热；本地 AI（信念期望） | ❌ | **可玩的单机揭棋** |
+| **P0 规则底座** | `types.ts` 加 `variant`/`hiddenMask`/`revealedType`；`MoveCheck`/`GameEngine`/`RuleEngine` 的分支；洗牌与后验；全部单测 | ❌ | 无（纯引擎） |
+| **P1 离线人机** | `pveSetup` 首行「选择模式」+ `game` 屏 `variant` 化；`ChessBoard` 暗子渲染；背面图资源 + 预热；本地 AI（信念期望） | ❌ | **可玩的单机揭棋** |
+| **P1.5 续局**（✅ 已在后续任务完成） | `chess_jieqi_save` 独占键；`JieqiIdentity` 随档落盘；`canResumeJieqi` 挡住缺身份表的老档 | ❌ | 揭棋可续局 |
 | **P2 在线对局** | 服务端 `variant` 设置、`jieqiSecret`、`publicGameState` 收口（含 spectate 修复）、悔棋快照、`verify-jieqi.cjs`；`aiDispatcher` 显式短路 | ✅ | 联机揭棋 |
-| **P3 复盘/存档** | `jieqiFinalSecret` 字段、存档分 key、复盘还原 | ✅ | 完整复盘 |
+| **P3 复盘** | `jieqiFinalSecret` 字段（存**棋种**，非 id）、复盘还原 | ❌（客户端） | 揭棋复盘 |
 | **P4（不排期）** | 原地翻子、在线揭棋引擎接入 —— 依 §14 定稿均**不做**，仅保留为预留开关 | — | 无（不排期） |
 
 **建议 P0+P1 先跑通再评审**，因为 P1 已经能验证最核心的「暗子体验」，且完全不碰服务端，风险最低。
+
+> 📌 **进度更正**：`P1.5 续局` 已由后续任务实现（本文档早期章节曾按「首版不落盘」记录，
+> 那部分结论**已过时**，以本节为准）。当前揭棋**可续局、不可复盘**。
 
 ---
 
@@ -896,7 +1150,7 @@ pnpm -w validate
 | # | 议题 | **定稿** | 实现落点 |
 | --- | --- | --- | --- |
 | 1 | **原地翻子** | ❌ **不做**。揭棋只有「走子即翻开」一种翻开方式 | 不实现任何原地翻子动作。若日后要开，须新增走子类型 + 协议字段 + 空步计数重置 |
-| 2 | **被吃暗子落在己方阵营后的走法** | ✅ **按落点列映射**（§5.5 表）：列 0/8→车、1/7→马、2/6→象、3/5→士、4→兵/卒 | `jieqi.ts` 的落点→占位 id 映射表 |
+| 2 | **被吃暗子落在己方阵营后的走法** | ✅ **该议题已消解**：经核实参考实现与腾讯规则页，吃子方**不获得任何新棋子**（见 14.3 决策 A） | 无需实现「落点→占位 id」映射表 |
 | 3 | **空步判和阈值** | ✅ **沿用现有 `RULE_CONFIG.naturalMoveLimit = 120` 步**（不改本仓库既有阈值） | 无需改动 |
 | 4 | **观战者可见信息** | ✅ **与对局双方完全相同的公开信息**（全程看不到未翻开暗子身份） | `publicGameState` 对玩家/观战者同构，零额外分支 |
 | 5 | **揭棋「让子」** | ❌ **不支持**。`handicap` 非空即拒绝开局 | 复用现有让子房拒绝逻辑（§6.1） |
@@ -915,18 +1169,26 @@ pnpm -w validate
 这条约束把揭棋与 Pikafish WASM **完全隔离**——既避免了「FEN 无法表达暗子」的语义错配，
 也意味着揭棋路径**不会触及 `ai.ts` 的 `isFenBoardShapeValid`**，新增风险面为零。
 
-### 14.2 第 7 项亦已定稿：**选 B**
+### 14.2 第 7 项：**原「选 B」已随决策 A 失效**
 
-| # | 议题 | **定稿** | 实现落点 |
-| --- | --- | --- | --- |
-| 7 | **被吃暗子是否向吃子方展示真身** | ✅ **选 B**：被吃暗子仅对**被吃方**翻开；吃子方拿到背面朝上的新暗子，按落点列走（§5.5） | `jieqi.ts` 身份池回收 + 升起新暗子（§5.4 现有逻辑，**无需改动**） |
+> **本节作废。** 决策 A（吃子方不获得新暗子）确定后，
+> 「被吃暗子是否向吃子方展示真身」这一议题**不再存在** ——
+> 棋盘上根本不会出现新的暗子，也不存在需要展示的那枚。
+> §2.1 **铁律 A 不开例外**：任何时刻都不因「谁被吃」向任何客户端释放身份；
+> §4.2 的 `capturedHidden` **只下发计数、不下发身份**。
 
-> ✅ **全部 7 项均已定稿**（本表 1~6 + 本表 7）。方案不再有待决事项，可直接进入 P0 实现。
->
-> **选 B 的连带效果**：
-> - §2.1 **铁律 A 不开例外** —— 任何时刻都不因「谁被吃」向任何客户端释放身份；
-> - §4.2 的 `JieqiPublicSetup.capturedHidden` **只下发计数、不下发身份**，维持原设计；
-> - §12 的 `jieqiNoLeak.test.ts` 覆盖面扩大到「吃暗子之后」，断言吃子方载荷仍不含被吃暗子的真实 id。
+### 14.3 决策 A（实现阶段定稿，2026-10）：吃暗子不补子 + 盘面 id 恒定
+
+| 议题 | 核实结论 | 依据 |
+| --- | --- | --- |
+| 吃暗子后吃子方是否获得新暗子 | **不获得**，棋盘上直接少一枚 | `lichlzh/pikafish-jieqi` `core/position.cpp` 的 `makeMove` 只把身份从 `pool_` 移入 `capturedDarkPool_`，不生成新子；腾讯规则页只说「输的一方看不到被吃暗子身份」，从未提及补子 |
+| 揭棋是否需要「占位 id 退役 + 真实 id 顶上」 | **不需要**，且该设计在本仓库**不可行** | 实测 30/30 暗子的真实身份都会落在另一个在盘暗子的 id 上（id 集合完全重合）。改用 `revealedType` 平行数组，与参考实现的 `hidden_[square]` 同构 |
+
+这两点共同带来三个结构性简化：
+
+1. **32 格命名空间恒够用** —— 无槽位复用、无耗尽、无退役栈（`freeSlots` 删除）；
+2. **`undoMove` 天然正确** —— 无 id 置换需要复原，只需把 `revealedType` 写回 `null`；
+3. **吃暗子的后验分布更简单** —— 被吃身份整体作为「未知余量」，不再需要池回收。
 
 ---
 
@@ -946,37 +1208,52 @@ pnpm -w validate
 
 ---
 
-## 附：需要改动的文件清单（预估）
+## 附：需要改动的文件清单（**实施后实际清单**）
 
-**客户端（`chinese-chess-client/client/`）**
+### 已完成（客户端 P0 + P1，本轮落地）
+
 ```
-utils/chess/types.ts                        +variant +hiddenMask
-utils/chess/MoveCheck.ts                    士象过河 + 攻击扫描跳过暗子（唯一动「真源」之处）
-utils/chess/GameEngine.ts                   makeMove 翻开 + isJiangJun 跳过暗子
-utils/chess/RuleEngine.ts                   positionKey 含暗子位图
-utils/chess/jieqi.ts                        【新】洗牌、投影、AI 信念后验
-utils/chess/pieceImages.ts                  +背面图导出
+utils/chess/types.ts                        +variant +hiddenMask +revealedType +JieqiPieceType
+utils/chess/jieqi.ts                        【新】洗牌、投影、effectiveIdOf/crossRiverOf、AI 信念后验
+utils/chess/MoveCheck.ts                    走点派发带 effectiveId；攻击扫描跳过暗子**且按真实身份派发**；calcXiang 越界修复
+utils/chess/GameEngine.ts                   makeMove 翻开（决策 A：无 id 交换）+ isJiangJun 跳过暗子
+utils/chess/RuleEngine.ts                   positionKey 含暗子位图；simulateMove 保守保持暗子
+utils/chess/AIEngine.ts                     揭棋分支：后验期望估值、搜索树翻开、提示确定性、hard 深度降 3
+utils/chess/aiDispatcher.ts                  揭棋在入口短路到 TS AI（皮卡鱼只懂象棋）
+utils/chess/offlineAiAdapter.ts             揭棋拒绝进本地引擎 + 跳过 ponder（3 道闸）
+utils/chess/pieceImages.ts                  +背面图导出 +getJieqiPieceImage
 utils/preloadAssets.ts                      +背面图预热
-components/ChessBoard.tsx                   +hiddenMask / flipTargetSlot
-hooks/useJieqiNewGame.ts                    【新】
-hooks/useJieqiMove.ts                       【新】
-screens/jieqiSetup/index.tsx                【新】
-screens/jieqiGame/index.tsx                 【新】
-screens/home/index.tsx                      +入口卡片
-app/jieqiSetup.tsx / app/jieqiGame.tsx      【新】路由
-app/_layout.tsx                             +2 行 Stack
-utils/GameSave.ts                           拆 key + 暗子校验
-utils/replayStorage.ts                      +jieqiFinalSecret
-screens/replayPlayer/index.tsx              +揭棋重建分支
-utils/chess/__tests__/jieqi*.test.ts        【新】7 个测试文件
+components/ChessBoard.tsx                   按 hiddenMask + revealedType 选图（无新 props）
+hooks/useNewGame.ts                         +buildJieqiInitialGameState、+variant/onIdentity 选项
+screens/game/index.tsx                      variant 化：建局、走子传 identity、重开重洗牌、跳过复盘
+                                              +saveBattle/loadBattle/deleteBattleSave 按 variant 分流存档键
+screens/pveSetup/index.tsx                  【改】首行「选择模式」（象棋/揭棋）；揭棋隐藏先后手、
+                                              挂 (i) 玩法说明弹窗、换引擎文案；续局区按模式读各自的键
+screens/home/index.tsx                      入口描述点明「象棋 / 揭棋」（揭棋独立卡片已移除）
+assets/pieces/face_down_black.png           【新】1536² → 66²，3865KB → 8KB
+assets/pieces/face_down_red.png             【新】1536² → 66²，3763KB → 8KB
+utils/chess/__tests__/jieqi*.test.ts        【新】9 个测试文件，681 条全绿
 ```
 
-**服务端（`chinese-chess-server/`）**
+> 📌 **已删除**：`screens/jieqiSetup/` 与 `app/jieqiSetup.tsx`（含 `_layout.tsx` 里的那一行
+> `Stack.Screen`）。揭棋入口并入 `screens/pveSetup`，见 §8.1.1。
+> 首页 `pushOnce` 的联合类型里 `/jieqiSetup` 也已一并去掉。
+> 注意 `utils/chess/__tests__/jieqiSetup.test.ts` 是**引擎层**的摆子测试，与那个已删的
+> 设置页无关，文件名里的 "Setup" 指「摆子（setup）」，**不要**顺手删。
+
+### P2 待做（服务端 + 揭棋续局/复盘）
+
 ```
-src/routes/lanGame.ts    Room/settings/actMove/startPlayingRoom/4 个下发点/悔棋快照
-src/routes/jieqiView.ts  【新】publicGameState 投影收口
-ai/ruleEngine.cjs        重新打包产物（由 --write 生成，不手改）
-scripts/verify-jieqi.cjs 【新】
+chinese-chess-server/src/routes/lanGame.ts    Room/settings/actMove/startPlayingRoom/下发点/悔棋快照
+chinese-chess-server/src/routes/jieqiView.ts  【新】publicGameState 投影收口
+chinese-chess-server/scripts/verify-jieqi.cjs 【新】
+utils/GameSave.ts                             拆 key + 身份落盘（或改 seed 洗棋，见 §10.1）
+utils/replayStorage.ts                        +jieqiFinalSecret（存棋种，非 id）
+screens/replayPlayer/index.tsx                +揭棋重建分支
 ```
 
-**闸门**：`pnpm -w validate` 挂入新 verify；收尾 `pack.ps1 all`。
+**闸门**：`pnpm -w validate` 挂入新 verify；收尾 `pack.ps1 client`（P1 未动服务端源码，故只重打 client）。
+
+> ⚠️ `ruleEngine.cjs` 是**客户端源码的打包产物**，改 `MoveCheck`/`GameEngine`/`RuleEngine`
+> 后必须跑 `verify-rule-engine-parity.mjs --write` 并**重启服务端**，否则两端会漂移。
+> 本轮已重新生成（**46713 字节**，同源校验通过；上一版 45583）。

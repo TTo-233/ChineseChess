@@ -16,10 +16,16 @@
  * 不存储搜索结果、不做剪枝，与置换表无关。
  */
 
-import { type GameState, type PieceState } from './GameEngine';
+import { type GameState, type PieceState, isJiangJun } from './GameEngine';
 import { fillPathPoints, createPathPointsBuffer, getPathPoints } from './MoveCheck';
 import { RED_SIDE, BLACK_SIDE, BOARD_COLS, BOARD_ROWS, type SideTag, type MoveRecord } from './types';
 import { isMoveBanned } from './RuleEngine';
+// 揭棋：只依赖 types.ts / jieqi.ts，不反向 import 本文件，故无循环依赖
+import {
+  hiddenIdentityPosterior, liveHiddenSlots, representativeId,
+  effectiveIdOf, crossRiverOf,
+  type JieqiPieceType,
+} from './jieqi';
 
 // ======================== 棋子价值 ========================
 
@@ -33,6 +39,129 @@ const PIECE_VALUES: number[] = [
   // 红方 (16-31): 帅 仕 仕 相 相 马 马 车 车 炮 炮 兵 兵 兵 兵 兵
   100000, 120, 120, 120, 120, 270, 270, 600, 600, 300, 300, 60, 60, 60, 60, 60,
 ];
+
+/**
+ * 揭棋 · 子力价值的**期望值**（方案 §9.3）。
+ *
+ * 暗子的盘面 id 是「棋位」而非身份，直接查 PIECE_VALUES 会把马当车算 600 分，
+ * 严重误导搜索。正确做法是按身份后验取期望：
+ *
+ *   E[value] = Σ_t P(t | 已翻开集合) × PIECE_VALUES[该方 t 的代表 id]
+ *
+ * P 是**解析可算的超几何分布**（jieqi.ts 的 hiddenIdentityPosterior），
+ * 无需蒙特卡洛采样 —— 这是揭棋 AI 最省事也最准的一点。
+ *
+ * ⚠️ 只在 `variant === 'jieqi'` 时走到；象棋返回 PIECE_VALUES[i]，
+ * 与改动前逐点相同，故既有评估结果完全不受影响。
+ */
+function effectivePieceValue(state: GameState, id: number): number {
+  if (state.variant !== 'jieqi') return PIECE_VALUES[id];
+
+  // 明子（含已翻开的暗子）：已翻开的按真实棋种算，未翻开的按棋位算
+  if (state.hiddenMask?.[id] !== true) {
+    const t = state.revealedType?.[id];
+    if (!t) return PIECE_VALUES[id]; // 将/帅等本来就是明子
+    const rep = representativeId(t, id <= 15 ? BLACK_SIDE : RED_SIDE);
+    return rep === null ? PIECE_VALUES[id] : PIECE_VALUES[rep];
+  }
+
+  // 暗子：取该方后验分布的期望价值
+  const side: SideTag = id <= 15 ? BLACK_SIDE : RED_SIDE;
+  return cachedJieqiExpectation(state, side);
+}
+
+/**
+ * 揭棋后验期望价值的**每局面缓存**。
+ *
+ * `hiddenIdentityPosterior` 每个节点都重算会让评估慢一个数量级
+ * （evaluate 对 32 枚棋子逐个取值）。同一局面内所有未读暗子共用一份分布，
+ * 所以每个 side 只算一次即可。
+ *
+ * 用 WeakMap 而非普通 Map：局面是即用即弃的对象，缓存随之自动回收，
+ * 不会在长对局中累积成内存泄漏。
+ *
+ * ⚠️ 键用 Map 而非对象字面量：SideTag 是 boolean（不是 string），
+ * 不能直接当索引类型用。
+ */
+const jieqiValueCache = new WeakMap<GameState, Map<SideTag, number>>();
+
+function cachedJieqiExpectation(state: GameState, side: SideTag): number {
+  let store = jieqiValueCache.get(state);
+  if (store) {
+    const hit = store.get(side);
+    if (hit !== undefined) return hit;
+  }
+
+  const post = hiddenIdentityPosterior(state, side);
+  const slots = liveHiddenSlots(state, side);
+  let expected = 0;
+  if (slots.length > 0) {
+    const dist = post.get(slots[0]);
+    if (dist) {
+      for (const t of JIEQI_TYPE_ORDER) {
+        const rep = representativeId(t, side);
+        if (rep === null) continue;
+        expected += (dist[t] ?? 0) * PIECE_VALUES[rep];
+      }
+    }
+  }
+
+  if (!store) {
+    store = new Map<SideTag, number>();
+    jieqiValueCache.set(state, store);
+  }
+  store.set(side, expected);
+  return expected;
+}
+
+/**
+ * 揭棋 · 按身份后验**采样**一枚暗子的真实身份（搜索树用）。
+ *
+ * 与 `cachedJieqiExpectation` 的关系：评估函数要**期望**（确定性、可比较），
+ * 而搜索树里「这枚子翻开后是什么」必须落到**具体一个**身份，
+ * 否则后继走点算不出来。两处口径必须一致，故采样严格按同一份后验分布。
+ *
+ * 提示（hint）通道必须用确定性模式（取期望值最大的棋种），
+ * 否则同一局面两次提示结果不同 —— 见 `pureBestHintSearch`。
+ */
+function sampleHiddenIdentity(state: GameState, pieceId: number): JieqiPieceType {
+  const side: SideTag = pieceId <= 15 ? BLACK_SIDE : RED_SIDE;
+
+  // 确定性通道：取后验概率最高的棋种（并列时按固定棋种序，保证可复现）
+  if (jieqiDeterministicReveal) {
+    const dist = hiddenIdentityPosterior(state, side).get(pieceId);
+    if (!dist) return 'zu';
+    let best: JieqiPieceType = 'zu';
+    let bestP = -1;
+    for (const t of JIEQI_TYPE_ORDER) {
+      const p = dist[t] ?? 0;
+      if (p > bestP) { bestP = p; best = t; }
+    }
+    return best;
+  }
+
+  // 随机通道：按后验分布抽一个
+  const dist = hiddenIdentityPosterior(state, side).get(pieceId);
+  if (!dist) return 'zu';
+  const r = nextRandom();
+  let acc = 0;
+  for (const t of JIEQI_TYPE_ORDER) {
+    acc += dist[t] ?? 0;
+    if (r <= acc) return t;
+  }
+  return JIEQI_TYPE_ORDER[JIEQI_TYPE_ORDER.length - 1];
+}
+
+/** 棋种的**固定遍历顺序**：采样与确定性取优都依赖它，保证同种子可复现 */
+const JIEQI_TYPE_ORDER: JieqiPieceType[] = ['che', 'ma', 'pao', 'shi', 'xiang', 'zu', 'bing'];
+
+/**
+ * 揭棋翻开的采样模式开关。
+ *
+ * false = 随机（对弈用；带随机性是揭棋的乐趣来源，也避免搜索走出刻板套路）
+ * true  = 确定性（提示 hint 用；同一局面两次提示必须一致）
+ */
+let jieqiDeterministicReveal = false;
 
 // ======================== 精细位置加成表 ========================
 
@@ -480,7 +609,8 @@ function evaluate(state: GameState, currentSide: SideTag): number {
     const piece = state.pieces[i];
     if (!piece.alive) continue;
 
-    const baseValue = PIECE_VALUES[i];
+    // 揭棋：暗子按身份后验取期望价值（象棋直接用 PIECE_VALUES，行为不变）
+    const baseValue = effectivePieceValue(state, i);
     const posBonus = getPositionBonus(i, piece.col, piece.row);
     const totalValue = baseValue + posBonus;
 
@@ -686,6 +816,20 @@ function isSideInCheck(state: GameState, side: SideTag): boolean {
   // 缺席口径与 GameEngine.isJiangJun / MoveCheck.afterMoveStillJiangJun 的 R-2 守卫一致；
   // 不加这道闸的话，-1 会被拿去索引 pathPoints[x][y] → undefined[-1] 抛 TypeError。
   if (!general.alive || !isOnBoard(general.col, general.row)) return true;
+
+  /**
+   * 揭棋：暗子**不是攻击者** —— 背面朝上的子连将军都不算（铁律：暗子无攻击身份）。
+   * 这里必须复用引擎的 isJiangJun，而不是下面的 isGeneralAttacked：
+   * 后者只按盘面 id 推走点，会把一枚盖着的车算成「正在攻击对方主帅」，
+   * 导致搜索把大量根本不存在将军的局面判成将军，评估全面失真。
+   *
+   * 象棋：variant !== 'jieqi' 时 isJiangJun 与本函数原有逻辑等价，
+   * 且它已跳过将/帅自身，故直接复用不改变既有行为（引擎口径单一来源）。
+   */
+  if (state.variant === 'jieqi') {
+    return isJiangJun(state, generalId)[0] === generalId;
+  }
+
   return isGeneralAttacked(state.qiPan, general.col, general.row, side);
 }
 
@@ -776,7 +920,21 @@ function generatePseudoMoves(state: GameState): Move[] {
     // 那步「走法」随后在 applyMove 的 ZOBRIST_TABLE[id][-1][-1] 上抛 TypeError。
     if (!isOnBoard(piece.col, piece.row)) continue;
     const pathPoints = scratchPathPoints;
-    fillPathPoints(i, state.qiPan, positions, pathPoints);
+    /**
+     * 揭棋：走点派发必须走「有效棋种」路径 ——
+     * 未翻开的暗子按盘面 id（棋位棋种）走，已翻开的按 revealedType 的真实棋种走，
+     * 且已翻开的士/象享受过河放宽。与 GameEngine/RuleEngine 同口径（motionArgs）。
+     *
+     * 象棋：两个参数皆 undefined ⇒ fillPathPoints 内的新分支恒不进入，行为不变。
+     */
+    if (state.variant === 'jieqi') {
+      fillPathPoints(
+        i, state.qiPan, positions, pathPoints,
+        crossRiverOf(state, i), effectiveIdOf(state, i),
+      );
+    } else {
+      fillPathPoints(i, state.qiPan, positions, pathPoints);
+    }
 
     for (let r = 0; r < 10; r++) {
       for (let c = 0; c < 9; c++) {
@@ -786,7 +944,9 @@ function generatePseudoMoves(state: GameState): Move[] {
         const target = state.qiPan[c][r];
         let score = 0;
         if (target !== -1) {
-          score = PIECE_VALUES[target] * 10 - PIECE_VALUES[i];
+          // 揭棋：被吃子若是暗子，其真实身份双方都不可见（决策 A），
+          // 故只能按后验期望计值；象棋仍用原表，行为不变。
+          score = effectivePieceValue(state, target) * 10 - effectivePieceValue(state, i);
         }
 
         moves.push({
@@ -827,6 +987,11 @@ export function cloneForSearch(state: GameState): GameState {
     ...state,
     qiPan: state.qiPan.map(col => [...col]),
     pieces: state.pieces.map(p => ({ ...p })),
+    // 揭棋：搜索树里 applyMove 会原地改写 hiddenMask/revealedType，
+    // 必须深拷贝 —— 否则会改到调用方的真局面，把「暗子」真的翻开了。
+    // 象棋这两个字段为 undefined，[...(undefined ?? [])] 得 []，无害。
+    hiddenMask: state.hiddenMask ? [...state.hiddenMask] : state.hiddenMask,
+    revealedType: state.revealedType ? [...state.revealedType] : state.revealedType,
     moveHistory: state.moveHistory.map(m => ({ ...m })),
     ruleState: state.ruleState
       ? {
@@ -852,12 +1017,38 @@ interface UndoInfo {
   capturedRow: number;
   prevSideTag: SideTag;
   prevHash: number; // 走棋前的 Zobrist 哈希（用于撤销恢复）
+  // 揭棋：搜索树里「走暗子即翻开」，撤销时要把暗子放回背面状态。
+  // undefined = 本步没发生翻开（象棋恒为 undefined，撤销逻辑不进入）。
+  prevRevealedType?: JieqiPieceType | null;
+  prevHidden?: boolean;
 }
 
 function applyMove(state: GameState, pieceId: number, toCol: number, toRow: number): UndoInfo {
   const piece = state.pieces[pieceId];
   const capturedPieceId = state.qiPan[toCol][toRow];
   const prevHash = state.zobristHash; // 保存旧哈希用于撤销
+
+  /**
+   * 揭棋：走子即翻开（规则 4）。
+   *
+   * 搜索树里必须模拟这一步 —— 否则会算错两处：
+   * 1. 该子后续的走点应按**真实棋种**走，且士/象过河放宽立即生效；
+   * 2. 它**立刻变成攻击者**（暗子不是攻击者，但翻开就是）。
+   *
+   * ⚠️ 真实身份在搜索中不可得（铁律 A：身份只在内存身份表里，
+   * 且此刻是「对手即将看到」的信息）。这里按后验**采样一个**身份，
+   * 与方案 §9.3 一致；提示（hint）通道必须关闭采样以保确定性，
+   * 见下方 pureBest 参数。
+   *
+   * 象棋：variant !== 'jieqi' ⇒ prevRevealedType 保持 undefined，撤销时零开销。
+   */
+  const wasHidden = state.variant === 'jieqi' && state.hiddenMask?.[pieceId] === true;
+  let sampledType: JieqiPieceType | null = null;
+  if (wasHidden) {
+    sampledType = sampleHiddenIdentity(state, pieceId);
+    state.revealedType![pieceId] = sampledType;
+    state.hiddenMask![pieceId] = false;
+  }
 
   const undo: UndoInfo = {
     pieceId,
@@ -870,6 +1061,8 @@ function applyMove(state: GameState, pieceId: number, toCol: number, toRow: numb
     capturedRow: capturedPieceId !== -1 ? state.pieces[capturedPieceId].row : -1,
     prevSideTag: state.sideTag,
     prevHash,
+    prevRevealedType: wasHidden ? null : undefined,
+    prevHidden: wasHidden ? true : undefined,
   };
 
   // 增量更新 Zobrist 哈希：移除起点棋子 + 添加终点棋子
@@ -922,6 +1115,12 @@ function unapplyMove(state: GameState, undo: UndoInfo): void {
   // 恢复棋子位置
   piece.col = undo.fromCol;
   piece.row = undo.fromRow;
+
+  // 恢复揭棋的翻开状态（把走过的暗子放回背面）
+  if (undo.prevHidden === true) {
+    state.hiddenMask![undo.pieceId] = true;
+    state.revealedType![undo.pieceId] = undo.prevRevealedType ?? null;
+  }
 }
 
 // ======================== 杀手走法 ========================
@@ -1251,6 +1450,14 @@ export async function searchWithTimeBudget(
   pureBest: boolean
 ): Promise<AIMoveResult | null> {
   const isMaximizing = state.sideTag === RED_SIDE;
+
+  /**
+   * 揭棋：提示（pureBest=true）必须走确定性翻牌，否则同一局面两次提示会给出不同结果。
+   * 对弈（pureBest=false）则保留随机翻牌 —— 揭棋的策略多样性本来就该有随机性。
+   * 象棋不进入 sampleHiddenIdentity，该开关无副作用。
+   */
+  jieqiDeterministicReveal = pureBest;
+
   let moves = generatePseudoMoves(state);
   if (moves.length === 0) return null;
 
@@ -1616,11 +1823,26 @@ export async function getBestMoveAsync(
   await new Promise<void>(resolve => setTimeout(resolve, 50));
   const maxDepth = MAX_DEPTH[difficulty] || 4;
   const timeBudget = TIME_BUDGET[difficulty] || 2000;
+  /**
+   * 揭棋：同等时间预算下深度必须下调（方案 §9.4）——
+   * 每个节点除了生成着法，还要算一份身份后验期望，比象棋贵一截。
+   *
+   * | 难度 | 象棋深度 | 揭棋深度 | 理由 |
+   * | --- | --- | --- | --- |
+   * | 入门 easy | 2 | 2 | 随机性本就高，深度不敏感 |
+   * | 进阶 medium | 3 | 3 | 与 medium 对齐，尚可承受 |
+   * | 大师 hard | 4 | 3 | JS 单线程扛不住深度 4，且大师档的价值在于提示 |
+   *
+   * hard 只降深度、不降时间预算：时间预算由 `SEND_SLICE_MS` 分片让出保证不卡 UI。
+   */
+  const jieqiDepth = state.variant === 'jieqi'
+    ? (difficulty === 'hard' ? 3 : maxDepth)
+    : maxDepth;
   // 让出主线程并分片执行：残局闯关固定走本地 AI，hard 预算长达 2.5s，
   // 若全程同步阻塞会冻结 JS 线程，导致走子音效的音频桥接消息无法送达、AI 落子无声；
   // 分片后搜索期间音频/UI/触摸保持响应（搜索逻辑与结果不受影响）。
   // 在私有副本上搜索：让出期间调用方（React state）不会被改写成搜索树的中间局面
-  return searchWithTimeBudget(cloneForSearch(state), maxDepth, timeBudget, false);
+  return searchWithTimeBudget(cloneForSearch(state), jieqiDepth, timeBudget, false);
 }
 
 // ======================== 提示预计算（后台思考 / Ponder） ========================

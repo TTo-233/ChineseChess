@@ -86,6 +86,31 @@ async function runOffline(
   purpose: 'move' | 'hint'
 ): Promise<{ move: AIMoveResult; engine: string; depth: number; timeMs: number } | null> {
   const startedAt = Date.now();
+
+  /**
+   * 揭棋：皮卡鱼**只懂象棋**，喂给它揭棋 FEN 只会得到垃圾着法或直接报错，
+   * 所以揭棋必须在入口就短路到本地 TS 引擎（它已支持揭棋，见 AIEngine 揭棋分支）。
+   *
+   * ⚠️ 这道闸必须在 `requestOfflineMove` **之前**：引擎不认揭棋，
+   * 让它先跑一遍只会浪费一整个时间预算（hard 档 2.5s）再回落，
+   * 表现为「揭棋 AI 每步都慢半拍」。
+   *
+   * 不走 runOffline 的 catch 兜底：那是给「引擎不可用」用的降级路径，
+   * 揭棋是**永久性**的能力缺失，走降级路径会让 engine 标签显示成
+   * 「皮卡鱼启动中」，虚报棋力来源（与 resolveOfflineEngineLabel 的注释同源问题）。
+   */
+  if (state.variant === 'jieqi') {
+    const jieqiTier = tier === 'hint' ? 'hard' : tier;
+    const move = tier === 'hint'
+      ? await getHintMoveAsync(state)
+      : await getBestMoveAsync(state, jieqiTier);
+    const safe = rejectMoverUnsafe(state, move);
+    if (!safe) return null;
+    // 标签固定 'legacy'：现有 UI 只有三种标签，'legacy' 在 UI 上表示
+    // 「本地基础 AI」，对揭棋而言是准确的（首版无揭棋专用引擎）。
+    return { move: safe, engine: 'legacy', depth: 0, timeMs: Date.now() - startedAt };
+  }
+
   try {
     const outcome = await requestOfflineMove(state, tier, purpose);
     // requestOfflineMove 已过三重守卫；这里再确认一次送将（与在线路径同构的出口断言）

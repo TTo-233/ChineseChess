@@ -17,6 +17,10 @@ import {
   type GameState,
 } from '@/utils/chess/GameEngine';
 import {
+  createJieqiInitialState,
+  type JieqiIdentity,
+} from '@/utils/chess/jieqi';
+import {
   clearHistoryHash,
   computeZobristHash,
   recordHistoryHash,
@@ -54,6 +58,29 @@ export function buildInitialGameState(initialSideTag: boolean): GameState {
   return state;
 }
 
+/**
+ * 揭棋开局局面 + **身份表**（与 buildInitialGameState 同构）。
+ *
+ * ⚠️ 身份表（JieqiIdentity）**不是** GameState 的一部分（铁律 A）：
+ * 它只交给调用方存在内存里，`makeMove` 每次翻开暗子时需要它。
+ * 故本函数返回 `{ state, identity }` 而不是裸 GameState ——
+ * 让「必须一起带着走」这件事在类型上就无法忽略。
+ *
+ * 开局走棋方：揭棋**红先**（规则 1）。故 `initialSideTag` 只在显式要求黑先时生效，
+ * 正常入口传 RED_SIDE。
+ */
+export function buildJieqiInitialGameState(
+  initialSideTag: boolean,
+  seed?: number
+): { state: GameState; identity: JieqiIdentity } {
+  const { state, identity } = createJieqiInitialState(undefined, initialSideTag);
+  state.zobristHash = computeZobristHash(state);
+  clearHistoryHash();
+  recordHistoryHash(state);
+  void seed;
+  return { state, identity };
+}
+
 export interface GameResetHandlers {
   setGameState: (state: GameState) => void;
   setSelectedPieceId: (id: number | null) => void;
@@ -73,6 +100,13 @@ export interface GameResetHandlers {
 export interface NewGameOptions {
   /** 残局模式下的开局局面；缺省（或非残局）则按 `initialSideTag` 开标准局 */
   endgameFen?: string;
+  /**
+   * 揭棋：开一局揭棋而非象棋。身份表由本 Hook 生成并通过 `onIdentity` 交给调用方持有
+   * （铁律 A：它不能进 GameState，所以必须显式带出去）。
+   */
+  variant?: 'jieqi';
+  /** 揭棋身份表的接收口；象棋路径不调用 */
+  onIdentity?: (identity: JieqiIdentity) => void;
   /** 标准局的开局走棋方 SideTag */
   initialSideTag: boolean;
   /** 玩家执黑时棋盘默认翻转 */
@@ -144,6 +178,8 @@ export function useNewGame(args: UseNewGameArgs): UseNewGameApi {
     (options: NewGameOptions): GameState => {
       const {
         endgameFen,
+        variant,
+        onIdentity,
         initialSideTag,
         initialFlipped,
         aiFirst,
@@ -157,9 +193,18 @@ export function useNewGame(args: UseNewGameArgs): UseNewGameApi {
       invalidatePendingAI();
       clearHint();
 
-      const newState = endgameFen
-        ? buildGameStateFromFen(endgameFen)
-        : buildInitialGameState(initialSideTag);
+      /**
+       * 揭棋重开必须**重新洗牌**：每局暗子身份都不同（规则 1）。
+       * 身份表交给调用方持有，本 Hook 不留存 —— 它只负责生成。
+       */
+      const jieqi = variant === 'jieqi' ? buildJieqiInitialGameState(initialSideTag) : null;
+      if (jieqi) onIdentity?.(jieqi.identity);
+
+      const newState = jieqi
+        ? jieqi.state
+        : endgameFen
+          ? buildGameStateFromFen(endgameFen)
+          : buildInitialGameState(initialSideTag);
 
       setGameState(newState);
       setSelectedPieceId(null);

@@ -87,7 +87,7 @@ function createPathPointsBuffer() {
   }
   return points;
 }
-function fillPathPoints(moveQiZi, qiPan, piecePositions, points) {
+function fillPathPoints(moveQiZi, qiPan, piecePositions, points, crossRiver, effectiveId) {
   for (let i = 0; i < BOARD_COLS; i++) {
     const col2 = points[i];
     for (let j = 0; j < BOARD_ROWS; j++) {
@@ -98,60 +98,61 @@ function fillPathPoints(moveQiZi, qiPan, piecePositions, points) {
   if (!piecePositions[moveQiZi].alive) return;
   const col = piecePositions[moveQiZi].col;
   const row = piecePositions[moveQiZi].row;
-  switch (moveQiZi) {
+  const dispatchId = effectiveId === void 0 ? moveQiZi : effectiveId;
+  switch (dispatchId) {
     case 7:
     case 8:
     case 23:
     case 24:
-      calcChe(col, row, moveQiZi, qiPan, points);
+      calcChe(col, row, dispatchId, qiPan, points);
       break;
     case 5:
     case 6:
     case 21:
     case 22:
-      calcMa(col, row, moveQiZi, qiPan, points);
+      calcMa(col, row, dispatchId, qiPan, points);
       break;
     case 3:
     case 4:
     case 19:
     case 20:
-      calcXiang(col, row, moveQiZi, qiPan, points);
+      calcXiang(col, row, dispatchId, qiPan, points, crossRiver);
       break;
     case 1:
     case 2:
     case 17:
     case 18:
-      calcShi(col, row, moveQiZi, qiPan, points);
+      calcShi(col, row, dispatchId, qiPan, points, crossRiver);
       break;
     case 0:
     case 16:
-      calcJiang(col, row, moveQiZi, qiPan, points);
+      calcJiang(col, row, dispatchId, qiPan, points);
       break;
     case 9:
     case 10:
     case 25:
     case 26:
-      calcPao(col, row, moveQiZi, qiPan, points);
+      calcPao(col, row, dispatchId, qiPan, points);
       break;
     case 11:
     case 12:
     case 13:
     case 14:
     case 15:
-      calcHeiZu(col, row, moveQiZi, qiPan, points);
+      calcHeiZu(col, row, dispatchId, qiPan, points);
       break;
     case 27:
     case 28:
     case 29:
     case 30:
     case 31:
-      calcHongBing(col, row, moveQiZi, qiPan, points);
+      calcHongBing(col, row, dispatchId, qiPan, points);
       break;
   }
 }
-function getPathPoints(moveQiZi, qiPan, piecePositions) {
+function getPathPoints(moveQiZi, qiPan, piecePositions, crossRiver, effectiveId) {
   const points = createPathPointsBuffer();
-  fillPathPoints(moveQiZi, qiPan, piecePositions, points);
+  fillPathPoints(moveQiZi, qiPan, piecePositions, points, crossRiver, effectiveId);
   return points;
 }
 function calcChe(col, row, moveQiZi, qiPan, points) {
@@ -206,9 +207,24 @@ function calcMa(col, row, moveQiZi, qiPan, points) {
     if (row < 9 && !isTongBang(moveQiZi, qiPan[col + 2][row + 1])) points[col + 2][row + 1] = true;
   }
 }
-function calcXiang(col, row, moveQiZi, qiPan, points) {
+function calcXiang(col, row, moveQiZi, qiPan, points, crossRiver) {
   let side = 0;
   if (row <= 4) side = 5;
+  if (crossRiver) {
+    if (col > 1 && qiPan[col - 1][row + 1] === -1 && !isTongBang(moveQiZi, qiPan[col - 2][row + 2])) {
+      points[col - 2][row + 2] = true;
+    }
+    if (col < 7 && qiPan[col + 1][row + 1] === -1 && !isTongBang(moveQiZi, qiPan[col + 2][row + 2])) {
+      points[col + 2][row + 2] = true;
+    }
+    if (col > 1 && qiPan[col - 1][row - 1] === -1 && !isTongBang(moveQiZi, qiPan[col - 2][row - 2])) {
+      points[col - 2][row - 2] = true;
+    }
+    if (col < 7 && qiPan[col + 1][row - 1] === -1 && !isTongBang(moveQiZi, qiPan[col + 2][row - 2])) {
+      points[col + 2][row - 2] = true;
+    }
+    return;
+  }
   if (row !== 9 - side) {
     if (col > 0 && qiPan[col - 1][row + 1] === -1 && !isTongBang(moveQiZi, qiPan[col - 2][row + 2])) {
       points[col - 2][row + 2] = true;
@@ -226,7 +242,14 @@ function calcXiang(col, row, moveQiZi, qiPan, points) {
     }
   }
 }
-function calcShi(col, row, moveQiZi, qiPan, points) {
+function calcShi(col, row, moveQiZi, qiPan, points, crossRiver) {
+  if (crossRiver) {
+    if (col > 0 && !isTongBang(moveQiZi, qiPan[col - 1][row + 1])) points[col - 1][row + 1] = true;
+    if (col < 8 && !isTongBang(moveQiZi, qiPan[col + 1][row + 1])) points[col + 1][row + 1] = true;
+    if (col > 0 && !isTongBang(moveQiZi, qiPan[col - 1][row - 1])) points[col - 1][row - 1] = true;
+    if (col < 8 && !isTongBang(moveQiZi, qiPan[col + 1][row - 1])) points[col + 1][row - 1] = true;
+    return;
+  }
   let side = 0;
   if (row <= 4) side = 7;
   if (row !== 9 - side) {
@@ -310,7 +333,7 @@ function calcHongBing(col, row, moveQiZi, qiPan, points) {
     if (col < 8 && !isTongBang(moveQiZi, qiPan[col + 1][row])) points[col + 1][row] = true;
   }
 }
-function afterMoveStillJiangJun(qiZi, x0, y0, x1, y1, qiPan, piecePositions) {
+function afterMoveStillJiangJun(qiZi, x0, y0, x1, y1, qiPan, piecePositions, hiddenAttacker, attackerMotion) {
   const myQiPan = qiPan.map((r) => [...r]);
   myQiPan[x1][y1] = qiZi;
   myQiPan[x0][y0] = -1;
@@ -352,8 +375,10 @@ function afterMoveStillJiangJun(qiZi, x0, y0, x1, y1, qiPan, piecePositions) {
       if (qiZi > 15) {
         if (localQiZi >= 5 && localQiZi <= 15) {
           if (!piecePositions[localQiZi].alive) continue;
+          if (hiddenAttacker && hiddenAttacker(localQiZi)) continue;
           if (!(qiZi === 16) && shuaiOffBoard) continue;
-          const thisPoints = getPathPoints(localQiZi, myQiPan, myPositions);
+          const am = attackerMotion ? attackerMotion(localQiZi) : void 0;
+          const thisPoints = getPathPoints(localQiZi, myQiPan, myPositions, am?.crossRiver, am?.effectiveId);
           const x = qiZi === 16 ? x1 : shuai.col;
           const y = qiZi === 16 ? y1 : shuai.row;
           if (thisPoints[x][y]) return true;
@@ -362,8 +387,10 @@ function afterMoveStillJiangJun(qiZi, x0, y0, x1, y1, qiPan, piecePositions) {
       if (qiZi < 16) {
         if (localQiZi >= 21 && localQiZi <= 31) {
           if (!piecePositions[localQiZi].alive) continue;
+          if (hiddenAttacker && hiddenAttacker(localQiZi)) continue;
           if (qiZi !== 0 && jiangOffBoard) continue;
-          const thisPoints = getPathPoints(localQiZi, myQiPan, myPositions);
+          const am = attackerMotion ? attackerMotion(localQiZi) : void 0;
+          const thisPoints = getPathPoints(localQiZi, myQiPan, myPositions, am?.crossRiver, am?.effectiveId);
           const x = qiZi === 0 ? x1 : jiang.col;
           const y = qiZi === 0 ? y1 : jiang.row;
           if (thisPoints[x][y]) return true;
@@ -372,6 +399,63 @@ function afterMoveStillJiangJun(qiZi, x0, y0, x1, y1, qiPan, piecePositions) {
     }
   }
   return false;
+}
+
+// chinese-chess-client/client/utils/chess/jieqi.ts
+var keyOf = (side) => side === RED_SIDE ? "red" : "black";
+var TYPE_IDS_BY_SIDE = {
+  black: {
+    shi: [1, 2],
+    xiang: [3, 4],
+    ma: [5, 6],
+    che: [7, 8],
+    pao: [9, 10],
+    zu: [11, 12, 13, 14, 15],
+    bing: []
+  },
+  red: {
+    shi: [17, 18],
+    xiang: [19, 20],
+    ma: [21, 22],
+    che: [23, 24],
+    pao: [25, 26],
+    zu: [],
+    bing: [27, 28, 29, 30, 31]
+  }
+};
+var ALL_TYPES = ["che", "ma", "pao", "shi", "xiang", "zu", "bing"];
+var ID_TYPE = (() => {
+  const m = {};
+  for (const key of ["black", "red"]) {
+    const byType = TYPE_IDS_BY_SIDE[key];
+    for (const t of ALL_TYPES) {
+      for (const id of byType[t]) m[id] = t;
+    }
+  }
+  return m;
+})();
+function sideOfId(id) {
+  return id <= 15 ? BLACK_SIDE : RED_SIDE;
+}
+function idsOfType(type, side) {
+  return TYPE_IDS_BY_SIDE[keyOf(side)][type];
+}
+function representativeId(type, side) {
+  const ids = idsOfType(type, side);
+  return ids.length > 0 ? ids[0] : null;
+}
+function effectiveIdOf(state, id) {
+  if (state.variant !== "jieqi") return void 0;
+  if (state.hiddenMask?.[id] === true) return void 0;
+  const type = state.revealedType?.[id];
+  if (!type) return void 0;
+  return representativeId(type, sideOfId(id)) ?? void 0;
+}
+function crossRiverOf(state, id) {
+  if (state.variant !== "jieqi") return void 0;
+  if (state.hiddenMask?.[id] === true) return false;
+  const type = state.revealedType?.[id];
+  return type === "shi" || type === "xiang" ? true : void 0;
 }
 
 // chinese-chess-client/client/utils/chess/RuleEngine.ts
@@ -423,24 +507,58 @@ function sideKey(side) {
 function toPositions(state) {
   return state.pieces.map((p) => ({ col: p.col, row: p.row, alive: p.alive }));
 }
+function hiddenAttackerOf(state) {
+  if (state.variant !== "jieqi") return void 0;
+  const mask = state.hiddenMask;
+  if (!mask) return void 0;
+  return (id) => mask[id] === true;
+}
+function motionArgs(state, id) {
+  if (state.variant !== "jieqi") return {};
+  return {
+    crossRiver: crossRiverOf(state, id),
+    effectiveId: effectiveIdOf(state, id)
+  };
+}
+function attackerMotionOf(state) {
+  if (state.variant !== "jieqi") return void 0;
+  const mask = state.hiddenMask;
+  const revealed = state.revealedType;
+  if (!mask || !revealed) return void 0;
+  return (id) => ({
+    crossRiver: mask[id] !== true && revealed[id] != null && crossRiverOf(state, id),
+    effectiveId: effectiveIdOf(state, id)
+  });
+}
 function positionKey(state) {
   let key = "";
   for (let i = 0; i < 32; i++) {
     const p = state.pieces[i];
     if (p.alive) key += `${i}:${p.col}${p.row};`;
   }
-  return key + (state.sideTag === RED_SIDE ? "w" : "b");
+  let out = key + (state.sideTag === RED_SIDE ? "w" : "b");
+  if (state.variant === "jieqi" && state.hiddenMask) {
+    let bits = 0;
+    for (let i = 0; i < 32; i++) {
+      if (state.hiddenMask[i]) bits |= 1 << i;
+    }
+    out += `|h${(bits >>> 0).toString(36)}`;
+  }
+  return out;
 }
 function isSideInCheck(state, side) {
   const kingId = side === RED_SIDE ? 16 : 0;
   const king = state.pieces[kingId];
   if (!king.alive) return false;
   const positions = toPositions(state);
+  const mask = state.hiddenMask;
   const enemyStart = side === RED_SIDE ? 5 : 21;
   const enemyEnd = side === RED_SIDE ? 16 : 32;
   for (let id = enemyStart; id < enemyEnd; id++) {
     if (!state.pieces[id].alive) continue;
-    const pts = getPathPoints(id, state.qiPan, positions);
+    if (mask && mask[id]) continue;
+    const m = motionArgs(state, id);
+    const pts = getPathPoints(id, state.qiPan, positions, m.crossRiver, m.effectiveId);
     if (pts[king.col][king.row]) return true;
   }
   return false;
@@ -453,12 +571,13 @@ function enumerateLegalMoves(state, side) {
   for (let id = start; id < end; id++) {
     const piece = state.pieces[id];
     if (!piece.alive) continue;
-    const pts = getPathPoints(id, state.qiPan, positions);
+    const m = motionArgs(state, id);
+    const pts = getPathPoints(id, state.qiPan, positions, m.crossRiver, m.effectiveId);
     for (let c = 0; c < BOARD_COLS; c++) {
       for (let r = 0; r < BOARD_ROWS; r++) {
         if (!pts[c][r]) continue;
         if (c === piece.col && r === piece.row) continue;
-        if (afterMoveStillJiangJun(id, piece.col, piece.row, c, r, state.qiPan, positions)) continue;
+        if (afterMoveStillJiangJun(id, piece.col, piece.row, c, r, state.qiPan, positions, hiddenAttackerOf(state), attackerMotionOf(state))) continue;
         moves.push({ pieceId: id, fromCol: piece.col, fromRow: piece.row, toCol: c, toRow: r });
       }
     }
@@ -475,7 +594,10 @@ function simulateMove(state, pieceId, toCol, toRow) {
     isCheck: false,
     checkMessage: "",
     zobristHash: 0,
-    ruleState: state.ruleState
+    ruleState: state.ruleState,
+    variant: state.variant,
+    hiddenMask: state.hiddenMask ? [...state.hiddenMask] : void 0,
+    revealedType: state.revealedType ? [...state.revealedType] : void 0
   };
   const piece = next.pieces[pieceId];
   const captured = next.qiPan[toCol][toRow];
@@ -483,23 +605,32 @@ function simulateMove(state, pieceId, toCol, toRow) {
   next.qiPan[toCol][toRow] = pieceId;
   piece.col = toCol;
   piece.row = toRow;
-  if (captured !== -1) next.pieces[captured].alive = false;
+  if (captured !== -1) {
+    next.pieces[captured].alive = false;
+    if (next.variant === "jieqi") {
+      next.pieces[captured].col = -1;
+      next.pieces[captured].row = -1;
+    }
+  }
   next.isCheck = isSideInCheck(next, next.sideTag);
   return next;
 }
 function isPinnedMove(state, pieceId, toCol, toRow) {
   const positions = toPositions(state);
   const p = state.pieces[pieceId];
-  return afterMoveStillJiangJun(pieceId, p.col, p.row, toCol, toRow, state.qiPan, positions);
+  return afterMoveStillJiangJun(pieceId, p.col, p.row, toCol, toRow, state.qiPan, positions, hiddenAttackerOf(state), attackerMotionOf(state));
 }
 function attackersOf(state, attackSide, col, row) {
   const positions = toPositions(state);
   const result = [];
   const start = attackSide === RED_SIDE ? 16 : 0;
   const end = attackSide === RED_SIDE ? 32 : 16;
+  const hiddenAttacker = hiddenAttackerOf(state);
   for (let id = start; id < end; id++) {
     if (!state.pieces[id].alive) continue;
-    const pts = getPathPoints(id, state.qiPan, positions);
+    if (hiddenAttacker && hiddenAttacker(id)) continue;
+    const m = motionArgs(state, id);
+    const pts = getPathPoints(id, state.qiPan, positions, m.crossRiver, m.effectiveId);
     if (pts[col][row]) result.push(id);
   }
   return result;
@@ -528,12 +659,15 @@ function isSacrificeExchange(state, attackerId, targetId) {
 function isPiecePinned(state, targetId) {
   const positions = toPositions(state);
   const t = state.pieces[targetId];
-  const pts = getPathPoints(targetId, state.qiPan, positions);
+  const m = motionArgs(state, targetId);
+  const pts = getPathPoints(targetId, state.qiPan, positions, m.crossRiver, m.effectiveId);
+  const hiddenAttacker = hiddenAttackerOf(state);
+  const attackers = attackerMotionOf(state);
   for (let c = 0; c < BOARD_COLS; c++) {
     for (let r = 0; r < BOARD_ROWS; r++) {
       if (!pts[c][r]) continue;
       if (c === t.col && r === t.row) continue;
-      if (!afterMoveStillJiangJun(targetId, t.col, t.row, c, r, state.qiPan, positions)) {
+      if (!afterMoveStillJiangJun(targetId, t.col, t.row, c, r, state.qiPan, positions, hiddenAttacker, attackers)) {
         return false;
       }
     }
@@ -546,12 +680,15 @@ function detectZhuo(state, moverSide) {
   const enemyEnd = enemySide === RED_SIDE ? 32 : 16;
   const results = [];
   const positions = toPositions(state);
+  const hiddenAttacker = hiddenAttackerOf(state);
   const myPoints = /* @__PURE__ */ new Map();
   const myStart = moverSide === RED_SIDE ? 16 : 0;
   const myEnd = moverSide === RED_SIDE ? 32 : 16;
   for (let id = myStart; id < myEnd; id++) {
     if (!state.pieces[id].alive) continue;
-    myPoints.set(id, getPathPoints(id, state.qiPan, positions));
+    if (hiddenAttacker && hiddenAttacker(id)) continue;
+    const m = motionArgs(state, id);
+    myPoints.set(id, getPathPoints(id, state.qiPan, positions, m.crossRiver, m.effectiveId));
   }
   for (let targetId = enemyStart; targetId < enemyEnd; targetId++) {
     const t = state.pieces[targetId];
@@ -924,7 +1061,15 @@ function cloneGameState(state) {
     isCheck: state.isCheck,
     checkMessage: state.checkMessage,
     zobristHash: state.zobristHash,
-    ruleState: state.ruleState ? cloneRuleState(state.ruleState) : void 0
+    ruleState: state.ruleState ? cloneRuleState(state.ruleState) : void 0,
+    // 揭棋字段：variant 缺省时原样透传 undefined，象棋行为不变；
+    // hiddenMask 必须**深拷贝**——它是 32 长度的布尔数组，
+    // 若与原局面共享引用，makeMove 的翻开/吃子改写会污染调用方的旧局面
+    // （cloneGameState 的全部意义就是切断别名，这条不能省）。
+    variant: state.variant,
+    hiddenMask: state.hiddenMask ? [...state.hiddenMask] : void 0,
+    // 同 hiddenMask：必须深拷贝，翻开时会被就地写入
+    revealedType: state.revealedType ? [...state.revealedType] : void 0
   };
 }
 function applyHandicap(state, handicapIds) {
@@ -942,6 +1087,29 @@ function applyHandicap(state, handicapIds) {
 function toPiecePositions(pieces) {
   return pieces.map((p) => ({ col: p.col, row: p.row, alive: p.alive }));
 }
+function hiddenAttackerOf2(state) {
+  if (state.variant !== "jieqi") return void 0;
+  const mask = state.hiddenMask;
+  if (!mask) return void 0;
+  return (id) => mask[id] === true;
+}
+function motionArgs2(state, id) {
+  if (state.variant !== "jieqi") return {};
+  return {
+    crossRiver: crossRiverOf(state, id),
+    effectiveId: effectiveIdOf(state, id)
+  };
+}
+function attackerMotionOf2(state) {
+  if (state.variant !== "jieqi") return void 0;
+  const mask = state.hiddenMask;
+  const revealed = state.revealedType;
+  if (!mask || !revealed) return void 0;
+  return (id) => ({
+    crossRiver: mask[id] !== true && revealed[id] != null && crossRiverOf(state, id),
+    effectiveId: effectiveIdOf(state, id)
+  });
+}
 function getSelectableMoves(state, pieceId) {
   const empty = () => Array.from({ length: BOARD_COLS }, () => Array(BOARD_ROWS).fill(false));
   if (pieceId < 0 || pieceId > 31) return empty();
@@ -950,7 +1118,8 @@ function getSelectableMoves(state, pieceId) {
   if (piece.col < 0 || piece.col >= BOARD_COLS || piece.row < 0 || piece.row >= BOARD_ROWS) return empty();
   const pieceSide = pieceId <= 15 ? BLACK_SIDE : RED_SIDE;
   if (pieceSide !== state.sideTag) return empty();
-  const points = getPathPoints(pieceId, state.qiPan, toPiecePositions(state.pieces));
+  const m = motionArgs2(state, pieceId);
+  const points = getPathPoints(pieceId, state.qiPan, toPiecePositions(state.pieces), m.crossRiver, m.effectiveId);
   points[piece.col][piece.row] = false;
   return points;
 }
@@ -967,7 +1136,9 @@ function isMoveKingSafe(state, pieceId, toCol, toRow) {
     toCol,
     toRow,
     state.qiPan,
-    toPiecePositions(state.pieces)
+    toPiecePositions(state.pieces),
+    hiddenAttackerOf2(state),
+    attackerMotionOf2(state)
   );
 }
 function isJiangJun(state, jiangOrShuai) {
@@ -979,10 +1150,13 @@ function isJiangJun(state, jiangOrShuai) {
     return result;
   }
   const positions = toPiecePositions(state.pieces);
+  const hiddenAttacker = hiddenAttackerOf2(state);
   if (jiangOrShuai === 16) {
     for (let qizi = 5; qizi <= 15; qizi++) {
       if (!state.pieces[qizi].alive) continue;
-      const thisPoints = getPathPoints(qizi, state.qiPan, positions);
+      if (hiddenAttacker && hiddenAttacker(qizi)) continue;
+      const m = motionArgs2(state, qizi);
+      const thisPoints = getPathPoints(qizi, state.qiPan, positions, m.crossRiver, m.effectiveId);
       const x = target.col;
       const y = target.row;
       if (thisPoints[x][y]) {
@@ -998,7 +1172,9 @@ function isJiangJun(state, jiangOrShuai) {
   if (jiangOrShuai === 0) {
     for (let qizi = 21; qizi <= 31; qizi++) {
       if (!state.pieces[qizi].alive) continue;
-      const thisPoints = getPathPoints(qizi, state.qiPan, positions);
+      if (hiddenAttacker && hiddenAttacker(qizi)) continue;
+      const m = motionArgs2(state, qizi);
+      const thisPoints = getPathPoints(qizi, state.qiPan, positions, m.crossRiver, m.effectiveId);
       const x = target.col;
       const y = target.row;
       if (thisPoints[x][y]) {
@@ -1015,16 +1191,19 @@ function isJiangJun(state, jiangOrShuai) {
 }
 function hasAnyLegalMove(state, side) {
   const positions = toPiecePositions(state.pieces);
+  const hiddenAttacker = hiddenAttackerOf2(state);
   const start = side === RED_SIDE ? 16 : 0;
   const end = side === RED_SIDE ? 32 : 16;
   for (let id = start; id < end; id++) {
     const piece = state.pieces[id];
     if (!piece.alive) continue;
-    const pathBool = getPathPoints(id, state.qiPan, positions);
+    const m = motionArgs2(state, id);
+    const pathBool = getPathPoints(id, state.qiPan, positions, m.crossRiver, m.effectiveId);
+    const attackers = attackerMotionOf2(state);
     for (let c = 0; c < 9; c++) {
       for (let r = 0; r < 10; r++) {
         if (!pathBool[c][r]) continue;
-        if (!afterMoveStillJiangJun(id, piece.col, piece.row, c, r, state.qiPan, positions)) {
+        if (!afterMoveStillJiangJun(id, piece.col, piece.row, c, r, state.qiPan, positions, hiddenAttacker, attackers)) {
           return true;
         }
       }
@@ -1043,18 +1222,29 @@ function isKunBi(state, side) {
   if (isJiangJun(state, jiangId)[0] !== -1) return false;
   return !hasAnyLegalMove(state, side);
 }
-function makeMove(state, pieceId, toCol, toRow) {
+function makeMove(state, pieceId, toCol, toRow, jieqiIdentity) {
   const newState = cloneGameState(state);
   const piece = newState.pieces[pieceId];
   const fromCol = piece.col;
   const fromRow = piece.row;
   const captured = newState.qiPan[toCol][toRow];
+  const flipping = newState.variant === "jieqi" && newState.hiddenMask?.[pieceId] === true;
+  const revealedType = flipping ? jieqiIdentity?.hiddenType[pieceId] ?? null : null;
+  const doFlip = flipping && revealedType != null;
   newState.qiPan[fromCol][fromRow] = -1;
   newState.qiPan[toCol][toRow] = pieceId;
   piece.col = toCol;
   piece.row = toRow;
+  if (doFlip) {
+    newState.revealedType[pieceId] = revealedType;
+    newState.hiddenMask[pieceId] = false;
+  }
   if (captured !== -1) {
     newState.pieces[captured].alive = false;
+    if (newState.variant === "jieqi") {
+      newState.pieces[captured].col = -1;
+      newState.pieces[captured].row = -1;
+    }
   }
   newState.moveHistory.push({
     pieceId,
@@ -1062,7 +1252,10 @@ function makeMove(state, pieceId, toCol, toRow) {
     fromRow,
     toCol,
     toRow,
-    capturedPieceId: captured
+    capturedPieceId: captured,
+    // 翻开时记下真实棋种（供 UI 播动画与 undoMove 精确还原）。
+    // 这是**已经公开**的信息：翻开后的棋子本来就是明子。
+    ...doFlip ? { flippedPieceId: pieceId, revealedType } : {}
   });
   newState.sideTag = !newState.sideTag;
   const checkResult = newState.sideTag === RED_SIDE ? isJiangJun(newState, 16) : isJiangJun(newState, 0);

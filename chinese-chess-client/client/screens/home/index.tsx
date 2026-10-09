@@ -142,7 +142,8 @@ export default function HomeScreen() {
             <View style={styles.entryInfo}>
               <Text style={styles.entryTitle}>人机对战</Text>
               <Text style={styles.entryDescription}>
-                {hasSavedGame ? '有未完成的棋局 · 点击进入' : '三种难度 · 可保存棋局'}
+                {/* 揭棋入口已并入本页首行的「选择模式」，故这里要点明有两种玩法 */}
+                {hasSavedGame ? '有未完成的棋局 · 点击进入' : '象棋 / 揭棋 · 三种难度 · 可保存棋局'}
               </Text>
             </View>
             <FontAwesome6 name="chevron-right" size={16} color={COLORS.textMuted} />

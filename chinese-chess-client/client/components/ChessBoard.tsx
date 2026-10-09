@@ -22,7 +22,7 @@
 import React, { useRef, useEffect, useState, useMemo, useCallback, memo } from 'react';
 import { View, Image, StyleSheet, useWindowDimensions, Text, GestureResponderEvent, Animated, TouchableOpacity } from 'react-native';
 import type { GameState } from '@/utils/chess/GameEngine';
-import { getPieceImage, PIECE_NAMES } from '@/utils/chess/pieceImages';
+import { getPieceImage, getJieqiPieceImage, PIECE_NAMES } from '@/utils/chess/pieceImages';
 import { useBoardStyle } from '@/utils/chess/boardStyleStore';
 import { gridSpacingX, gridSpacingY, BOARD_H_PADDING } from '@/utils/chess/boardStyles';
 // 【C-86】原 import { RED_SIDE, BLACK_SIDE } from '@/utils/chess/types' 是未使用 import
@@ -783,17 +783,27 @@ export default function ChessBoard({
           );
         })}
 
-        {/* 棋子 - 直接遍历传递，避免 find() 查找 */}
+        {/* 棋子 - 直接遍历传递，避免 find() 查找
+            揭棋：暗子显示背面图；已翻开的子**按 revealedType 的真实棋种**显示正面图
+            （绝不能按 id 取 —— id 恒等于棋位棋种，那样翻开看起来毫无变化）。
+            imageSource 已在 PieceItem 的 memo 依赖里，故「走子即翻开」
+            会让该子自动换图，无需额外重渲染逻辑。 */}
         {gameState.pieces.map(piece => {
           if (!piece.alive) return null;
           const anim = pieceAnims.get(piece.id);
           if (!anim) return null;
 
+          const isHidden = gameState.hiddenMask?.[piece.id] === true;
           return (
             <PieceItem
               key={piece.id}
               pieceId={piece.id}
-              imageSource={getPieceImage(piece.id)}
+              imageSource={getJieqiPieceImage(
+                piece.id,
+                isHidden,
+                gameState.revealedType?.[piece.id],
+                piece.id <= 15 ? 'black' : 'red',
+              )}
               animX={anim.x}
               animY={anim.y}
               pieceSize={pieceSize}

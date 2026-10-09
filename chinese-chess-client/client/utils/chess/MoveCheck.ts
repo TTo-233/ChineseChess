@@ -61,7 +61,9 @@ export function fillPathPoints(
   moveQiZi: number,
   qiPan: number[][],
   piecePositions: Array<{ col: number; row: number; alive: boolean }>,
-  points: boolean[][]
+  points: boolean[][],
+  crossRiver?: boolean,
+  effectiveId?: number
 ): void {
   for (let i = 0; i < BOARD_COLS; i++) {
     const col = points[i];
@@ -76,38 +78,51 @@ export function fillPathPoints(
   const col = piecePositions[moveQiZi].col;
   const row = piecePositions[moveQiZi].row;
 
-  switch (moveQiZi) {
+  /**
+   * 【揭棋 · 有效棋种】`dispatchId` 由调用方给出。
+   *
+   * 象棋：直接传 moveQiZi，下面这个 switch 的行为与改动前**逐字节一致**。
+   *
+   * 揭棋：暗子的盘面 id 是它的**棋位**（走法按棋位走），而**已翻开的暗子**
+   * 必须按其真实身份走 —— 但盘面 id 不会变（见 types.ts hiddenMask 注释里
+   * 撞车实测 30/30 的说明），所以这里需要一个「走法派发用的代表 id」。
+   * 调用方按 revealedType 把真实棋种映射成该方同类棋子的**某个** id；
+   * 同类棋子的走法完全相同，故取哪一个都一样（attack 范围同理）。
+   */
+  const dispatchId = effectiveId === undefined ? moveQiZi : effectiveId;
+
+  switch (dispatchId) {
     case 7: case 8: case 23: case 24:
       // 车的移动
-      calcChe(col, row, moveQiZi, qiPan, points);
+      calcChe(col, row, dispatchId, qiPan, points);
       break;
     case 5: case 6: case 21: case 22:
       // 马的移动
-      calcMa(col, row, moveQiZi, qiPan, points);
+      calcMa(col, row, dispatchId, qiPan, points);
       break;
     case 3: case 4: case 19: case 20:
       // 相/象的移动
-      calcXiang(col, row, moveQiZi, qiPan, points);
+      calcXiang(col, row, dispatchId, qiPan, points, crossRiver);
       break;
     case 1: case 2: case 17: case 18:
       // 士/仕的移动
-      calcShi(col, row, moveQiZi, qiPan, points);
+      calcShi(col, row, dispatchId, qiPan, points, crossRiver);
       break;
     case 0: case 16:
       // 将/帅的移动
-      calcJiang(col, row, moveQiZi, qiPan, points);
+      calcJiang(col, row, dispatchId, qiPan, points);
       break;
     case 9: case 10: case 25: case 26:
       // 炮的移动
-      calcPao(col, row, moveQiZi, qiPan, points);
+      calcPao(col, row, dispatchId, qiPan, points);
       break;
     case 11: case 12: case 13: case 14: case 15:
       // 黑卒的移动
-      calcHeiZu(col, row, moveQiZi, qiPan, points);
+      calcHeiZu(col, row, dispatchId, qiPan, points);
       break;
     case 27: case 28: case 29: case 30: case 31:
       // 红兵的移动
-      calcHongBing(col, row, moveQiZi, qiPan, points);
+      calcHongBing(col, row, dispatchId, qiPan, points);
       break;
   }
 }
@@ -137,13 +152,24 @@ export function fillPathPoints(
  * 绕过了本函数自建攻击判定（历史教训见 _review/probe_ai_mate.cjs）。
  * ============================================================================
  */
+/**
+ * 求某棋子的走点。
+ *
+ * @param crossRiver 揭棋「士/象可过河」放宽开关。仅当 variant==='jieqi' 且
+ *   **该子已翻开**时由调用方传 true；象棋恒不传（缺省 undefined）。
+ *   仍是暗子时传 false —— 暗子按棋位走法，盘面无法区分身份，
+ *   规则原文也只说「揭开后的士、象可以过河」。
+ *   传 undefined / false 时 calcShi / calcXiang 走的分支与改动前完全一致。
+ */
 export function getPathPoints(
   moveQiZi: number,
   qiPan: number[][],
-  piecePositions: Array<{ col: number; row: number; alive: boolean }>
+  piecePositions: Array<{ col: number; row: number; alive: boolean }>,
+  crossRiver?: boolean,
+  effectiveId?: number
 ): boolean[][] {
   const points = createPathPointsBuffer();
-  fillPathPoints(moveQiZi, qiPan, piecePositions, points);
+  fillPathPoints(moveQiZi, qiPan, piecePositions, points, crossRiver, effectiveId);
   return points;
 }
 
@@ -196,9 +222,40 @@ function calcMa(
   }
 }
 
-function calcXiang(col: number, row: number, moveQiZi: number, qiPan: number[][], points: boolean[][]) {
+function calcXiang(
+  col: number, row: number, moveQiZi: number, qiPan: number[][],
+  points: boolean[][], crossRiver?: boolean
+) {
   let side = 0;
   if (row <= 4) side = 5; // 上方相/象边界 0-4，下方相/象边界 5-9
+
+  // 揭棋：已翻开的象/相不受河界限制（仍保留「田」字走法与塞眼判定）
+  if (crossRiver) {
+    /**
+     * ⚠️ 这里的边界条件必须用 `col < 7` / `col > 1`（与下方非放宽分支同口径），
+     * **不能**用 `col < 8` / `col > 0`。
+     *
+     * 象走「田」，落点跨 2 格：col=7 时 `col+2=9` 已越界，
+     * `qiPan[9][row+2]` 直接抛 `Cannot read properties of undefined`。
+     * 原写成 `col < 8` 会在象贴到第 7、8 路时崩掉 —— 该分支只在揭棋下可达，
+     * 故象棋不受影响，但揭棋随机对弈必然踩到。
+     */
+    // 下方
+    if (col > 1 && qiPan[col - 1][row + 1] === -1 && !isTongBang(moveQiZi, qiPan[col - 2][row + 2])) {
+      points[col - 2][row + 2] = true;
+    }
+    if (col < 7 && qiPan[col + 1][row + 1] === -1 && !isTongBang(moveQiZi, qiPan[col + 2][row + 2])) {
+      points[col + 2][row + 2] = true;
+    }
+    // 上方
+    if (col > 1 && qiPan[col - 1][row - 1] === -1 && !isTongBang(moveQiZi, qiPan[col - 2][row - 2])) {
+      points[col - 2][row - 2] = true;
+    }
+    if (col < 7 && qiPan[col + 1][row - 1] === -1 && !isTongBang(moveQiZi, qiPan[col + 2][row - 2])) {
+      points[col + 2][row - 2] = true;
+    }
+    return;
+  }
 
   // 下方
   if (row !== 9 - side) {
@@ -220,7 +277,19 @@ function calcXiang(col: number, row: number, moveQiZi: number, qiPan: number[][]
   }
 }
 
-function calcShi(col: number, row: number, moveQiZi: number, qiPan: number[][], points: boolean[][]) {
+function calcShi(
+  col: number, row: number, moveQiZi: number, qiPan: number[][],
+  points: boolean[][], crossRiver?: boolean
+) {
+  // 揭棋：已翻开的士/仕不再受九宫限制（仍保持斜行一步）
+  if (crossRiver) {
+    if (col > 0 && !isTongBang(moveQiZi, qiPan[col - 1][row + 1])) points[col - 1][row + 1] = true;
+    if (col < 8 && !isTongBang(moveQiZi, qiPan[col + 1][row + 1])) points[col + 1][row + 1] = true;
+    if (col > 0 && !isTongBang(moveQiZi, qiPan[col - 1][row - 1])) points[col - 1][row - 1] = true;
+    if (col < 8 && !isTongBang(moveQiZi, qiPan[col + 1][row - 1])) points[col + 1][row - 1] = true;
+    return;
+  }
+
   let side = 0;
   if (row <= 4) side = 7;
 
@@ -362,11 +431,36 @@ function calcHongBing(col: number, row: number, moveQiZi: number, qiPan: number[
  * 换言之，照面是否算"被将"完全取决于上面那段的独立判定，不要在重构成
  * 统一走法生成函数时顺手把它并进攻击判定，那会让所有原本合法的照面着法
  * 突然变成非法（历史上 AI 曾因此漏掉大量真实取胜着，见 _review/probe_ai_mate.cjs）。
+ *
+ * 【揭棋 · 暗子不是攻击者（方案 §3.1，与直觉相反，必须显式实现）】
+ * `hiddenAttacker(id)` 由调用方注入，命中表示该子是**未翻开的暗子**。
+ * 暗子必须从被攻击段的扫描中排除，原因：
+ *   暗子的占位 id 只保证「按棋位走法」，但这个走法**不是玩家能看见的攻击**。
+ *   若不排除，开局基线占位（底线两枚车号暗子正对对方将/帅）就会被算成
+ *   「己方将帅正被攻击」→ 开局即白脸将判负，或所有合法着法被判送将。
+ *   棋规上攻击性由**真实身份**决定，而真实身份对双方都不可见，故暗子
+ *   既不能将军、也不能构成白脸将的依据。
+ * 象棋不注入该回调（传 undefined），分支恒不进入，既有行为逐字节不变。
+ *
+ * 【揭棋 · 攻击范围必须按真实身份派发（与 GameEngine.isJiangJun 同口径）】
+ * `attackerMotion(id)` 注入攻击者的有效走法参数（crossRiver / effectiveId）。
+ *
+ * ⚠️ 这里曾漏注入，导致一个**双向**的错误（实测 272 个随机着法里 45 个分歧）：
+ *   决策 A 下盘面 id 恒等于**棋位棋种**，而攻击性由**真实身份**决定。
+ *   于是「占位是卒、真身是炮」的暗子翻开后会：
+ *     · 只按盘面 id 派发 → 算不出炮的攻击 ⇒ **漏判仍在被将**（漏拦送将）；
+ *     · 反向地「占位是车、真身是马」时 → 多算出不存在的车 ⇒
+ *       把本可的应将着法（如上仕挡将）**误拦成「着法送将」**。
+ *   isJiangJun（走子前）一直按真实身份派发，本函数（走子后）却没有，
+ *   两者口径分叉 ⇒ 同一局面「走子前说被将、走子后说没被将」。
+ *   故凡涉及攻击范围的判定，**必须**与 isJiangJun 走同一套 motionArgs。
  * ============================================================================
  */
 export function afterMoveStillJiangJun(
   qiZi: number, x0: number, y0: number, x1: number, y1: number,
-  qiPan: number[][], piecePositions: Array<{ col: number; row: number; alive: boolean }>
+  qiPan: number[][], piecePositions: Array<{ col: number; row: number; alive: boolean }>,
+  hiddenAttacker?: (id: number) => boolean,
+  attackerMotion?: (id: number) => { crossRiver?: boolean; effectiveId?: number }
 ): boolean {
   const myQiPan = qiPan.map(r => [...r]);
   myQiPan[x1][y1] = qiZi;
@@ -411,8 +505,15 @@ export function afterMoveStillJiangJun(
       if (qiZi > 15) {
         if (localQiZi >= 5 && localQiZi <= 15) {
           if (!piecePositions[localQiZi].alive) continue;
+          // 揭棋：暗子不是攻击者（方案 §3.1，与直觉相反，必须显式排除）
+          if (hiddenAttacker && hiddenAttacker(localQiZi)) continue;
           if (!(qiZi === 16) && shuaiOffBoard) continue;
-          const thisPoints = getPathPoints(localQiZi, myQiPan, myPositions);
+          // 【揭棋 · 必须与 GameEngine.isJiangJun 同口径】攻击者的攻击范围按**真实身份**派发。
+          // 盘面 id 只是棋位（决策 A：id 永不因翻开而改变），占位兵/卒按真实身份是炮时
+          // 就能隔子将军；只按 localQiZi 派发会漏判「仍在被将」⇒ 漏拦送将，
+          // 反向也会误判安全 ⇒ 把本可的应将着法（如上仕挡将）拦成「送将」。
+          const am = attackerMotion ? attackerMotion(localQiZi) : undefined;
+          const thisPoints = getPathPoints(localQiZi, myQiPan, myPositions, am?.crossRiver, am?.effectiveId);
           const x = (qiZi === 16) ? x1 : shuai.col;
           const y = (qiZi === 16) ? y1 : shuai.row;
           if (thisPoints[x][y]) return true;
@@ -421,8 +522,11 @@ export function afterMoveStillJiangJun(
       if (qiZi < 16) {
         if (localQiZi >= 21 && localQiZi <= 31) {
           if (!piecePositions[localQiZi].alive) continue;
+          // 揭棋：同上
+          if (hiddenAttacker && hiddenAttacker(localQiZi)) continue;
           if (qiZi !== 0 && jiangOffBoard) continue;
-          const thisPoints = getPathPoints(localQiZi, myQiPan, myPositions);
+          const am = attackerMotion ? attackerMotion(localQiZi) : undefined;
+          const thisPoints = getPathPoints(localQiZi, myQiPan, myPositions, am?.crossRiver, am?.effectiveId);
           const x = (qiZi === 0) ? x1 : jiang.col;
           const y = (qiZi === 0) ? y1 : jiang.row;
           if (thisPoints[x][y]) return true;

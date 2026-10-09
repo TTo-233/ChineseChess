@@ -11,7 +11,7 @@
 
 import { Image } from 'react-native';
 import { BOARD_STYLES } from '@/utils/chess/boardStyles';
-import { getPieceImage } from '@/utils/chess/pieceImages';
+import { getPieceImage, getFaceDownImage } from '@/utils/chess/pieceImages';
 
 const EFFECT_IMAGES = [
   require('@/assets/effect_chi.png'),
@@ -48,6 +48,20 @@ export function preloadChessAssets(): void {
   const seen = new Set<unknown>();
   for (let id = 0; id < 32; id++) {
     const img = getPieceImage(id);
+    if (img && !seen.has(img)) {
+      seen.add(img);
+      prefetchAsset(img);
+    }
+  }
+
+  /**
+   * 揭棋暗子背面图（2 张：黑/红）。
+   *
+   * 必须显式登记：背面图不在 `getPieceImage` 的正面表里，
+   * 漏登记不会报错，只会在揭棋首帧弹出图片未缓存导致的空白/闪烁 ——
+   * 这类问题只在真机上偶发，很难靠肉眼复现，所以这里直接进预热清单。
+   */
+  for (const img of [getFaceDownImage(0), getFaceDownImage(16)]) {
     if (img && !seen.has(img)) {
       seen.add(img);
       prefetchAsset(img);

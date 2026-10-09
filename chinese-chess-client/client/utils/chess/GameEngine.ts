@@ -12,6 +12,12 @@ import { getPathPoints, afterMoveStillJiangJun } from './MoveCheck';
 import {
   evaluateRuleAfterMove, recomputeRuleState, cloneRuleState,
 } from './RuleEngine';
+// 揭棋：只依赖 types.ts，不反向 import 本文件，故无循环依赖
+import {
+  effectiveIdOf as jieqiEffectiveIdOf,
+  crossRiverOf as jieqiCrossRiverOf,
+  type JieqiIdentity,
+} from './jieqi';
 
 // 类型已下沉至 types.ts（避免与 RuleEngine 循环依赖），此处 re-export 保持既有引用兼容
 export type { GameState, PieceState } from './types';
@@ -63,6 +69,14 @@ export function cloneGameState(state: GameState): GameState {
     checkMessage: state.checkMessage,
     zobristHash: state.zobristHash,
     ruleState: state.ruleState ? cloneRuleState(state.ruleState) : undefined,
+    // 揭棋字段：variant 缺省时原样透传 undefined，象棋行为不变；
+    // hiddenMask 必须**深拷贝**——它是 32 长度的布尔数组，
+    // 若与原局面共享引用，makeMove 的翻开/吃子改写会污染调用方的旧局面
+    // （cloneGameState 的全部意义就是切断别名，这条不能省）。
+    variant: state.variant,
+    hiddenMask: state.hiddenMask ? [...state.hiddenMask] : undefined,
+    // 同 hiddenMask：必须深拷贝，翻开时会被就地写入
+    revealedType: state.revealedType ? [...state.revealedType] : undefined,
   };
 }
 
@@ -89,6 +103,68 @@ export function applyHandicap(state: GameState, handicapIds: number[]): GameStat
  */
 function toPiecePositions(pieces: PieceState[]) {
   return pieces.map(p => ({ col: p.col, row: p.row, alive: p.alive }));
+}
+
+// ---------------------------------------------------------------------------
+// 揭棋适配（方案 §3）：两个零开销的注入器
+//
+// 关键设计：**象棋路径必须逐字节不变**。因此这两个函数在 variant !== 'jieqi'
+// （含 variant 缺省）时一律返回 undefined，调用方据此把「不传第四/第五参数」
+// 传给 MoveCheck，于是 MoveCheck 里新加的分支恒不进入，既有行为完全不受影响。
+// ---------------------------------------------------------------------------
+
+/**
+ * 揭棋「暗子不算攻击者」回调（方案 §3.1）。
+ *
+ * 象棋返回 undefined ⇒ afterMoveStillJiangJun 的新分支恒不进入。
+ * 见 MoveCheck.afterMoveStillJiangJun 的长注释：不排除暗子会导致
+ * **开局即白脸将判负**（基线占位车号暗子正对对方将帅）。
+ */
+function hiddenAttackerOf(state: GameState): ((id: number) => boolean) | undefined {
+  if (state.variant !== 'jieqi') return undefined;
+  const mask = state.hiddenMask;
+  if (!mask) return undefined;
+  return (id: number) => mask[id] === true;
+}
+
+/**
+ * 走点派发辅助：把该子的**有效身份**喂给 MoveCheck。
+ *
+ * 象棋 → 两个字段皆 undefined，MoveCheck 内的新分支恒不进入。
+ * 揭棋 → 已翻开的子给出 representativeId（同类棋子走法相同）+ 士/象放宽；
+ *        未翻开的暗子两者皆 undefined，即**继续按盘面 id（棋位棋种）走**，
+ *        正是规则 2 的要求（暗子按所在棋位的棋种走第一步）。
+ */
+function motionArgs(state: GameState, id: number): { crossRiver?: boolean; effectiveId?: number } {
+  if (state.variant !== 'jieqi') return {};
+  return {
+    crossRiver: jieqiCrossRiverOf(state, id),
+    effectiveId: jieqiEffectiveIdOf(state, id),
+  };
+}
+
+/**
+ * 攻击者的有效走法回调（注入 MoveCheck.afterMoveStillJiangJun）。
+ *
+ * ⚠️ 这段在揭棋下**不是可选优化，而是正确性要求**（实测 272 个随机着法里 45 个分歧）：
+ * 决策 A 下盘面 id 恒等于**棋位棋种**，攻击性却由**真实身份**决定。
+ * 只按盘面 id 派发会造成双向错误 —— 既漏判「仍在被将」，
+ * 也会把本可的应将着法（如上仕挡将）**误拦成「着法送将」**。
+ * 必须与 isJiangJun 走同一套 motionArgs，否则两者口径分叉。
+ *
+ * 象棋返回 undefined ⇒ MoveCheck 里新分支恒不进入，既有行为逐字节不变。
+ */
+function attackerMotionOf(
+  state: GameState
+): ((id: number) => { crossRiver?: boolean; effectiveId?: number }) | undefined {
+  if (state.variant !== 'jieqi') return undefined;
+  const mask = state.hiddenMask;
+  const revealed = state.revealedType;
+  if (!mask || !revealed) return undefined;
+  return (id: number) => ({
+    crossRiver: mask[id] !== true && revealed[id] != null && jieqiCrossRiverOf(state, id),
+    effectiveId: jieqiEffectiveIdOf(state, id),
+  });
 }
 
 /**
@@ -121,7 +197,8 @@ export function getSelectableMoves(state: GameState, pieceId: number): boolean[]
   const pieceSide = pieceId <= 15 ? BLACK_SIDE : RED_SIDE;
   if (pieceSide !== state.sideTag) return empty();
 
-  const points = getPathPoints(pieceId, state.qiPan, toPiecePositions(state.pieces));
+  const m = motionArgs(state, pieceId);
+  const points = getPathPoints(pieceId, state.qiPan, toPiecePositions(state.pieces), m.crossRiver, m.effectiveId);
   // 排除自身位置
   points[piece.col][piece.row] = false;
   return points;
@@ -185,7 +262,9 @@ export function isMoveKingSafe(
     toCol,
     toRow,
     state.qiPan,
-    toPiecePositions(state.pieces)
+    toPiecePositions(state.pieces),
+    hiddenAttackerOf(state),
+    attackerMotionOf(state)
   );
 }
 
@@ -239,12 +318,16 @@ export function isJiangJun(state: GameState, jiangOrShuai: number): number[] {
   }
 
   const positions = toPiecePositions(state.pieces);
+  const hiddenAttacker = hiddenAttackerOf(state);
 
   if (jiangOrShuai === 16) {
     // 检查红帅是否被黑方棋子攻击
     for (let qizi = 5; qizi <= 15; qizi++) {
       if (!state.pieces[qizi].alive) continue;
-      const thisPoints = getPathPoints(qizi, state.qiPan, positions);
+      // 【揭棋】暗子不是攻击者：占位走法不代表玩家能看见的攻击（方案 §3.1）
+      if (hiddenAttacker && hiddenAttacker(qizi)) continue;
+      const m = motionArgs(state, qizi);
+      const thisPoints = getPathPoints(qizi, state.qiPan, positions, m.crossRiver, m.effectiveId);
       const x = target.col;
       const y = target.row;
       if (thisPoints[x][y]) {
@@ -258,7 +341,10 @@ export function isJiangJun(state: GameState, jiangOrShuai: number): number[] {
     // 检查黑将是否被红方棋子攻击
     for (let qizi = 21; qizi <= 31; qizi++) {
       if (!state.pieces[qizi].alive) continue;
-      const thisPoints = getPathPoints(qizi, state.qiPan, positions);
+      // 【揭棋】同上
+      if (hiddenAttacker && hiddenAttacker(qizi)) continue;
+      const m = motionArgs(state, qizi);
+      const thisPoints = getPathPoints(qizi, state.qiPan, positions, m.crossRiver, m.effectiveId);
       const x = target.col;
       const y = target.row;
       if (thisPoints[x][y]) {
@@ -281,17 +367,20 @@ export function isJiangJun(state: GameState, jiangOrShuai: number): number[] {
  */
 export function hasAnyLegalMove(state: GameState, side: SideTag): boolean {
   const positions = toPiecePositions(state.pieces);
+  const hiddenAttacker = hiddenAttackerOf(state);
   const start = side === RED_SIDE ? 16 : 0;
   const end = side === RED_SIDE ? 32 : 16;
 
   for (let id = start; id < end; id++) {
     const piece = state.pieces[id];
     if (!piece.alive) continue;
-    const pathBool = getPathPoints(id, state.qiPan, positions);
+    const m = motionArgs(state, id);
+    const pathBool = getPathPoints(id, state.qiPan, positions, m.crossRiver, m.effectiveId);
+    const attackers = attackerMotionOf(state);
     for (let c = 0; c < 9; c++) {
       for (let r = 0; r < 10; r++) {
         if (!pathBool[c][r]) continue;
-        if (!afterMoveStillJiangJun(id, piece.col, piece.row, c, r, state.qiPan, positions)) {
+        if (!afterMoveStillJiangJun(id, piece.col, piece.row, c, r, state.qiPan, positions, hiddenAttacker, attackers)) {
           return true;
         }
       }
@@ -365,6 +454,13 @@ function undoInPlace(state: GameState): MoveRecord | null {
   piece.row = last.fromRow;
   state.qiPan[last.fromCol][last.fromRow] = last.pieceId;
 
+  // 2b. 【揭棋】撤销「走子即翻开」：该子回到暗子集合，真实棋种清空。
+  //     id 从未改变过（见 types.ts hiddenMask 注释），故不涉及任何置换。
+  if (last.revealedType) {
+    state.revealedType![last.pieceId] = null;
+    state.hiddenMask![last.pieceId] = true;
+  }
+
   // 3. 被吃子放回落点并登记到棋盘（只置 alive 会留下悬空子）
   if (last.capturedPieceId !== -1) {
     const captured = state.pieces[last.capturedPieceId];
@@ -372,6 +468,12 @@ function undoInPlace(state: GameState): MoveRecord | null {
     captured.col = last.toCol;
     captured.row = last.toRow;
     state.qiPan[last.toCol][last.toRow] = captured.id;
+  }
+
+  // 4. 【揭棋】撤销翻开（与 undoMove 同口径，见其注释）
+  if (last.revealedType) {
+    state.revealedType![last.pieceId] = null;
+    state.hiddenMask![last.pieceId] = true;
   }
 
   state.sideTag = !state.sideTag;
@@ -437,7 +539,8 @@ export function makeMove(
   state: GameState,
   pieceId: number,
   toCol: number,
-  toRow: number
+  toRow: number,
+  jieqiIdentity?: JieqiIdentity
 ): { newState: GameState; captured: number; isCheck: boolean; isGameOver: boolean; gameOverReason: string } {
   const newState = cloneGameState(state);
   const piece = newState.pieces[pieceId];
@@ -445,7 +548,19 @@ export function makeMove(
   const fromRow = piece.row;
   const captured = newState.qiPan[toCol][toRow];
 
-  // 更新棋盘
+  // 揭棋：走子即翻开（规则 3）。
+  //
+  // ⚠️ 关键设计：**盘面 id 永不改变**。只写 revealedType[pieceId] = 真实棋种。
+  // 早期版本曾试过「占位 id 退役 + 真实 id 顶上」，但那是错的：
+  // id 是 pieces 的下标，而 32 个 id 与暗子占位格是同一套集合，
+  // 真实身份几乎必然落在另一个在盘暗子的 id 上（实测 30/30 全撞）。
+  // 改为「只记棋种、不动 id」后，悔棋只需把 revealedType 写回 null，
+  // 没有置换、没有槽位耗尽、undo 天然正确。
+  const flipping = newState.variant === 'jieqi' && newState.hiddenMask?.[pieceId] === true;
+  const revealedType = flipping ? jieqiIdentity?.hiddenType[pieceId] ?? null : null;
+  const doFlip = flipping && revealedType != null;
+
+  // 更新棋盘：id 不变
   newState.qiPan[fromCol][fromRow] = -1;
   newState.qiPan[toCol][toRow] = pieceId;
 
@@ -453,9 +568,27 @@ export function makeMove(
   piece.col = toCol;
   piece.row = toRow;
 
+  // 翻开：记录真实棋种，并把该子移出「暗子」集合
+  if (doFlip) {
+    newState.revealedType![pieceId] = revealedType;
+    // hiddenMask 是「当前哪些子是暗子」的**快照语义**（将军/攻击扫描用），
+    // 翻开必须清位，否则该子会被永远排除在攻击者之外。
+    newState.hiddenMask![pieceId] = false;
+  }
+
   // 如果被吃子，标记为死亡
   if (captured !== -1) {
     newState.pieces[captured].alive = false;
+    // 【揭棋专属】被吃的若是暗子，其占位 id 就此退役（决策 A —— 吃子方不获得新子，
+    // 棋盘上直接少一枚）。清坐标使其与 R-2「悬空/缺席子」语义一致。
+    // 真实身份对双方都不可见，故此处**不**写入任何身份信息，铁律 A 保持成立。
+    //
+    // ⚠️ 仅揭棋执行：象棋保持只置 alive=false 的原样，
+    // 以免影响任何依赖被吃子原坐标的既有逻辑（不得当作无关清理删掉这个分支）。
+    if (newState.variant === 'jieqi') {
+      newState.pieces[captured].col = -1;
+      newState.pieces[captured].row = -1;
+    }
   }
 
   // 记录走棋历史
@@ -466,6 +599,9 @@ export function makeMove(
     toCol,
     toRow,
     capturedPieceId: captured,
+    // 翻开时记下真实棋种（供 UI 播动画与 undoMove 精确还原）。
+    // 这是**已经公开**的信息：翻开后的棋子本来就是明子。
+    ...(doFlip ? { flippedPieceId: pieceId, revealedType: revealedType! } : {}),
   });
 
   // 切换走棋方
@@ -590,7 +726,20 @@ export function undoMove(state: GameState): GameState | null {
 
   // 恢复被吃棋子
   if (lastMove.capturedPieceId !== -1) {
-    newState.pieces[lastMove.capturedPieceId].alive = true;
+    const cap = newState.pieces[lastMove.capturedPieceId];
+    cap.alive = true;
+    // 揭棋：吃子时清掉了被吃子的坐标（决策 A），悔棋需一并复位
+    if (newState.variant === 'jieqi') {
+      cap.col = lastMove.toCol;
+      cap.row = lastMove.toRow;
+    }
+  }
+
+  // 【揭棋】撤销「走子即翻开」：把该子收回暗子集合，真实棋种清空。
+  // id 从未改变过，所以这里只需回退两个标记位，不存在任何置换。
+  if (lastMove.revealedType) {
+    newState.revealedType![lastMove.pieceId] = null;
+    newState.hiddenMask![lastMove.pieceId] = true;
   }
 
   // 切换回走棋方
@@ -879,7 +1028,7 @@ function buildReplayableSegment(
     }
     if (afterMoveStillJiangJun(
       mv.pieceId, mv.fromCol, mv.fromRow, mv.toCol, mv.toRow,
-      cur.qiPan, toPiecePositions(cur.pieces)
+      cur.qiPan, toPiecePositions(cur.pieces), hiddenAttackerOf(cur), attackerMotionOf(cur)
     )) {
       lastBad = i;
       reason = '走完后己方将/帅仍被攻击（含照面），引擎会拒绝重放该步';

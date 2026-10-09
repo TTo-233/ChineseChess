@@ -30,6 +30,7 @@ import {
   useNewGame,
   buildGameStateFromFen,
   buildInitialGameState,
+  buildJieqiInitialGameState,
   ENDGAME_HINT_LIMIT,
   ENDGAME_UNDO_LIMIT,
 } from '@/hooks/useNewGame';
@@ -57,7 +58,8 @@ import { getBestMoveOffline, getHintMoveOffline, type HybridMoveResult } from '@
 import { isMoveBanned, enumerateLegalMoves, getMoveBanReason, banReasonNotice } from '@/utils/chess/RuleEngine';
 import { playSound, playJiangJunSound, unloadAllSounds, preloadSounds, preloadGameEndSounds } from '@/utils/SoundManager';
 import { RED_SIDE, BLACK_SIDE } from '@/utils/chess/types';
-import { saveGame, loadGame, deleteSave, type GameSave } from '@/utils/GameSave';
+import { type JieqiIdentity, liveHiddenSlots } from '@/utils/chess/jieqi';
+import { saveGame, loadGame, deleteSave, canResumeJieqi, resolveFirstMover, saveJieqiGame, loadJieqiGame, deleteJieqiSave, type GameSave } from '@/utils/GameSave';
 import { saveReplay } from '@/utils/replayStorage';
 import { BUILTIN_ENDGAMES } from '@/utils/chess/endgames';
 import { useBackgroundStyle } from '@/utils/chess/backgroundStyleStore';
@@ -107,7 +109,37 @@ export default function GameScreen() {
     firstMover?: 'player' | 'ai';
     continueGame?: boolean;
     endgame?: string;
+    /** 揭棋：缺省即象棋（'xiangqi' 不必传，保持旧链接/旧路由完全不变） */
+    variant?: 'jieqi';
   }>();
+
+  /**
+   * 揭棋：身份表只存在内存里（铁律 A），既不进 GameState 也不进存档序列化。
+   * 用 ref 而非 state —— 它不是「界面要显示的东西」，而是 makeMove 的隐藏输入；
+   * 放进 state 会让每次翻开都触发一次无谓的全页重渲染。
+   */
+  const isJieqi = params.variant === 'jieqi';
+  const jieqiIdentityRef = useRef<JieqiIdentity | null>(null);
+
+  /**
+   * 存档读写按玩法分流（2026-10 揭棋独占一个键）。
+   *
+   * 揭棋与人机对战各存各的，两个玩法的「上次棋局」互不覆盖。
+   * 集中成三个小函数而不是在 5 处 `isJieqi ? 揭棋版 : 人机版` 地三元，
+   * 是为了让「哪个玩法碰哪个键」只有这一处定义；新增存读点时不会漏。
+   *
+   * 注意：残局走的是另一套键（saveEndgameBattle / deleteEndgameBattle），
+   * 不经过这里。
+   */
+  const saveBattle = useCallback((save: GameSave) => {
+    return isJieqi ? saveJieqiGame(save) : saveGame(save);
+  }, [isJieqi]);
+  const loadBattle = useCallback(() => {
+    return isJieqi ? loadJieqiGame() : loadGame();
+  }, [isJieqi]);
+  const deleteBattleSave = useCallback(() => {
+    return isJieqi ? deleteJieqiSave() : deleteSave();
+  }, [isJieqi]);
 
   // 残局闯关模式：参数经 JSON 传递（useMemo 避免每次渲染重复解析）
   const initialEndgame = useMemo<EndgameLaunchParams | null>(() => {
@@ -147,9 +179,18 @@ export default function GameScreen() {
 
   // 游戏状态（开局局面的构建与 useNewGame 共用同一实现 buildGameStateFromFen /
   // buildInitialGameState：Zobrist 哈希与重复局面历史的初始化不能有两份写法）
-  const [gameState, setGameState] = useState<GameState>(() =>
-    initialEndgame ? buildGameStateFromFen(initialEndgame.fen) : buildInitialGameState(initialSideTag)
-  );
+  /**
+   * 揭棋：开局必须建揭棋局面，身份表同时交给 ref。
+   * 残局与揭棋互斥（揭棋没有残局模式），故这里的优先级：揭棋 > 残局 > 标准象棋。
+   */
+  const [gameState, setGameState] = useState<GameState>(() => {
+    if (isJieqi) {
+      const { state, identity } = buildJieqiInitialGameState(initialSideTag);
+      jieqiIdentityRef.current = identity;
+      return state;
+    }
+    return initialEndgame ? buildGameStateFromFen(initialEndgame.fen) : buildInitialGameState(initialSideTag);
+  });
   const [selectedPieceId, setSelectedPieceId] = useState<number | null>(null);
   const [validMoves, setValidMoves] = useState<boolean[][] | null>(null);
   const [lastMove, setLastMove] = useState<{
@@ -229,6 +270,15 @@ export default function GameScreen() {
   const savePveReplay = useCallback((finalState: GameState, playerWon: boolean) => {
     if (isEndgame || replaySavedRef.current) return;
     replaySavedRef.current = true;
+
+    /**
+     * 揭棋暂不支持复盘：复盘是「从初始局面重放着法表」，
+     * 而揭棋的初始局面含**随机洗牌的身份**（且身份表不落盘，铁律 A），
+     * 重放出来的盘面与玩家当初下的那盘完全不是一回事。
+     * 首版直接不存；要支持必须让存档带上身份表或 seed（P2）。
+     */
+    if (isJieqi) return;
+
     const winnerSide = playerWon ? currentPlayerSide : (currentPlayerSide === 'red' ? 'black' : 'red');
     const diffLabel = { easy: '入门', medium: '进阶', hard: '大师' }[difficulty] || difficulty;
     // 先手方由首着棋子归属确定（换边翻转后依然准确），无着法时兜底红先
@@ -244,7 +294,7 @@ export default function GameScreen() {
       mySide: currentPlayerSide,
       note: `难度·${diffLabel}`,
     }).catch(() => undefined);
-  }, [isEndgame, currentPlayerSide, difficulty]);
+  }, [isEndgame, currentPlayerSide, difficulty, isJieqi]);
   // 残局闯关：本局结局（win=玩家过关 / lose=被将死或棋差 / draw=未能在限招内取胜），
   // 用于结算按钮与文案区分。draw 必须与 lose 区分：自然限招/无进攻子力/重复局面
   // 判和都不是「闯关成功」，也不能当成「挑战失败，再接再厉」的战败提示。
@@ -277,8 +327,22 @@ export default function GameScreen() {
         setBoardKey(k => k + 1); // 强制 ChessBoard 重新挂载
       });
     } else if (shouldContinue && !loaded) {
-      loadGame().then((save) => {
-        if (save) {
+      loadBattle().then((save) => {
+        /**
+         * 揭棋续局：身份表装回 ref，供后续 makeMove 翻开暗子。
+         *
+         * ⚠️ 顺序很关键：**先验身份表、再落地局面**。
+         * 缺身份表时绝不能把存档的 gameState 交给 setGameState —— 那时手上的暗子
+         * 全是"没有身份的壳"，走一步就翻开成 null（GameEngine 的 `revealedType ?? null`
+         * 分支），玩家会看到一盘凭空变空的棋，比明确拒绝续局糟得多。
+         * 故此时丢弃该档，保持 useState 初始化时建好的新局（ref 里已有一份身份表）。
+         */
+        const jieqiSaveBroken = !!save && save.gameState.variant === 'jieqi' && !canResumeJieqi(save);
+        if (jieqiSaveBroken) {
+          console.warn('揭棋存档缺少身份表，已丢弃并改开新局');
+          deleteBattleSave();
+        }
+        if (save && !jieqiSaveBroken) {
           // 重建 Zobrist 哈希（加载存档时）
           save.gameState.zobristHash = computeZobristHash(save.gameState);
           clearHistoryHash();
@@ -289,6 +353,23 @@ export default function GameScreen() {
           setCapturedBlack(save.capturedBlack);
           setLastMove(save.lastMove);
           setIsFlipped(save.isFlipped);
+
+          if (canResumeJieqi(save)) {
+            jieqiIdentityRef.current = {
+              hiddenType: [...save.jieqiIdentity!.hiddenType],
+              seed: save.jieqiIdentity!.seed,
+            };
+            /**
+             * 执棋方/先后手也从存档恢复。
+             *
+             * 不能只依赖路由参数 `variant`：续局入口已带 variant='jieqi'，
+             * 但存档本身才是这局棋的事实来源（旧链接、手工构造的路由都可能不带）。
+             * 两处口径不一致时，揭棋会出现「按象棋执棋方算先后手」的错局，
+             * 而揭棋固定红先，差一位就是整局走反。
+             */
+            setCurrentPlayerSide(save.playerSide);
+            setCurrentFirstMover(resolveFirstMover(save));
+          }
         }
         setLoaded(true);
         setBoardKey(k => k + 1); // 强制 ChessBoard 重新挂载
@@ -459,7 +540,8 @@ export default function GameScreen() {
           currentState,
           aiMove.pieceId,
           aiMove.toCol,
-          aiMove.toRow
+          aiMove.toRow,
+          jieqiIdentityRef.current ?? undefined
         );
 
         // 规则提示（AI 走子也可能撞到规则一的判和阈值，如「双方长将已达 5 次…」）
@@ -542,8 +624,8 @@ export default function GameScreen() {
             }
             deleteEndgameBattle(); // 残局终局：清除残局局内存档（不动人机存档）
           } else {
-            deleteSave(); // 人机对战终局：仅清人机枪局存档
-            savePveReplay(newState, !aiWon); // 按真实胜负保存复盘
+            deleteBattleSave(); // 非残局终局：清本玩法（人机 or 揭棋）的存档
+            savePveReplay(newState, !aiWon); // 按真实胜负保存复盘（揭棋内部会跳过）
           }
         } else {
           // AI 走棋完成，轮到玩家：后台预计算提示（现在走本地皮卡鱼，不占 JS 主线程）
@@ -707,7 +789,7 @@ export default function GameScreen() {
     cancelHintPonder(); // 玩家走棋：立即中止后台提示预计算，算力让给 AI 思考
     cancelOfflinePonder(); // 同上，但针对本地皮卡鱼预计算（不占主线程，但要释放唯一引擎）
     const { newState, captured, isCheck, isGameOver, gameOverReason } = makeMove(
-      gameState, pieceId, toCol, toRow
+      gameState, pieceId, toCol, toRow, jieqiIdentityRef.current ?? undefined
     );
 
     // 规则提示（规则一判和类的到点前一步预警，如「下着将满 120 步判和」）
@@ -789,8 +871,8 @@ export default function GameScreen() {
           deleteEndgameBattle();
         }
       } else {
-        deleteSave(); // 人机对战终局：仅清人机枪局存档
-        savePveReplay(newState, playerWon); // 玩家走棋终局：按真实胜负保存复盘
+        deleteBattleSave(); // 非残局终局：清本玩法（人机 or 揭棋）的存档
+        savePveReplay(newState, playerWon); // 玩家走棋终局：按真实胜负保存复盘（揭棋跳过）
       }
       // 按真实胜负播放结算音效（和棋不播胜负音效）
       // 【P3】同样 fire-and-forget：结算界面（胜/负/续局）此时已经渲染完成，
@@ -879,13 +961,19 @@ export default function GameScreen() {
     setShowRestartConfirm(false);
     startNewGame({
       endgameFen: isEndgame && currentEndgame ? currentEndgame.fen : undefined,
+      // 揭棋重开 = 重新洗牌（每局身份都不同）；象棋不传这两个参数，路径不变
+      variant: isJieqi ? 'jieqi' : undefined,
+      onIdentity: (id) => { jieqiIdentityRef.current = id; },
       initialSideTag,
       initialFlipped: currentPlayerSide === 'black',
       aiFirst,
     });
-  }, [startNewGame, isEndgame, currentEndgame, initialSideTag, currentPlayerSide, aiFirst]);
+  }, [startNewGame, isEndgame, currentEndgame, isJieqi, initialSideTag, currentPlayerSide, aiFirst]);
 
   // 返回（对局中且有有效着法时弹保存确认，与系统返回行为一致）
+  // 揭棋走同一条路径：有子可走就弹「保存对局」框，与象棋/残局完全一致。
+  // （揭棋按下「保存」不会真的落盘——身份表只在内存，见 confirmBackWithSave 注释；
+  //   但确认框本身要给，弹框是"是否保存"的统一交互，不是"保证能存"的承诺。）
   const handleBack = useCallback(() => {
     if (gameState.gameStatus !== 'playing' || gameState.moveHistory.length === 0) {
       router.back();
@@ -898,6 +986,24 @@ export default function GameScreen() {
   const confirmBackWithSave = useCallback(async () => {
     setShowBackConfirm(false);
     invalidatePendingAI(); // 离场取消延时中/计算中的 AI 走子
+
+    /**
+     * 揭棋的身份表随存档一起落盘（2026-10 支持续局）。
+     *
+     * 铁律 A 依然成立：身份表**不进 GameState**，只作为 GameSave 的并列字段
+     * 存在（`jieqiIdentity`），不会随任何面向 AI / 展示的 payload 泄漏。
+     *
+     * 体积可忽略：32 格棋种短字符串 + 一个整数，JSON 后几十字节。
+     * 已翻开那部分的真实身份本来就在 `gameState.revealedType`（明子=公开信息），
+     * 随 gameState 一起存，无需重复。
+     */
+    const jieqiIdentity = isJieqi && jieqiIdentityRef.current
+      ? {
+          hiddenType: [...jieqiIdentityRef.current.hiddenType],
+          seed: jieqiIdentityRef.current.seed,
+        }
+      : undefined;
+
     if (isEndgame && currentEndgame) {
       await saveEndgameBattle({
         levelIndex: currentEndgame.levelIndex,
@@ -923,12 +1029,14 @@ export default function GameScreen() {
         lastMove,
         isFlipped,
         timestamp: Date.now(),
+        // 象棋档为 undefined；揭棋档带上身份表，续局才能还原暗子真相
+        jieqiIdentity,
       };
-      await saveGame(save);
+      await saveBattle(save);
     }
     allowLeaveRef.current = true;
     router.back();
-  }, [gameState, difficulty, currentPlayerSide, currentFirstMover, moveCount, capturedRed, capturedBlack, lastMove, isFlipped, isEndgame, currentEndgame, invalidatePendingAI]);
+  }, [gameState, difficulty, currentPlayerSide, currentFirstMover, moveCount, capturedRed, capturedBlack, lastMove, isFlipped, isEndgame, currentEndgame, invalidatePendingAI, isJieqi, saveBattle]);
 
   // 确认返回（不保存）
   const confirmBackWithoutSave = useCallback(() => {
@@ -938,22 +1046,24 @@ export default function GameScreen() {
     if (isEndgame) {
       deleteEndgameBattle();
     } else {
-      deleteSave();
+      deleteBattleSave();
     }
     allowLeaveRef.current = true;
     router.back();
-  }, [isEndgame, invalidatePendingAI]);
+  }, [isEndgame, invalidatePendingAI, deleteBattleSave]);
 
   // 处理再来一局（残局模式：重新挑战当前关）
   // 第 3 批：与「确认重开」共用 useNewGame 的单一重置实现，参数完全一致
   const handlePlayAgain = useCallback(() => {
     startNewGame({
       endgameFen: isEndgame && currentEndgame ? currentEndgame.fen : undefined,
+      variant: isJieqi ? 'jieqi' : undefined,
+      onIdentity: (id) => { jieqiIdentityRef.current = id; },
       initialSideTag,
       initialFlipped: currentPlayerSide === 'black',
       aiFirst,
     });
-  }, [startNewGame, isEndgame, currentEndgame, initialSideTag, currentPlayerSide, aiFirst]);
+  }, [startNewGame, isEndgame, currentEndgame, isJieqi, initialSideTag, currentPlayerSide, aiFirst]);
 
   // 残局闯关：进入下一关（原地重置棋盘为新关 FEN，避免同路由导航的状态复用问题）
   // 第 3 批：重置序列同样走 useNewGame，差异只剩三项（棋盘重挂载、固定正向显示、
@@ -1052,28 +1162,48 @@ export default function GameScreen() {
 
   // ===== 底部操作栏配置（2026-10 改造：三模式从左到右的按键集合）=====
   // 人机对战：菜单 / 提示 / 悔棋 / 重开（"翻转"按用户要求移入「菜单」弹出列表）
+  // 揭棋：返回 / 提示 / 重开（揭棋不提供悔棋与翻转棋盘，见下）
   // 残局闯关：返回 / 提示 / 悔棋 / 重开（残局不允许翻转，故无翻转；说明入口随标题栏下线）
+  //
+  // 【揭棋为何单独一套按键】（2026-10 产品要求：取消揭棋的悔棋与反转棋盘）：
+  // 揭棋的一手棋同时暴露了三类信息——身份、位置、可用性——悔棋要退回去的不只是盘面，
+  // 还牵涉「走子即翻开」的还原（GameEngine.undoMove 里的揭棋分支）与后验身份表；
+  // 而翻转棋盘在揭棋里会连带交换执棋方（handleFlip 是"换边+翻转"一体），
+  // 等于在暗子身份仍属机密时把玩家的观察视角整个对调，两者都不适合揭棋。
+  // 故揭棋底栏首位直接给「返回」，不再套一层「菜单」——菜单原本只为承载翻转/退出两项，
+  // 去掉翻转后它只剩一个「退出对局」，不如直接摊到底栏（与残局模式的「返回」一致）。
+  // ⚠️ 只摘掉揭棋的**入口**；handleUndo / handleFlip 的实现原样保留，象棋与残局仍在用。
   const pveBarActions: GameBottomBarActionInput[] = useMemo(
-    () => [
-      { key: 'menu', icon: 'bars', label: '菜单' },
-      { key: 'hint', icon: 'lightbulb', label: '提示', disabled: !canHint, onPress: handleHint },
-      {
-        key: 'undo',
-        icon: 'rotate-left',
-        label: '悔棋',
-        disabled: gameState.moveHistory.length < 2 || aiThinking,
-        onPress: handleUndo,
-      },
-      { key: 'restart', icon: 'rotate-right', label: '重开', onPress: handleRestart },
-    ],
-    [canHint, handleHint, gameState.moveHistory.length, aiThinking, handleUndo, handleRestart]
+    () => (isJieqi
+      ? [
+          { key: 'back', icon: 'arrow-left' as const, label: '返回', onPress: handleBack },
+          { key: 'hint', icon: 'lightbulb' as const, label: '提示', disabled: !canHint, onPress: handleHint },
+          { key: 'restart', icon: 'rotate-right' as const, label: '重开', onPress: handleRestart },
+        ]
+      : [
+          { key: 'menu', icon: 'bars' as const, label: '菜单' },
+          { key: 'hint', icon: 'lightbulb' as const, label: '提示', disabled: !canHint, onPress: handleHint },
+          {
+            key: 'undo',
+            icon: 'rotate-left' as const,
+            label: '悔棋',
+            disabled: gameState.moveHistory.length < 2 || aiThinking,
+            onPress: handleUndo,
+          },
+          { key: 'restart', icon: 'rotate-right' as const, label: '重开', onPress: handleRestart },
+        ]),
+    [isJieqi, handleBack, canHint, handleHint, gameState.moveHistory.length, aiThinking, handleUndo, handleRestart]
   );
+  // 揭棋没有「菜单」键（首位已是「返回」），这里返回空数组而不是留一个只剩「退出对局」的弹层：
+  // GameBottomBar 的 hasMenu 为 false 时菜单键点击无效果，留着反而是条死路。
   const pveMenuItems: GameMenuItem[] = useMemo(
-    () => [
-      { key: 'flip', icon: 'arrows-rotate', label: '翻转棋盘', onPress: handleFlip },
-      { key: 'exit', icon: 'door-open', label: '退出对局', onPress: handleBack },
-    ],
-    [handleFlip, handleBack]
+    () => (isJieqi
+      ? []
+      : [
+          { key: 'flip', icon: 'arrows-rotate' as const, label: '翻转棋盘', onPress: handleFlip },
+          { key: 'exit', icon: 'door-open' as const, label: '退出对局', onPress: handleBack },
+        ]),
+    [isJieqi, handleFlip, handleBack]
   );
   const endgameBarActions: GameBottomBarActionInput[] = useMemo(
     () => [
@@ -1273,6 +1403,7 @@ export default function GameScreen() {
             让底栏的透明黑底一路铺到物理底边、盖住 Home Indicator 区域。
             绝杀特效显示时隐藏但保持占位，防止棋盘位置移动。
             人机对战：菜单 / 提示 / 悔棋 / 重开（翻转移入「菜单」弹出列表）
+            揭棋：返回 / 提示 / 重开（无悔棋、无翻转，故不挂「菜单」弹出层）
             残局闯关：返回 / 提示 / 悔棋 / 重开（标题栏下线后，残局说明改挂到 AI 标识行
             的关卡名角标上，用一个提示图标就地唤起原来的说明弹窗） */}
         <GameBottomBar

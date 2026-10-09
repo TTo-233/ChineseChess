@@ -137,6 +137,16 @@ export async function requestOfflineMove(
   movetimeCapMs?: number
 ): Promise<AIMoveSearchOutcome> {
   const startedAt = Date.now();
+
+  /**
+   * 揭棋：引擎只懂象棋，这里是**最深处**的一道闸。
+   * aiDispatcher 与 precomputeOfflineHint 各自已短路过一次，
+   * 但本函数是公开导出，第三方/未来调用方未必都记得 —— 显式拒绝比默默喂错更安全。
+   */
+  if (state.variant === 'jieqi') {
+    throw new OfflineMoveRejectedError('揭棋暂不支持本地引擎，已转由 TS AI 走子');
+  }
+
   const fen = toFenString(state);
 
   // 行宽异常会让 WASM 越界写内存（历史上打崩过整个 worker 池）。
@@ -344,6 +354,16 @@ function ponderMatches(entry: PonderEntry, state: GameState): boolean {
  */
 export function precomputeOfflineHint(state: GameState): void {
   if (state.gameStatus !== 'playing') return;
+  /**
+   * 揭棋：皮卡鱼只懂象棋，ponder 绝不能喂它揭棋局面。
+   * （aiDispatcher 的走子入口已短路到 TS 引擎，但这里的**后台预计算**是独立入口，
+   *  漏掉这道闸的后果是：玩家思考期间引擎一直在后台白算一个它算不动的局面，
+   *  白占唯一引擎槽位，且 getHintMoveOffline 取到的 ponder 结果也是错的。）
+   */
+  if (state.variant === 'jieqi') {
+    cancelOfflinePonder();
+    return;
+  }
   // ⚠️ 2026-10 实测：引擎启动中（starting）时别落 TS AI——那会在主线程占满
   // ponder cap，还缓存一个"标着皮卡鱼其实是 TS"的结果。本地引擎已就绪
   //（pikafish）才值得跑 ponder。
