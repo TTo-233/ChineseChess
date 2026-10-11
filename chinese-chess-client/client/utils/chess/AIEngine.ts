@@ -823,10 +823,26 @@ function isSideInCheck(state: GameState, side: SideTag): boolean {
    * 后者只按盘面 id 推走点，会把一枚盖着的车算成「正在攻击对方主帅」，
    * 导致搜索把大量根本不存在将军的局面判成将军，评估全面失真。
    *
-   * 象棋：variant !== 'jieqi' 时 isJiangJun 与本函数原有逻辑等价，
-   * 且它已跳过将/帅自身，故直接复用不改变既有行为（引擎口径单一来源）。
+   * ⚠️【2026-10 实测 BUG 修复】但 isJiangJun **只含「被攻击段」，不含「飞将段」**，
+   * 所以揭棋分支不能直接 return，必须按象棋那样「先照面、再被攻击」两段判：
+   *
+   *   旧实现：return isJiangJun(state, generalId)[0] === generalId;
+   *   ⇒ 揭棋下 AI 的合法性过滤**看不见将帅照面（白脸将）**。
+   *
+   * 后果（用户实测报障「将军无解后提示 AI 暂时无法出招，请重开本局」）：
+   *   · AI 搜索把「走完之后两将照面」当作合法最优着法（象棋下它非法）；
+   *   · aiDispatcher 的出口守卫 rejectMoverUnsafe 走 isMoveKingSafe
+   *     ——那**含**飞将段，于是把这步**拒收**并返回 null；
+   *   · screens/game 拿到 null 后重试 2 次仍是 null ⇒ 弹出「AI 暂时无法出招，请重开本局」，
+   *     而此时局面 `hasAnyLegalMoveForSide` 为 true（实测 seed 6183 / ply 48：
+   *     红方仍有 25 步合法着法，AI 却给不出任何着法）。
+   *
+   * 为什么只有揭棋会踩：象棋走的是 isGeneralAttacked，而它内部第一行就是
+   * `if (areGeneralsFacing(qiPan)) return true`，两段都覆盖到了。
+   * 换言之这是**揭棋分支单方面漏掉了第二段**，不是两种玩法规则不同。
    */
   if (state.variant === 'jieqi') {
+    if (areGeneralsFacing(state.qiPan)) return true;
     return isJiangJun(state, generalId)[0] === generalId;
   }
 

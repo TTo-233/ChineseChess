@@ -28,3 +28,9 @@
 pikafish.cjs        -text
 pikafish.worker.bin -text
 pikafish.html       -text
+
+# 揭棋引擎同理（2026-10）：jieqi.js 是被内联进产物的 Emscripten glue（上游检出为 CRLF），
+# jieqi.worker.bin 是 glue + worker-core 的拼接产物。
+# verify-jieqi-engine-assets 会断言产物内**逐字包含** worker-core 源码，故两者必须字节稳定。
+jieqi.js            -text
+jieqi.worker.bin    -text

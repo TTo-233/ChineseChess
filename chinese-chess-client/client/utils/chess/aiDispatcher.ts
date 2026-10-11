@@ -38,7 +38,75 @@ import {
 } from './offlineAiAdapter';
 import { getOfflineEngine } from './pikafish';
 import { isMoveKingSafe, type GameState } from './GameEngine';
+import { enumerateLegalMoves } from './RuleEngine';
 import type { AIDifficulty } from './types';
+import { getJieqiRuntime, buildJieqiSearchPayload, type JieqiRuntime } from './jieqiRuntime';
+import { isJieqiHostAvailable, runJieqiSession } from './pikafish/jieqiHost';
+import { getJieqiTier } from './pikafish/jieqiTier';
+import { consumeEngineLine, createInfoState, parseBestmove } from './jieqiUci';
+
+/**
+ * 跑一次揭棋引擎搜索。
+ *
+ * 模型：一次性批量 UCI 会话（见 pikafish/jieqiHost.ts 顶部说明）。
+ *
+ * @returns 引擎给出的着法；无可用着法时返回 null（调用方回落 TS AI）
+ */
+async function runJieqiEngine(
+  state: GameState,
+  ctx: JieqiRuntime,
+  tier: AIDifficulty | 'hint',
+  purpose: 'move' | 'hint'
+): Promise<{ move: AIMoveResult; depth: number; timeMs: number } | null> {
+  const startedAt = Date.now();
+  const t = getJieqiTier(tier === 'hint' ? 'hint' : tier);
+
+  const payload = buildJieqiSearchPayload(state, ctx);
+
+  const commands: string[] = ['uci', 'isready', `setoption name MultiPV value ${t.multiPV}`];
+  if (payload.moves.length > 0) {
+    commands.push(`position fen ${payload.fen} moves ${payload.moves.join(' ')}`);
+  } else {
+    commands.push(`position fen ${payload.fen}`);
+  }
+  commands.push(`go depth ${t.depth} movetime ${t.movetimeMs}`);
+  commands.push('quit');
+
+  const res = await runJieqiSession(commands, t.movetimeMs + 15000);
+
+  const info = createInfoState();
+  let bestLine: string | null = null;
+  for (const line of res.lines) {
+    if (consumeEngineLine(line, info)) {
+      bestLine = line;
+      break;
+    }
+  }
+  const uci = bestLine ? parseBestmove(bestLine) : null;
+  if (!uci) return null;
+
+  const fromCol = uci.charCodeAt(0) - 97;
+  const fromRow = 9 - Number(uci[1]);
+  const toCol = uci.charCodeAt(2) - 97;
+  const toRow = 9 - Number(uci[3]);
+  if (!Number.isFinite(fromRow) || !Number.isFinite(toRow)) return null;
+
+  const pieceId = state.qiPan[fromCol]?.[fromRow] ?? -1;
+  if (pieceId < 0) return null;
+
+  return {
+    move: {
+      pieceId,
+      fromCol,
+      fromRow,
+      toCol,
+      toRow,
+      score: 0,
+    },
+    depth: info.depth,
+    timeMs: Date.now() - startedAt,
+  };
+}
 
 export interface HybridMoveResult extends AIMoveResult {
   /**
@@ -67,6 +135,50 @@ function rejectMoverUnsafe(state: GameState, move: AIMoveResult | null): AIMoveR
   if (!move) return null;
   if (isMoveKingSafe(state, move.pieceId, move.toCol, move.toRow)) return move;
   return null;
+}
+
+/**
+ * 兜底着法的评分：它不是搜索产物，没有真实评估分。
+ * 用 `0` 作哨兵——**任何真实搜索分的量级都远大于 0**
+ * （MATE_SCORE = 1 000 000，静默分约 -1e5 量级），
+ * 故 0 不会被误当成"这是个好棋"。调用方也不读 score（它只用于排序/展示）。
+ */
+const FALLBACK_MOVE_SCORE = 0;
+
+/**
+ * 【2026-10 实测 BUG 的最后一道兜底】出口守卫拒收**之后**的最后一条路。
+ *
+ * 守卫把着法拒了却直接返回 null，界面拿到 null 就只能报「AI 暂时无法出招，请重开本局」，
+ * 而此时该方往往**明明还有合法着法**（实测 seed 9434 红方有 15 步，见
+ * jieqiAiLegalityParity.test.ts）。玩家被逼重开一整局，性质上就是「AI 算不出来」，
+ * 其实只是引擎内部合法性口径与守卫口径分叉后的一次抖动。
+ *
+ * 这里不再挑「最优」，只保证**一定有一步可走的合法棋**：
+ * 枚举该方全部合法着法，取 pieceId / 落点最小的那一步（保证确定性，便于复现与录像）。
+ * 走一步平庸的棋，远好过把整局锁死。
+ *
+ * ⚠️ 判据与守卫用**同一个** isMoveKingSafe ⇒ 返回的着法必然过闸，不会二次被拒。
+ * 枚举结果为空（真无棋可走 = 已被绝杀/困毙）时返回 null，由调用方按终局处理。
+ */
+function pickAnyLegalMove(state: GameState): AIMoveResult | null {
+  let best: (AIMoveResult & { score: number }) | null = null;
+  try {
+    for (const m of enumerateLegalMoves(state, state.sideTag)) {
+      const cand = { ...m, score: FALLBACK_MOVE_SCORE };
+      if (!best) { best = cand; continue; }
+      // 确定性排序：先比 pieceId，再比落点，避免每次兜底走法漂移
+      if (
+        cand.pieceId < best.pieceId ||
+        (cand.pieceId === best.pieceId &&
+          (cand.toRow < best.toRow || (cand.toRow === best.toRow && cand.toCol < best.toCol)))
+      ) {
+        best = cand;
+      }
+    }
+  } catch {
+    return null;
+  }
+  return best && isMoveKingSafe(state, best.pieceId, best.toCol, best.toRow) ? best : null;
 }
 
 /**
@@ -99,16 +211,61 @@ async function runOffline(
    * 揭棋是**永久性**的能力缺失，走降级路径会让 engine 标签显示成
    * 「皮卡鱼启动中」，虚报棋力来源（与 resolveOfflineEngineLabel 的注释同源问题）。
    */
+  /**
+   * 揭棋：优先用**揭棋引擎**（jieqi.wasm），失败或产物缺失则回落本地 TS AI。
+   *
+   * ⚠️ 与象棋路径的关键差别：
+   *   · 引擎**不是常驻实例**——我们的 WASM 是同步阻塞的 UCI 循环，
+   *     一次搜索 = 一个实例生命周期（见 pikafish/jieqiHost.ts 顶部说明）；
+   *   · 引擎需要**暗子池**（精确多重集）与**带揭晓后缀的历史**，
+   *     二者由 `jieqiRuntime` 上下文提供（开局时由页面注册）。
+   *
+   * 产品定稿：**保留 TS AI 作为兜底**。引擎不可用/出错/超时时静默回落，
+   * 对局不中断；标签如实反映这一步是谁算的（不虚报棋力来源）。
+   */
   if (state.variant === 'jieqi') {
     const jieqiTier = tier === 'hint' ? 'hard' : tier;
+
+    const ctx = getJieqiRuntime();
+    if (ctx && isJieqiHostAvailable()) {
+      try {
+        const outcome = await runJieqiEngine(state, ctx, tier, purpose);
+        if (outcome) {
+          const safe = rejectMoverUnsafe(state, outcome.move);
+          if (safe) {
+            return {
+              move: safe,
+              engine: 'jieqi-engine',
+              depth: outcome.depth,
+              timeMs: outcome.timeMs || Date.now() - startedAt,
+            };
+          }
+          // 引擎着法送将（不应发生，出口守卫拦截）→ 回落 TS AI
+          console.warn('[aiDispatcher] 揭棋引擎着法未通过出口守卫，回落 TS AI');
+        }
+      } catch (err) {
+        if (isAbortLike(err)) return null;
+        console.warn('[aiDispatcher] 揭棋引擎未给出可用着法，回落 TS AI:', describeError(err));
+      }
+    }
+
+    // 兜底：本地 TS AI（揭棋分支已实现，见 AIEngine）
     const move = tier === 'hint'
       ? await getHintMoveAsync(state)
       : await getBestMoveAsync(state, jieqiTier);
     const safe = rejectMoverUnsafe(state, move);
-    if (!safe) return null;
-    // 标签固定 'legacy'：现有 UI 只有三种标签，'legacy' 在 UI 上表示
-    // 「本地基础 AI」，对揭棋而言是准确的（首版无揭棋专用引擎）。
-    return { move: safe, engine: 'legacy', depth: 0, timeMs: Date.now() - startedAt };
+    if (!safe) {
+      // 守卫拒收了 TS AI 的着法（历史上唯一成因：AIEngine 揭棋分支漏判飞将，
+      // 已于 2026-10 修复；此处是防止同类口径漂移再次把整局锁死）。
+      // 先退「随便一步合法棋」，再退 null（真无棋可走 = 已被绝杀/困毙）。
+      const any = pickAnyLegalMove(state);
+      if (!any) return null;
+      console.warn('[aiDispatcher] 揭棋兜底 AI 着法被出口守卫拒收，已改用合法兜底着法');
+      return { move: any, engine: 'legacy', depth: 0, timeMs: Date.now() - startedAt };
+    }
+    // 标签区分「引擎产物缺失/永久不可用」与「引擎本次失败（下次可能好）」
+    const engine = ctx && isJieqiHostAvailable() ? 'jieqi-engine-starting' : 'legacy';
+    return { move: safe, engine, depth: 0, timeMs: Date.now() - startedAt };
   }
 
   try {
@@ -137,9 +294,15 @@ async function runOffline(
   // 兜底：旧 TS AI（提示走 hard 预算；产品难度各档有自身预算）
   const fallbackTier = tier === 'hint' ? 'hard' : tier;
   const fallback = tier === 'hint' ? await getHintMoveAsync(state) : await getBestMoveAsync(state, fallbackTier);
-  if (!fallback) return null;
   const safe = rejectMoverUnsafe(state, fallback);
-  if (!safe) return null;
+  if (!safe) {
+    // 同揭棋分支：守卫拒收不等于「无棋可走」。宁可走一步平庸的合法棋，
+    // 也不能让 screens/game 弹出「AI 暂时无法出招，请重开本局」把整局锁死。
+    const any = pickAnyLegalMove(state);
+    if (!any) return null;
+    console.warn('[aiDispatcher] 兜底 AI 着法被出口守卫拒收，已改用合法兜底着法');
+    return { move: any, engine: 'legacy', depth: 0, timeMs: Date.now() - startedAt };
+  }
   return { move: safe, engine: 'legacy', depth: 0, timeMs: Date.now() - startedAt };
 }
 

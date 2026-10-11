@@ -19,6 +19,12 @@ _board_stage/
 _tmp_*.png
 _tmp_*.npy
 
+# 沙箱 ACL 诊断/修复残留（工具产物，不入库）
+.acl-repair/
+
+# 引擎源码暂存区（jieqi/pikafish 构建时的 clone 与中间目标文件）
+_tmp/
+
 # 本机启动服务端/客户端时的分离式进程日志（.runlogs/*.log）
 .runlogs/
 

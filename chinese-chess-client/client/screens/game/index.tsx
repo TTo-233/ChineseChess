@@ -58,7 +58,8 @@ import { getBestMoveOffline, getHintMoveOffline, type HybridMoveResult } from '@
 import { isMoveBanned, enumerateLegalMoves, getMoveBanReason, banReasonNotice } from '@/utils/chess/RuleEngine';
 import { playSound, playJiangJunSound, unloadAllSounds, preloadSounds, preloadGameEndSounds } from '@/utils/SoundManager';
 import { RED_SIDE, BLACK_SIDE } from '@/utils/chess/types';
-import { type JieqiIdentity, liveHiddenSlots } from '@/utils/chess/jieqi';
+import { type JieqiIdentity, liveHiddenSlots, createJieqiInitialState, makeSeededRand } from '@/utils/chess/jieqi';
+import { setJieqiRuntime, clearJieqiRuntime } from '@/utils/chess/jieqiRuntime';
 import { saveGame, loadGame, deleteSave, canResumeJieqi, resolveFirstMover, saveJieqiGame, loadJieqiGame, deleteJieqiSave, type GameSave } from '@/utils/GameSave';
 import { saveReplay } from '@/utils/replayStorage';
 import { BUILTIN_ENDGAMES } from '@/utils/chess/endgames';
@@ -187,6 +188,14 @@ export default function GameScreen() {
     if (isJieqi) {
       const { state, identity } = buildJieqiInitialGameState(initialSideTag);
       jieqiIdentityRef.current = identity;
+      /**
+       * 注册揭棋引擎运行时上下文（暗子池簿记 + 初始局面 + 随机种子）。
+       *
+       * 引擎每次搜索都需要这三样（见 jieqiRuntime.ts 顶部说明），
+       * 而 aiDispatcher 的公共签名只收 GameState，故走模块级注册表。
+       * 种子用身份表的 seed，保证同局可重放（续局时从存档传入）。
+       */
+      setJieqiRuntime(state, identity.seed);
       return state;
     }
     return initialEndgame ? buildGameStateFromFen(initialEndgame.fen) : buildInitialGameState(initialSideTag);
@@ -231,6 +240,16 @@ export default function GameScreen() {
     return () => {
       cancelHintPonder();
       cancelOfflinePonder();
+      /**
+       * 注销揭棋运行时上下文。
+       *
+       * 不注销的后果：离场后模块级单槽仍指向旧局的池与初始局面，
+       * 若随后开一局**象棋**，`variant !== 'jieqi'` 不会读它（无影响）；
+       * 但若再开揭棋局而注册因异常被跳过，就会用**上一局的池**重放，
+       * 表现为池与盘面不符 → 引擎静默回落 TS AI。
+       * 注销是廉价且语义正确的收尾。
+       */
+      clearJieqiRuntime();
     };
   }, []);
 
@@ -359,6 +378,18 @@ export default function GameScreen() {
               hiddenType: [...save.jieqiIdentity!.hiddenType],
               seed: save.jieqiIdentity!.seed,
             };
+            /**
+             * 续局也要**重建揭棋运行时上下文**。
+             *
+             * 初始局面不入存档（存档只有当前 GameState），但揭棋初始局面除身份
+             * 分配外是确定的，且分配由 seed 驱动 ⇒ 用 makeSeededRand(seed)
+             * 调 createJieqiInitialState 可**逐格复现**同一初始局面。
+             * 这是引擎历史重放（position fen <初始> moves ...）的起点，
+             * 拿错起点会让重放出的局面与真实对局不符。
+             */
+            const seed = save.jieqiIdentity!.seed;
+            const reproduced = createJieqiInitialState(makeSeededRand(seed));
+            setJieqiRuntime(reproduced.state, seed);
             /**
              * 执棋方/先后手也从存档恢复。
              *
@@ -954,6 +985,21 @@ export default function GameScreen() {
     setShowRestartConfirm(true);
   }, []);
 
+  /**
+   * 揭棋新局的统一收口：拿到身份表后**同时**更新引擎运行时上下文。
+   *
+   * 为什么必须收口成一处：「确认重开」与「再来一局」都走 startNewGame，
+   * 若各自内联一份 onIdentity，将来只改一处就会出现「重开时引擎还用旧池」
+   * —— 表现为 assertPoolMatchesBoard 抛错、引擎静默回落 TS AI（棋力降级且无提示）。
+   * 本仓库已有「同一语义多处实现必然漂移」的教训（CODE_AUDIT §8）。
+   */
+  const handleJieqiIdentity = useCallback((id: JieqiIdentity) => {
+    jieqiIdentityRef.current = id;
+    // 新 seed ⇒ 新池、新历史起点：用 seed 复现该局初始局面作为重放起点
+    const reproduced = createJieqiInitialState(makeSeededRand(id.seed));
+    setJieqiRuntime(reproduced.state, id.seed);
+  }, []);
+
   // 确认重新开始（残局模式：重置为当前关卡的 FEN 局面）
   // 第 3 批：重置序列不再在此手写，改由 @/hooks/useNewGame 的单一实现承担
   // （此前「确认重开 / 再来一局 / 残局下一关」各有一份 15 行副本，见 §8 表）。
@@ -963,12 +1009,12 @@ export default function GameScreen() {
       endgameFen: isEndgame && currentEndgame ? currentEndgame.fen : undefined,
       // 揭棋重开 = 重新洗牌（每局身份都不同）；象棋不传这两个参数，路径不变
       variant: isJieqi ? 'jieqi' : undefined,
-      onIdentity: (id) => { jieqiIdentityRef.current = id; },
+      onIdentity: handleJieqiIdentity,
       initialSideTag,
       initialFlipped: currentPlayerSide === 'black',
       aiFirst,
     });
-  }, [startNewGame, isEndgame, currentEndgame, isJieqi, initialSideTag, currentPlayerSide, aiFirst]);
+  }, [startNewGame, isEndgame, currentEndgame, isJieqi, initialSideTag, currentPlayerSide, aiFirst, handleJieqiIdentity]);
 
   // 返回（对局中且有有效着法时弹保存确认，与系统返回行为一致）
   // 揭棋走同一条路径：有子可走就弹「保存对局」框，与象棋/残局完全一致。
@@ -1058,12 +1104,12 @@ export default function GameScreen() {
     startNewGame({
       endgameFen: isEndgame && currentEndgame ? currentEndgame.fen : undefined,
       variant: isJieqi ? 'jieqi' : undefined,
-      onIdentity: (id) => { jieqiIdentityRef.current = id; },
+      onIdentity: handleJieqiIdentity,
       initialSideTag,
       initialFlipped: currentPlayerSide === 'black',
       aiFirst,
     });
-  }, [startNewGame, isEndgame, currentEndgame, isJieqi, initialSideTag, currentPlayerSide, aiFirst]);
+  }, [startNewGame, isEndgame, currentEndgame, isJieqi, initialSideTag, currentPlayerSide, aiFirst, handleJieqiIdentity]);
 
   // 残局闯关：进入下一关（原地重置棋盘为新关 FEN，避免同路由导航的状态复用问题）
   // 第 3 批：重置序列同样走 useNewGame，差异只剩三项（棋盘重挂载、固定正向显示、
@@ -1148,17 +1194,43 @@ export default function GameScreen() {
   //    随服务端 AI 一并移除：AI 现在永远在本地跑，没有"连不连得上"可言。
   //    继续挂着那些后缀只会让用户以为 AI 出了故障（正是 2026-10 实测到的误导）。
   //
-  // 首步 AI 走棋前 aiEngine 还是 null，此时引擎通常已在后台启动/就绪，
-  // 显示"皮卡鱼启动中"而不是"基础AI"——否则开局第一眼就看到"基础"，
-  // 会让用户以为引擎没起来（它其实正在起来，且会自动升级）。
+  // ⚠️ 揭棋有**独立**的引擎与标签（2026-10 接入 jieqi.wasm）：
+  //   · 'jieqi-engine'          揭棋引擎已就绪，这一步由它算出
+  //   · 'jieqi-engine-starting' 揭棋引擎本次未成功（产物缺失或本次失败），
+  //                             这一步由内置 AI 代走，下次可能恢复
+  //   · null（尚未走棋）        两种玩法都显示「启动中」——
+  //                             首步之前引擎可能压根没被调用过（揭棋引擎是
+  //                             一次性会话，没有预热），此时写死"揭棋引擎"
+  //                             属于**虚报**：实测反馈"名称标签一直显示揭棋引擎，
+  //                             但一直是灰色标识"正是这两种口径打架的结果。
+  //                             「启动中」既不虚报，也不会退化成象棋的文案。
   const aiChipLabel =
     aiEngine === 'pikafish-local'
       ? `皮卡鱼（${difficultyLabel}）`
-      : aiEngine === 'legacy'
-        // 引擎判定不可用，本局都用兜底
-        ? `基础AI（${difficultyLabel}）`
-        // 引擎还在加载/重试，或尚未走第一步 —— 这段时间是基础 AI 在出招（会自动升级）
-        : `皮卡鱼启动中（${difficultyLabel}）`;
+      : aiEngine === 'jieqi-engine'
+        ? `揭棋引擎（${difficultyLabel}）`
+        : aiEngine === 'jieqi-engine-starting'
+          ? `揭棋引擎启动中（${difficultyLabel}）`
+          : aiEngine === 'legacy'
+            // 引擎判定不可用，本局都用兜底
+            ? `基础AI（${difficultyLabel}）`
+            : isJieqi
+              // 揭棋且尚未走子：还没跑过引擎，如实说"启动中"（会自动升级）
+              ? `揭棋引擎启动中（${difficultyLabel}）`
+              // 象棋：引擎还在加载/重试，或尚未走第一步（会自动升级）
+              : `皮卡鱼启动中（${difficultyLabel}）`;
+
+  /**
+   * 指示灯是否点亮（绿灯 = 最近这一步确实由**真引擎**算出）。
+   *
+   * ⚠️【2026-10 实测修复】此前只判 `aiEngine === 'pikafish-local'`，
+   * 于是揭棋走的是 'jieqi-engine' → **永远点不亮**。表现为「名称标签一直显示
+   * 揭棋引擎，但一直都是灰色标识」，用户据此怀疑引擎根本没在跑（实测引擎确实在跑，
+   * 见 _tmp 的 Chrome CDP 端到端验证：bestmove a9b9、depth 6、396 knps）。
+   * 判据应是"这一步是谁算的"，而不是"是哪一款引擎"。
+   */
+  const aiEngineIsLive =
+    aiEngine === 'pikafish-local' || aiEngine === 'jieqi-engine';
 
   // ===== 底部操作栏配置（2026-10 改造：三模式从左到右的按键集合）=====
   // 人机对战：菜单 / 提示 / 悔棋 / 重开（"翻转"按用户要求移入「菜单」弹出列表）
@@ -1263,11 +1335,13 @@ export default function GameScreen() {
           {/* 内容垂直居中（boardPadTop 由纵向预算给出） */}
           <View style={[styles.boardContainer, { paddingTop: boardPadTop }]}>
             {/* AI 标识角标行：棋盘上方独立行，左对齐（参照联机对战对手名称角标样式），
-                实时指示当前 AI 引擎来源——绿色指示灯=皮卡鱼已就绪，灰色指示灯=基础AI（含难度）。
+                实时指示当前 AI 引擎来源——绿色指示灯=这一步确由真引擎算出，
+                灰色指示灯=兜底 AI（含难度）。aiEngineIsLive 对皮卡鱼与揭棋**同等**点亮，
+                此前只判皮卡鱼会让揭棋永远显示灰点（2026-10 实测报障）。
                 残局模式下补一枚说明图标：标题栏 2026-10 下线后，说明弹窗的入口就地挪到这里。 */}
             <View style={[styles.aiNameRow, alignedRowStyle]} pointerEvents="box-none">
               <View style={styles.aiNameChip}>
-                <View style={[styles.aiNameChipDot, aiEngine === 'pikafish-local' && styles.aiNameChipDotPikafish]} />
+                <View style={[styles.aiNameChipDot, aiEngineIsLive && styles.aiNameChipDotEngine]} />
                 <Text style={styles.aiNameChipText} numberOfLines={1}>
                   {aiChipLabel}
                 </Text>
@@ -1487,16 +1561,17 @@ const styles = StyleSheet.create({
     // 角标文案含引擎名与难度（如"皮卡鱼（进阶）"），放宽上限避免截断
     maxWidth: '86%',
   },
-  // 指示灯：默认灰色=基础AI
+  // 指示灯：默认灰色=兜底 AI（含首步前的「启动中」与长期基础AI）
   aiNameChipDot: {
     width: 6,
     height: 6,
     borderRadius: 3,
     backgroundColor: '#9E9E9E',
   },
-  // 绿色指示灯=皮卡鱼已就绪（2026-10 服务端去 AI 化后不再有"在线"含义，
-// 此处沿用绿色表示"引擎就绪"；样式名由 ...DotOnline 改为 ...DotPikafish）
-  aiNameChipDotPikafish: {
+  // 绿色指示灯=这一步确实由**真引擎**算出（皮卡鱼或揭棋引擎都算）。
+  // 2026-10 服务端去 AI 化后不再有"在线"含义，沿用绿色表示"引擎真的算出了这一步"；
+  // 原名 ...DotPikafish 只覆盖皮卡鱼，会让揭棋永远显示灰点（实测报障），故改为 ...DotEngine。
+  aiNameChipDotEngine: {
     backgroundColor: '#2E7D32',
   },
   aiNameChipText: {
