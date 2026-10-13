@@ -12,6 +12,10 @@ node_modules/
 # 打包产物（zip 输出到仓库根目录，不入库）
 /*.zip
 
+# 压测用的规则层打包产物：由 engine-source/jieqi/gen-stress-bundle.mjs 重新生成。
+# 不入库 —— 改了规则层 TS 后必须重跑该脚本，否则压测会静默测旧规则。
+chinese-chess-client/client/engine-source/jieqi/stress-entry.bundle.cjs
+
 # 会话草稿区（临时探针、快照、日志，不入库）
 .dsh-work/
 .perf-probe/

@@ -58,6 +58,19 @@ import { getBestMoveOffline, getHintMoveOffline, type HybridMoveResult } from '@
 import { isMoveBanned, enumerateLegalMoves, getMoveBanReason, banReasonNotice } from '@/utils/chess/RuleEngine';
 import { playSound, playJiangJunSound, unloadAllSounds, preloadSounds, preloadGameEndSounds } from '@/utils/SoundManager';
 import { RED_SIDE, BLACK_SIDE } from '@/utils/chess/types';
+// 【揭棋】被吃棋子显示：角位内容塞进 BoardEdgeSlot 的槽位，定位全交给「带」。
+// 分组口径见 utils/chess/jieqiCaptured（暗子只出背面图），
+// 几何与占位计算见 utils/chess/jieqiCapturedLayout（纯模块，含上下对称的推导）。
+import { BoardEdgeSlot } from '@/components/BoardEdgeSlot';
+import { CapturedPieces } from '@/components/CapturedPieces';
+import { capturedPiecesOfSide } from '@/utils/chess/jieqiCaptured';
+import {
+  AI_ROW_MIN_HEIGHT,
+  CAPTURED_ROW_GAP,
+  capturedRowReservedHeight,
+  capturedTopFlowDelta,
+} from '@/utils/chess/jieqiCapturedLayout';
+import { useBoardStyle } from '@/utils/chess/boardStyleStore';
 import { type JieqiIdentity, liveHiddenSlots, createJieqiInitialState, makeSeededRand } from '@/utils/chess/jieqi';
 import { setJieqiRuntime, clearJieqiRuntime } from '@/utils/chess/jieqiRuntime';
 import { saveGame, loadGame, deleteSave, canResumeJieqi, resolveFirstMover, saveJieqiGame, loadJieqiGame, deleteJieqiSave, type GameSave } from '@/utils/GameSave';
@@ -275,6 +288,10 @@ export default function GameScreen() {
   // （screenWidth / windowHeight / dynamicGap 改由 useGameBoardLayout 内的
   //  useWindowDimensions 提供，第 3 批顺带修掉转屏后不再重算的旧问题）
   const insets = useSafeAreaInsets();
+  // 【揭棋】被吃棋子行的尺寸换算要用屏宽。它必须在 useGameBoardLayout **之前**取到
+  // （下方行的纵向预留高度要作为该 Hook 的入参），所以这里单独取一份响应式屏宽，
+  // 与 Hook 内部同源（同一个 useWindowDimensions），值一致、只是取用时机不同。
+  const windowDimensions = useWindowDimensions();
 
   // 整屏背景（首页「样式设置 → 背景」所选）。未选背景图时不产生任何视觉变化。
   const background = useBackgroundStyle();
@@ -464,6 +481,50 @@ export default function GameScreen() {
   }, []);
   const hideRuleNotice = useCallback(() => setRuleNotice(null), []);
 
+  // 【揭棋】被吃棋子显示：角位内容塞进 BoardEdgeSlot 的槽位，定位全交给「带」。
+  //
+  //   [ 上带：上左 = AI 引擎药丸 ............ 上右 = 我方损失(右上) ]
+  //   [ 棋盘 ]
+  //   [ 下带：下左 = 对方损失(左下) .......... 下右 = 空 ]
+  //
+  // 结构与前四轮试错的原因见 components/BoardEdgeSlot.tsx 与
+  // utils/chess/jieqiCapturedLayout.ts 的文件头。要点：**角位内容不改变所在行的结构**，
+  // 「带」的高度只由带自己的规则决定，故新加角位不会再牵动既有角位。
+  //
+  // 两处预留高度：
+  //   上带 = max(26, P) + G（AI 药丸行与被吃棋子取高者）+ 上带因我方损失多出的增量
+  //   下带 = P + G
+  // 上下留白都是 G，故棋盘上下对称；上带多承载的 AI 行高度是叠加项，与被吃棋子无关。
+  const capturedBoardStyle = useBoardStyle();
+  const { hasMineCaptured, hasTheirsCaptured } = useMemo(() => {
+    if (gameState.variant !== 'jieqi') return { hasMineCaptured: false, hasTheirsCaptured: false };
+    const playerTag = currentPlayerSide === 'red' ? RED_SIDE : BLACK_SIDE;
+    const opponentTag = playerTag === RED_SIDE ? BLACK_SIDE : RED_SIDE;
+    // 只算「有没有棋子」来决定槽是否占位与预留高度；具体画哪些由组件内部按规则分组，
+    // 这里不复用它的分组结果，避免两份分组逻辑各自演化。
+    return {
+      hasMineCaptured: capturedPiecesOfSide(gameState, playerTag).length > 0,
+      hasTheirsCaptured: capturedPiecesOfSide(gameState, opponentTag).length > 0,
+    };
+  }, [gameState, currentPlayerSide]);
+
+  // 下带（对方损失）的纵向预留高度：只在真的有棋子时预留，否则象棋界面逐像素不变。
+  // 屏宽用本 Hook 的响应式值（与 useGameBoardLayout 内部同一个来源），
+  // 不用 useGameBoardLayout 返回的 screenWidth —— 那个值在下方代码之后才解构出来。
+  const capturedBottomFlowHeight = capturedRowReservedHeight(
+    windowDimensions.width,
+    capturedBoardStyle,
+    hasTheirsCaptured
+  );
+
+  // 上带挂载「我方损失」后长高的那部分（AI 药丸行从 26 长到 max(26, P)）。
+  // 必须计入 topFlowHeight，否则棋盘顶边会被这条带压住。
+  const capturedTopFlowHeight = capturedTopFlowDelta(
+    windowDimensions.width,
+    capturedBoardStyle,
+    hasMineCaptured
+  );
+
   // ===== 棋盘几何与纵向预算（第 3 批抽到 @/hooks/useGameBoardLayout）=====
   // 宿主实测 → 视口封顶 → 纵向预算二分 → 棋盘尺寸 → 对齐行宽 → 绝杀特效框 → 提示条中心，
   // 这条依赖链整体搬进了 Hook；页面只按名字消费结果，不再自己串每一环。
@@ -489,6 +550,10 @@ export default function GameScreen() {
     insetsTop: insets.top,
     insetsBottom: insets.bottom,
     jueshaVisible: jueShaVisible,
+    // 【揭棋】被吃棋子行的上/下预留高度：仅揭棋且对应一方已有损失时 >0，
+    // 从纵向预算里扣掉，棋盘不会被这两行压住。两侧同源 ⇒ 上下间隙一致。
+    capturedBottomFlowHeight,
+    capturedTopFlowHeight,
   });
 
   // 【P4】稳定化传给 ChessBoard 的 onBoardLayout：setBoardSize 本身已是 React 稳定的
@@ -1334,30 +1399,55 @@ export default function GameScreen() {
         >
           {/* 内容垂直居中（boardPadTop 由纵向预算给出） */}
           <View style={[styles.boardContainer, { paddingTop: boardPadTop }]}>
-            {/* AI 标识角标行：棋盘上方独立行，左对齐（参照联机对战对手名称角标样式），
-                实时指示当前 AI 引擎来源——绿色指示灯=这一步确由真引擎算出，
+            {/* 上带（BoardEdgeSlot）：上左 = AI 引擎角标，上右 = 我方损失(右上)。
+                带只负责「贴左/贴右 + 与棋盘的留白」，两端内容各自独立，互不影响。
+
+                AI 标识角标：实时指示当前 AI 引擎来源——绿色指示灯=这一步确由真引擎算出，
                 灰色指示灯=兜底 AI（含难度）。aiEngineIsLive 对皮卡鱼与揭棋**同等**点亮，
                 此前只判皮卡鱼会让揭棋永远显示灰点（2026-10 实测报障）。
                 残局模式下补一枚说明图标：标题栏 2026-10 下线后，说明弹窗的入口就地挪到这里。 */}
-            <View style={[styles.aiNameRow, alignedRowStyle]} pointerEvents="box-none">
-              <View style={styles.aiNameChip}>
-                <View style={[styles.aiNameChipDot, aiEngineIsLive && styles.aiNameChipDotEngine]} />
-                <Text style={styles.aiNameChipText} numberOfLines={1}>
-                  {aiChipLabel}
-                </Text>
-              </View>
-              {isEndgame && currentEndgame && (
-                <Pressable
-                  onPress={() => setEndgameInfoVisible(true)}
-                  accessibilityLabel="玩法说明"
-                  accessibilityRole="button"
-                  hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
-                  style={styles.aiNameRowInfo}
-                >
-                  <FontAwesome6 name="circle-info" size={14} color={COLORS.primary} />
-                </Pressable>
-              )}
-            </View>
+            <BoardEdgeSlot
+              side="top"
+              alignedRowStyle={alignedRowStyle}
+              gap={CAPTURED_ROW_GAP}
+              minHeight={AI_ROW_MIN_HEIGHT}
+              paddingHorizontal={12}
+              testID="board-edge-top"
+              start={
+                <>
+                  <View style={styles.aiNameChip}>
+                    <View
+                      style={[styles.aiNameChipDot, aiEngineIsLive && styles.aiNameChipDotEngine]}
+                    />
+                    <Text style={styles.aiNameChipText} numberOfLines={1}>
+                      {aiChipLabel}
+                    </Text>
+                  </View>
+                  {isEndgame && currentEndgame && (
+                    <Pressable
+                      onPress={() => setEndgameInfoVisible(true)}
+                      accessibilityLabel="玩法说明"
+                      accessibilityRole="button"
+                      hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                      style={styles.aiNameRowInfo}
+                    >
+                      <FontAwesome6 name="circle-info" size={14} color={COLORS.primary} />
+                    </Pressable>
+                  )}
+                </>
+              }
+              end={
+                hasMineCaptured ? (
+                  <CapturedPieces
+                    gameState={gameState}
+                    playerSide={currentPlayerSide}
+                    side="mine"
+                    maxBoardHeight={maxBoardHeight}
+                    testID="captured-mine"
+                  />
+                ) : null
+              }
+            />
 
             {/* 棋盘几何测量包裹层：绝杀特效据此锁定棋盘中心/底边（collapsable=false 保证 Android 可测量） */}
             <View ref={boardRef} onLayout={measureBoardFrame} collapsable={false}>
@@ -1385,6 +1475,31 @@ export default function GameScreen() {
               onBoardLayout={stableSetBoardSize}
             />
             </View>
+
+            {/* 下带（BoardEdgeSlot）：下左 = 对方损失(左下)。与上带同一组件、同一 gap，
+                故上下留白严格相等、左右边缘都精确落在棋盘本体上。
+                下右暂时为空 —— 在线对战会有我方名角标（那时两端都由同一个带承载，
+                结构与上带完全相同，无需再改布局）。
+
+                仅揭棋且确有棋子时渲染 —— 无棋子时带不占纵向空间，象棋界面逐像素不变。 */}
+            <BoardEdgeSlot
+              side="bottom"
+              alignedRowStyle={alignedRowStyle}
+              gap={CAPTURED_ROW_GAP}
+              paddingHorizontal={12}
+              testID="board-edge-bottom"
+              start={
+                hasTheirsCaptured ? (
+                  <CapturedPieces
+                    gameState={gameState}
+                    playerSide={currentPlayerSide}
+                    side="theirs"
+                    maxBoardHeight={maxBoardHeight}
+                    testID="captured-theirs"
+                  />
+                ) : null
+              }
+            />
           </View>
 
           {/* 长将长捉规则提示（方案 12 文案）：接近阈值/禁着/违规警告。
@@ -1541,13 +1656,12 @@ const styles = StyleSheet.create({
   containerTransparent: {
     backgroundColor: 'transparent',
   },
-  aiNameRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    height: 26,
-    marginBottom: 4,
-    paddingHorizontal: 12,
-  },
+  // 【揭棋】角标行已改为 BoardEdgeSlot（见上带渲染处）：定位（贴左/贴右）与与棋盘的
+  // 留白全部交给带，故本页不再需要 aiNameRow 的定位样式，只保留药丸本身的外观样式。
+  // 【揭棋】这一版刻意**去掉 maxWidth**：
+  // 角位带的两端是「药丸 + 被吃棋子」互不重叠的两块内容，不再有「挤在同一行里互相压缩」
+  // 的情况，限宽只会把文案截断（2026-10 实机：「揭棋引擎（进阶）」显示成「揭棋引擎（...」）。
+  // 文案本身已在 aiChipLabel 处收敛，宽度由内容决定。
   aiNameChip: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -1558,8 +1672,11 @@ const styles = StyleSheet.create({
     borderColor: COLORS.border,
     paddingVertical: 4,
     paddingHorizontal: 10,
-    // 角标文案含引擎名与难度（如"皮卡鱼（进阶）"），放宽上限避免截断
-    maxWidth: '86%',
+    // 安全阀：正常情况下药丸宽度 = 文案宽度，不会被压缩（文案完整显示）；
+    // 只有在右端被吃棋子异常宽、带宽真的不够时才压缩，
+    // 以免两端**溢出重叠**。minWidth:0 是允许压缩到内容宽度以下的必要条件。
+    flexShrink: 1,
+    minWidth: 0,
   },
   // 指示灯：默认灰色=兜底 AI（含首步前的「启动中」与长期基础AI）
   aiNameChipDot: {
@@ -1578,12 +1695,14 @@ const styles = StyleSheet.create({
     fontSize: FONT.caption,
     fontWeight: '600',
     color: COLORS.text,
-    flexShrink: 1,
+    // 刻意不加 flexShrink/numberOfLines 之外的限宽：文案要完整显示（2026-10 实机报障）。
+    // 药丸宽度 = 文案宽度，角位带保证左端与右端内容不重叠（见 BoardEdgeSlot 文件头上界论证）。
   },
   // 残局说明入口：贴在引擎标识角标右侧（标题栏下线后无处安放说明弹窗触发器）
   aiNameRowInfo: {
     marginLeft: 8,
     padding: 2,
+    flexShrink: 0,
   },
   // 棋盘 + 底部操作栏的内容宿主（顶部标题栏已于 2026-10 下线，宿主直接顶到安全区下方）
   boardHost: {

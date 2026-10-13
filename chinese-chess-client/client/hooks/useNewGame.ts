@@ -73,11 +73,20 @@ export function buildJieqiInitialGameState(
   initialSideTag: boolean,
   seed?: number
 ): { state: GameState; identity: JieqiIdentity } {
-  const { state, identity } = createJieqiInitialState(undefined, initialSideTag);
+  /**
+   * 【2026-10 审计 D1 修复】原实现是 `createJieqiInitialState(undefined, side)`
+   * 然后 `void seed` —— 接受 seed 却**丢弃**，于是：
+   *   · identity.seed 由 createJieqiInitialState 内部现生成（不再是写死的 0）；
+   *   · 而调用方以为「我传了 seed 就能复现」，实际拿到的是另一个随机 seed。
+   * 三处消费点（开局 / 续局 :408 / 重开 :1064）都以 identity.seed 为唯一契约，
+   * 只要这里把它丢掉，整条「存 seed → 复现同一张身份表」的链条就断了。
+   *
+   * 现在 seed 真正透传：`seed` 给了就逐格复现，不给就内部随机生成并写进 identity。
+   */
+  const { state, identity } = createJieqiInitialState(undefined, initialSideTag, seed);
   state.zobristHash = computeZobristHash(state);
   clearHistoryHash();
   recordHistoryHash(state);
-  void seed;
   return { state, identity };
 }
 

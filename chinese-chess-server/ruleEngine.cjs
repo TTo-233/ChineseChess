@@ -93,6 +93,9 @@ function fillPathPoints(moveQiZi, qiPan, piecePositions, points, crossRiver, eff
     for (let j = 0; j < BOARD_ROWS; j++) {
       col2[j] = false;
     }
+    if (col2.length !== BOARD_ROWS) col2.length = BOARD_ROWS;
+    delete col2[-1];
+    delete col2[-2];
   }
   if (moveQiZi > 31 || moveQiZi < 0) return;
   if (!piecePositions[moveQiZi].alive) return;
@@ -211,16 +214,18 @@ function calcXiang(col, row, moveQiZi, qiPan, points, crossRiver) {
   let side = 0;
   if (row <= 4) side = 5;
   if (crossRiver) {
-    if (col > 1 && qiPan[col - 1][row + 1] === -1 && !isTongBang(moveQiZi, qiPan[col - 2][row + 2])) {
+    const rowLo2 = row >= 2;
+    const rowHi2 = row <= BOARD_ROWS - 3;
+    if (col > 1 && rowHi2 && qiPan[col - 1][row + 1] === -1 && !isTongBang(moveQiZi, qiPan[col - 2][row + 2])) {
       points[col - 2][row + 2] = true;
     }
-    if (col < 7 && qiPan[col + 1][row + 1] === -1 && !isTongBang(moveQiZi, qiPan[col + 2][row + 2])) {
+    if (col < 7 && rowHi2 && qiPan[col + 1][row + 1] === -1 && !isTongBang(moveQiZi, qiPan[col + 2][row + 2])) {
       points[col + 2][row + 2] = true;
     }
-    if (col > 1 && qiPan[col - 1][row - 1] === -1 && !isTongBang(moveQiZi, qiPan[col - 2][row - 2])) {
+    if (col > 1 && rowLo2 && qiPan[col - 1][row - 1] === -1 && !isTongBang(moveQiZi, qiPan[col - 2][row - 2])) {
       points[col - 2][row - 2] = true;
     }
-    if (col < 7 && qiPan[col + 1][row - 1] === -1 && !isTongBang(moveQiZi, qiPan[col + 2][row - 2])) {
+    if (col < 7 && rowLo2 && qiPan[col + 1][row - 1] === -1 && !isTongBang(moveQiZi, qiPan[col + 2][row - 2])) {
       points[col + 2][row - 2] = true;
     }
     return;
@@ -244,10 +249,10 @@ function calcXiang(col, row, moveQiZi, qiPan, points, crossRiver) {
 }
 function calcShi(col, row, moveQiZi, qiPan, points, crossRiver) {
   if (crossRiver) {
-    if (col > 0 && !isTongBang(moveQiZi, qiPan[col - 1][row + 1])) points[col - 1][row + 1] = true;
-    if (col < 8 && !isTongBang(moveQiZi, qiPan[col + 1][row + 1])) points[col + 1][row + 1] = true;
-    if (col > 0 && !isTongBang(moveQiZi, qiPan[col - 1][row - 1])) points[col - 1][row - 1] = true;
-    if (col < 8 && !isTongBang(moveQiZi, qiPan[col + 1][row - 1])) points[col + 1][row - 1] = true;
+    if (col > 0 && row + 1 < BOARD_ROWS && !isTongBang(moveQiZi, qiPan[col - 1][row + 1])) points[col - 1][row + 1] = true;
+    if (col < BOARD_COLS - 1 && row + 1 < BOARD_ROWS && !isTongBang(moveQiZi, qiPan[col + 1][row + 1])) points[col + 1][row + 1] = true;
+    if (col > 0 && row - 1 >= 0 && !isTongBang(moveQiZi, qiPan[col - 1][row - 1])) points[col - 1][row - 1] = true;
+    if (col < BOARD_COLS - 1 && row - 1 >= 0 && !isTongBang(moveQiZi, qiPan[col + 1][row - 1])) points[col + 1][row - 1] = true;
     return;
   }
   let side = 0;
@@ -438,7 +443,7 @@ function sideOfId(id) {
   return id <= 15 ? BLACK_SIDE : RED_SIDE;
 }
 function idsOfType(type, side) {
-  return TYPE_IDS_BY_SIDE[keyOf(side)][type];
+  return TYPE_IDS_BY_SIDE[keyOf(side)][type] ?? [];
 }
 function representativeId(type, side) {
   const ids = idsOfType(type, side);
@@ -1229,7 +1234,12 @@ function makeMove(state, pieceId, toCol, toRow, jieqiIdentity) {
   const fromRow = piece.row;
   const captured = newState.qiPan[toCol][toRow];
   const flipping = newState.variant === "jieqi" && newState.hiddenMask?.[pieceId] === true;
-  const revealedType = flipping ? jieqiIdentity?.hiddenType[pieceId] ?? null : null;
+  if (flipping && !jieqiIdentity) {
+    throw new Error(
+      `makeMove: \u63ED\u68CB\u6697\u5B50 ${pieceId} \u79FB\u52A8\u9700\u8981 jieqiIdentity\uFF08\u94C1\u5F8B A\uFF1A\u8EAB\u4EFD\u8868\u4E0D\u968F GameState \u4F20\u9012\uFF09`
+    );
+  }
+  const revealedType = flipping ? jieqiIdentity.hiddenType[pieceId] ?? null : null;
   const doFlip = flipping && revealedType != null;
   newState.qiPan[fromCol][fromRow] = -1;
   newState.qiPan[toCol][toRow] = pieceId;

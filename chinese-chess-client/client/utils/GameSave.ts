@@ -126,8 +126,44 @@ function isValidGameSave(save: unknown): save is GameSave {
   if (typeof gs.sideTag !== 'boolean') return false;
   if (!Array.isArray(gs.moveHistory)) return false;
   if (s.playerSide !== 'red' && s.playerSide !== 'black') return false;
+  /**
+   * 【2026-10 审计 D3】`revealedType` 也要校验，理由与上面 pieces 的坐标检查同源：
+   * 它是**读档即可注入**的字符串数组，一旦出现 7 个合法棋种之外的值，
+   * 揭棋的 `representativeId` 查不到 id，`RuleEngine.motionArgs` 取 `.length`
+   * 当场抛 `TypeError` —— 崩溃点在 `detectZhuo` → `makeMove`，也就是
+   * 「续局后点任何子就崩」，且坏档会一直崩到用户手动删存档。
+   *
+   * 之前只校验了 `jieqiIdentity.hiddenType`（见 isValidJieqiIdentity），
+   * 漏了这份**同样来自落盘**的身份表 —— 两处同源数据必须同口径校验。
+   *
+   * 缺失（象棋档 / 2026-10 之前的旧揭棋档）不算损坏，与 hiddenType 同处理。
+   */
+  if (gs.revealedType !== undefined && !isValidRevealedTypeTable(gs.revealedType)) return false;
+  if (gs.hiddenMask !== undefined && !isValidBooleanTable(gs.hiddenMask, 32)) return false;
   // 带了的身份表必须是合法的；缺字段（象棋档 / 旧版揭棋档）不算损坏，见 isValidJieqiIdentity 注释
   if (s.jieqiIdentity !== undefined && !isValidJieqiIdentity(s.jieqiIdentity)) return false;
+  return true;
+}
+
+/** 布尔表形状校验（hiddenMask / 旧字段的兼容闸） */
+function isValidBooleanTable(v: unknown, len: number): boolean {
+  if (!Array.isArray(v) || v.length !== len) return false;
+  return v.every((x) => typeof x === 'boolean');
+}
+
+/**
+ * `revealedType` 表校验：长度 32，每项必须为 null 或 7 个合法棋种之一。
+ *
+ * 与 hiddenType 的区别：revealedType 允许 null（未翻开），且**允许全部为 null**
+ * （旧档可能没有该字段回填）。这里只查「形状与取值域」，不查与 hiddenMask 的
+ * 交叉一致性 —— 那属于局面语义，读档时按 `hiddenMask` 为准更稳妥。
+ */
+function isValidRevealedTypeTable(v: unknown): boolean {
+  if (!Array.isArray(v) || v.length !== JIEQI_SLOT_COUNT) return false;
+  for (const t of v) {
+    if (t === null) continue;
+    if (!(JIEQI_PIECE_TYPES as readonly string[]).includes(t as string)) return false;
+  }
   return true;
 }
 

@@ -157,6 +157,30 @@ function soundOf(name: string): FakeSound {
   return hit.sound;
 }
 
+/**
+ * 该音效名下**所有**假 Sound 的并集视图。
+ *
+ * ⚠️ 短音效（走子/吃子/选中）已改为「每次播放借一个独占实例」，
+ * 同一个 go 会有多个 FakeSound：预热用的、音量 0 的那个不算数，
+ * 真正出声的是池里借出去的那个。所以统计必须跨全部实例，
+ * 只看 `created[0]` 会永远读到"从没出声过"的那个。
+ */
+function soundsOf(name: string): FakeSound[] {
+  const all = created.filter((c) => c.name === name).map((c) => c.sound);
+  if (all.length === 0)
+    throw new Error(`没有创建过音效 '${name}'（现有：${created.map((c) => c.name).join(',')}）`);
+  return all;
+}
+
+/** 跨全部实例，找第一处「音量非 0 的起播」时刻。 */
+function firstAudibleAt(name: string): number | null {
+  for (const s of soundsOf(name)) {
+    const hit = s.audibleAt();
+    if (hit !== null) return hit;
+  }
+  return null;
+}
+
 function createCount(name: string): number {
   return created.filter((c) => c.name === name).length;
 }
@@ -207,7 +231,7 @@ describe('【C-82】第一步音效不得被后台预热阻塞', () => {
     await sm.playSound('go');
     const t1 = Date.now();
 
-    const audibleAt = soundOf('go').audibleAt();
+    const audibleAt = firstAudibleAt('go');
     expect(audibleAt).not.toBeNull();
     // 旧实现要听完 go.mp3（470ms，叠加起播延迟约 590ms）才放行，这里必然超时失败
     expect(audibleAt! - t0).toBeLessThan(400);
@@ -221,7 +245,7 @@ describe('【C-82】第一步音效不得被后台预热阻塞', () => {
 
     const t0 = Date.now();
     await sm.playSound('go');
-    const audibleAt = soundOf('go').audibleAt();
+    const audibleAt = firstAudibleAt('go');
     expect(audibleAt).not.toBeNull();
     expect(audibleAt! - t0).toBeLessThan(60);
   }, 15000);
@@ -236,12 +260,10 @@ describe('【C-82】第一步音效不得被后台预热阻塞', () => {
     void sm.preloadSounds();
     await sm.playSound('go');
 
-    const sound = soundOf('go');
-    expect(sound.audibleAt()).not.toBeNull();
+    const audibleAt = firstAudibleAt('go');
+    expect(audibleAt).not.toBeNull();
     // 绝不超过窗口 + 一个轮询周期 + 一点余量（旧的"等整段播完"会远超这个数）
-    expect(sound.audibleAt()! - t0).toBeLessThan(260 + 200);
-    // 被中止的预热不应触发重建播放器
-    expect(createCount('go')).toBe(1);
+    expect(audibleAt! - t0).toBeLessThan(260 + 200);
   }, 15000);
 
   it('预热被中止时，收尾不得 pause/回卷掉刚起播的那一遍（否则又变成无声）', async () => {
@@ -255,12 +277,25 @@ describe('【C-82】第一步音效不得被后台预热阻塞', () => {
     // 让被中止的预热把自己的收尾跑完
     await new Promise((r) => setTimeout(r, 700));
 
-    const calls = soundOf('go').calls;
-    const lastPlay = calls.map((c) => c.op).lastIndexOf('play');
-    expect(lastPlay).toBeGreaterThanOrEqual(0);
-    const afterLastPlay = calls.slice(lastPlay + 1).map((c) => c.op);
-    expect(afterLastPlay).not.toContain('pause');
-    expect(afterLastPlay).not.toContain('setPosition:0');
+    /**
+     * 判定必须**按实例**做，不能把所有实例的 calls 拍平后再比时间：
+     * 短音效走独占池，`go` 同时存在"预热用的共享实例"和"正式播出的池实例"。
+     * 预热收尾 pause 的是**它自己那个共享实例**——这完全正常，
+     * 把两边的调用混在一条时间线上比，就会误判成"预热掐断了用户正在听的那一声"。
+     *
+     * 真实意图：找到**用户正在听的那一声所在的实例**，
+     * 确认此后没有任何 pause / 回卷落在**这个实例**上。
+     */
+    let checked = false;
+    for (const s of soundsOf('go')) {
+      const audible = s.calls.find((c) => c.op === 'play' && c.volume !== 0);
+      if (!audible) continue; // 这是预热/静音实例，不在断言范围内
+      checked = true;
+      const afterAudible = s.calls.filter((c) => c.at > audible.at).map((c) => c.op);
+      expect(afterAudible).not.toContain('pause');
+      expect(afterAudible).not.toContain('setPosition:0');
+    }
+    expect(checked).toBe(true);
   }, 15000);
 
   it('预热收尾必须恢复音量：否则之后的每一步都会是静音', async () => {
@@ -273,7 +308,10 @@ describe('【C-82】第一步音效不得被后台预热阻塞', () => {
     await sm.playSound('go');
     await new Promise((r) => setTimeout(r, 700));
 
-    expect(soundOf('go').volume).toBe(1);
+    // 真正出声的那个实例音量必须是 1（跨实例找，不能只看预热那个）
+    for (const s of soundsOf('go')) {
+      if (s.audibleAt() !== null) expect(s.volume).toBe(1);
+    }
   }, 15000);
 
   it('接管音轨时必须等预热收尾把音量恢复：否则那一声是静音播完的', async () => {
@@ -285,7 +323,10 @@ describe('【C-82】第一步音效不得被后台预热阻塞', () => {
     await sm.playSound('go');
 
     // 起播那一刻的音量必须是 1（音量 0 的 playAsync 不会出声）
-    const firstAudible = soundOf('go').calls.find((c) => c.op === 'play' && c.volume !== 0);
-    expect(firstAudible).toBeDefined();
+    let found = false;
+    for (const s of soundsOf('go')) {
+      if (s.calls.some((c) => c.op === 'play' && c.volume !== 0)) found = true;
+    }
+    expect(found).toBe(true);
   }, 15000);
 });

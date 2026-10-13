@@ -41,10 +41,19 @@ jest.mock('../AIEngine', () => ({
   getHintMoveAsync: (...args: unknown[]) => mockGetHintMoveAsync(...args),
 }));
 
-// 出口守卫依赖的送将判定：默认放行，可按用例改写
+// 出口守卫依赖的送将判定 + 落点合法性判定：默认放行，可按用例改写
 const mockIsMoveKingSafe = jest.fn(() => true);
+/**
+ * 【2026-10 审计 D2】rejectMoverUnsafe 现在还会查 `getValidMoves` 落点合法性
+ * （揭棋引擎与本仓库是**两套**实现，失配会把非法着法直接写进盘面）。
+ * 这里默认返回一张全 true 的表，即「引擎给的着法都合法」。
+ */
+const mockGetValidMoves = jest.fn(() =>
+  Array.from({ length: 9 }, () => new Array(10).fill(true))
+);
 jest.mock('../GameEngine', () => ({
   isMoveKingSafe: (...args: unknown[]) => mockIsMoveKingSafe(...args),
+  getValidMoves: (...args: unknown[]) => mockGetValidMoves(...args),
 }));
 
 import { getBestMoveOffline, getHintMoveOffline } from '../aiDispatcher';
@@ -81,6 +90,9 @@ beforeEach(() => {
   jest.clearAllMocks();
   mockGetStatus.mockReturnValue({ source: 'pikafish', capabilities: null, reason: null });
   mockIsMoveKingSafe.mockReturnValue(true);
+  mockGetValidMoves.mockImplementation(() =>
+    Array.from({ length: 9 }, () => new Array(10).fill(true))
+  );
 });
 
 describe('aiDispatcher 引擎来源标签（纯本地）', () => {
@@ -156,6 +168,37 @@ describe('aiDispatcher 引擎来源标签（纯本地）', () => {
     mockIsMoveKingSafe.mockReturnValue(false);
     const r = await getBestMoveOffline(state, 'medium');
     expect(r).toBeNull();
+  });
+
+  /**
+   * 【2026-10 审计 D2】着法**不送将**但**落点不在合法着法表**里时也必须拒收。
+   *
+   * 背景：揭棋引擎（Pikafish `jieqi_old`）与本仓库是两套实现，两者对
+   * 「已翻开的士/象是否仍受九宫河界限制」等边界的认知可能不同。一旦失配，
+   * 引擎给的落点会被 `screens/game/index.tsx` 的 makeMove 直接落子（它不校验），
+   * 盘面进入**无法靠对方补救**的非法状态。
+   */
+  it('(11) 落点不在合法着法表 → 引擎着法被拒收（即便不送将），不把非法着法交给界面', async () => {
+    mockRequestOfflineMove.mockResolvedValue(outcome('pikafish'));
+    mockIsMoveKingSafe.mockReturnValue(true); // 不送将
+    // 全 false：引擎着法与兜底着法的落点 (1,7) 都非法 ⇒ 最终只能是 null。
+    // 这正是「两套规则实现失配」时的真实情形：连兜底 AI 也走不到那个点。
+    mockGetValidMoves.mockReturnValue(Array.from({ length: 9 }, () => new Array(10).fill(false)));
+    mockGetBestMoveAsync.mockResolvedValue(tsMove);
+
+    const r = await getBestMoveOffline(state, 'medium');
+    expect(r).toBeNull();
+  });
+
+  it('(12) 落点合法 → 放行（守住 D2 的闸不会误杀正常着法）', async () => {
+    mockRequestOfflineMove.mockResolvedValue(outcome('pikafish'));
+    const legal = Array.from({ length: 9 }, () => new Array(10).fill(false));
+    legal[1][7] = true; // outcome() 的落点正是 (1,7)
+    mockGetValidMoves.mockReturnValue(legal);
+
+    const r = await getBestMoveOffline(state, 'medium');
+    expect(r?.toCol).toBe(1);
+    expect(r?.toRow).toBe(7);
   });
 });
 

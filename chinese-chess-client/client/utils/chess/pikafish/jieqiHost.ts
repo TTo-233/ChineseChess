@@ -185,8 +185,30 @@ export function getJieqiWasmUrl(): string {
   return wasmUrlCache;
 }
 
-/** 产物是否齐备（缺任一产物时上层应直接降级到 TS AI，而不是报错） */
+/**
+ * 产物是否齐备（缺任一产物时上层应直接降级到 TS AI，而不是报错）
+ *
+ * 【2026-10 审计 D4：必须同时检查「承载能力」】
+ *
+ * 原实现只 `require` 两个资源，于是**任何平台都返回 true**。但本模块唯一的
+ * 承载路径是 Web Worker，而 `runJieqiSession` 在 `typeof Worker === 'undefined'`
+ * 时直接抛错。于是原生端（Android/iOS）会：
+ *   1. 走进引擎分支（isJieqiHostAvailable() 为 true）；
+ *   2. 每次搜索都在 runJieqiSession 里抛错；
+ *   3. 被上层 catch → **静默回落 TS AI**；
+ *   4. 角标却因为 (1) 一直显示「揭棋引擎启动中」——
+ *      用户看到的是一个**永远启动不了**的引擎 + 永久降级的棋力，且毫无提示。
+ *
+ * ⚠️ 象棋侧是靠 WebView 承载解决的（pikafish/index.ts 的 createPrimaryEngine
+ * 有 android/ios 分支），而揭棋**没有** WebView transport。故这里不能假装
+ * 支持原生，只能诚实地按「Worker 可用」判定：
+ *   · Web（Expo web / 打包后的浏览器）：Worker 可用 ⇒ 引擎可用；
+ *   · 原生：返回 false ⇒ 立刻走 TS AI，且角标不再谎称「启动中」。
+ *
+ * 若将来为揭棋补 WebView 承载，应在此改为与象棋同样的三态判定。
+ */
 export function isJieqiHostAvailable(): boolean {
+  if (typeof Worker === 'undefined') return false;
   try {
     resolveWorkerUrl();
     resolveWasmUrl();

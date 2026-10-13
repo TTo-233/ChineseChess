@@ -18,7 +18,8 @@ import { useWindowDimensions, type View } from 'react-native';
 import { useBoardFrame } from '@/hooks/useBoardFrame';
 import { useBoardStyle } from '@/utils/chess/boardStyleStore';
 import { boardAlignedRowStyle } from '@/utils/chess/boardContentWidth';
-import { useBoardLayoutBudget, capHostHeightToViewport } from '@/utils/chess/boardLayoutBudget';
+import { useBoardLayoutBudget } from '@/utils/chess/useBoardLayoutBudget';
+import { capHostHeightToViewport } from '@/utils/chess/boardLayoutBudget';
 import { BOTTOM_BAR_HEIGHT } from '@/components/GameBottomBar';
 
 /** AI 角标行在纵向流内的占位高度（StyleSheet 里 aiNameRow height 26 + marginBottom 4） */
@@ -40,6 +41,22 @@ export interface GameBoardLayoutOptions {
   insetsBottom: number;
   /** 绝杀特效可见：弹出前需要按绝对坐标兜底重测棋盘框 */
   jueshaVisible: boolean;
+  /**
+   * 【揭棋】棋盘**上方**被吃棋子行（我方损失）的流内占位高度；默认 0。
+ *
+   * 它与下方那行用同一个换算函数（capturedRowReservedHeight），
+   * 因此棋盘上下的间隙完全一致 —— 上下两行若一边预留一边不预留，
+   * 就会出现「上边压盘面、下边留空白」这种不对称。
+   */
+  capturedTopFlowHeight?: number;
+  /**
+   * 【揭棋】棋盘**下方**被吃棋子行（对方损失）的流内占位高度；默认 0。
+   *
+   * 只在该行真的有棋子时 >0（象棋局面恒为 0），因此象棋界面与改造前逐像素一致。
+   * 它必须计入纵向预算：否则棋盘底边会直接压在这一行上（实机就是这个效果）。
+   * 口径见 utils/chess/boardLayoutBudget.ts 的 bottomFlowHeight 说明。
+   */
+  capturedBottomFlowHeight?: number;
 }
 
 export interface GameBoardLayoutApi {
@@ -49,8 +66,13 @@ export interface GameBoardLayoutApi {
   boardPadTop: number;
   /** 棋盘与底部操作栏之间的间距 = max(屏宽 * 3%, 8) */
   dynamicGap: number;
-  /** 棋盘本体宽度对齐样式：AI 角标行与底部操作栏共用（同一几何、同一结果） */
-  alignedRowStyle: object;
+  /**
+   * 棋盘本体宽度对齐样式：AI 角标行与底部操作栏共用（同一几何、同一结果）。
+   *
+   * 类型取 boardAlignedRowStyle 的真实返回值而非裸 object —— 这个值被透传给
+   * 被吃棋子行等下游组件，裸 object 会让下游拿不到 width/alignSelf 而编译失败。
+   */
+  alignedRowStyle: ReturnType<typeof boardAlignedRowStyle>;
   /** 绝杀特效对齐用的棋盘框（棋盘本体真实几何） */
   jueshaBoardFrame: { x: number; y: number; width: number; height: number } | null;
   /** 规则提示条（GameNotice）的棋盘中心纵坐标；undefined = 退回容器 50% 居中 */
@@ -77,6 +99,8 @@ export function useGameBoardLayout(options: GameBoardLayoutOptions): GameBoardLa
     insetsTop,
     insetsBottom,
     jueshaVisible,
+    capturedBottomFlowHeight = 0,
+    capturedTopFlowHeight = 0,
   } = options;
 
   const { width: screenWidth, height: windowHeight } = useWindowDimensions();
@@ -106,8 +130,9 @@ export function useGameBoardLayout(options: GameBoardLayoutOptions): GameBoardLa
       BOTTOM_BAR_HEIGHT + dynamicGap
     ),
     screenWidth,
-    topFlowHeight: AI_NAME_ROW_FLOW_HEIGHT,
-    bottomFlowHeight: 0,
+    topFlowHeight: AI_NAME_ROW_FLOW_HEIGHT + capturedTopFlowHeight,
+    // 【揭棋】下方被吃棋子行从棋盘的高度预算里扣除（它真实占位，必须计入）
+    bottomFlowHeight: capturedBottomFlowHeight,
     hostTopY: boardHostY,
     viewportHeight: windowHeight,
   });

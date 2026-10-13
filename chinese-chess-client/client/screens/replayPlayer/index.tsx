@@ -35,7 +35,8 @@ import GameBottomBar, {
 import { createInitialState, applyHandicap, makeMove, type GameState } from '@/utils/chess/GameEngine';
 import { RED_SIDE, BLACK_SIDE } from '@/utils/chess/types';
 import { getReplay, type ReplayGame } from '@/utils/replayStorage';
-import { useBoardLayoutBudget, capHostHeightToViewport } from '@/utils/chess/boardLayoutBudget';
+import { useBoardLayoutBudget } from '@/utils/chess/useBoardLayoutBudget';
+import { capHostHeightToViewport } from '@/utils/chess/boardLayoutBudget';
 import { boardAlignedRowStyle } from '@/utils/chess/boardContentWidth';
 import { useBoardStyle } from '@/utils/chess/boardStyleStore';
 import { useBackgroundStyle } from '@/utils/chess/backgroundStyleStore';

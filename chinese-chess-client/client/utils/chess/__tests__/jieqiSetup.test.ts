@@ -232,15 +232,59 @@ describe('揭棋 · 翻开（只记棋种，id 恒定）', () => {
     expect(undone!.revealedType![mv!.id]).toBeNull();
   });
 
-  it('未传 identity 时不瞎猜：暗子继续按棋位走，局面仍自洽', () => {
+  /**
+ * 【2026-10 审计 D1：行为已反转】
+ *
+ * 原用例名叫「未传 identity 时**不瞎猜**：暗子继续按棋位走，局面仍自洽」，
+ * 它把「静默跳过翻开」当成正确行为固化了下来。但静默跳过本身就是缺陷：
+ * 走过的暗子永远翻不开 ⇒ 直接违反规则 3，且 `hiddenMask[x]===true` 与
+ * 「x 明明移动过」两个状态并存，后续任何按 hiddenMask 的扫描（攻击判定、
+ * 引擎展开）都会把它当成没动过的暗子 —— **静默错局比崩溃更难发现**。
+ *
+ * `jieqiIdentity` 是可选参数，签名不会提醒调用方必须传（`replayPlayer/index.tsx`
+ * 就曾漏传）。故现在改为**显式抛错**：宁可不走，也不走出一局假棋。
+ */
+  it('未传 identity 时报错：绝不允许「走过的暗子永远翻不开」（审计 D1）', () => {
     const { state } = createJieqiInitialState(makeSeededRand(24));
     const mv = findAnyHiddenMove(state);
     expect(mv).not.toBeNull();
-    const res = makeMove(state, mv!.id, mv!.c, mv!.r); // 不传 identity
+    // 不传 identity ⇒ 直接拒绝，绝不产出一个「看似正常」的错局
+    expect(() => makeMove(state, mv!.id, mv!.c, mv!.r)).toThrow(/jieqiIdentity/);
+  });
+
+  it('正常传入 identity 时仍然走子即翻开（守住规则 3 不被上面的守卫误伤）', () => {
+    const { state, identity } = createJieqiInitialState(makeSeededRand(24));
+    const mv = findAnyHiddenMove(state);
+    const res = makeMove(state, mv!.id, mv!.c, mv!.r, identity);
     expect(res.newState.qiPan[mv!.c][mv!.r]).toBe(mv!.id);
-    // 没有任何 id 被标成已翻开
-    expect(res.newState.hiddenMask![mv!.id]).toBe(true);
+    expect(res.newState.hiddenMask![mv!.id]).toBe(false);
+    expect(res.newState.revealedType![mv!.id]).not.toBeNull();
     expect(auditBoardConsistency(res.newState)).toEqual([]);
+  });
+
+  it('象棋局面不受该守卫影响（无 identity 也能正常走）', () => {
+    const { state } = createJieqiInitialState(makeSeededRand(24));
+    const xiangqi: GameState = {
+      ...state,
+      variant: 'xiangqi',
+      hiddenMask: undefined,
+      revealedType: undefined,
+    };
+    // 不能用 findAnyHiddenMove（它按 hiddenMask 过滤，象棋局面没有该字段），
+    // 这里直接从走法表里找一步合法棋。
+    let mv: { id: number; c: number; r: number } | null = null;
+    for (let id = 0; id < 32 && !mv; id++) {
+      if (!xiangqi.pieces[id].alive) continue;
+      if ((id <= 15) !== (xiangqi.sideTag === BLACK_SIDE)) continue;
+      const pts = getValidMoves(xiangqi, id);
+      for (let c = 0; c < BOARD_COLS && !mv; c++) {
+        for (let r = 0; r < BOARD_ROWS && !mv; r++) {
+          if (pts[c][r] && isMoveKingSafe(xiangqi, id, c, r)) mv = { id, c, r };
+        }
+      }
+    }
+    expect(mv).not.toBeNull();
+    expect(() => makeMove(xiangqi, mv!.id, mv!.c, mv!.r)).not.toThrow();
   });
 });
 

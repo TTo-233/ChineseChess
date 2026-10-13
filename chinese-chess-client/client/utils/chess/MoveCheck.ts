@@ -70,6 +70,16 @@ export function fillPathPoints(
     for (let j = 0; j < BOARD_ROWS; j++) {
       col[j] = false;
     }
+    /**
+     * 【2026-10 审计 D2】兜底截断：清零循环只跑 `j < BOARD_ROWS`，
+     * 若某个走法分支（历史上是揭棋已翻开士/象的跨河分支漏判行边界）把
+     * `col[10]` 写成 true，数组长度会被撑到 11 且该幻影点**跨调用残留**在
+     * AIEngine 复用的缓冲里。这里把长度钉回 10 并删除可能的负下标隐藏属性，
+     * 使「走点矩阵恒为 9×10」成为不变量，而不再依赖每个分支都判对边界。
+     */
+    if (col.length !== BOARD_ROWS) col.length = BOARD_ROWS;
+    delete col[-1];
+    delete col[-2];
   }
 
   if (moveQiZi > 31 || moveQiZi < 0) return;
@@ -239,19 +249,37 @@ function calcXiang(
      * `qiPan[9][row+2]` 直接抛 `Cannot read properties of undefined`。
      * 原写成 `col < 8` 会在象贴到第 7、8 路时崩掉 —— 该分支只在揭棋下可达，
      * 故象棋不受影响，但揭棋随机对弈必然踩到。
+     *
+     * 【2026-10 审计 D2】**行**边界此前一直漏判：揭棋的士/象可以过河、走过九宫，
+     * 落在棋盘任意行都可能触发 `row±1` / `row±2` 越界。两种越界都很隐蔽：
+     *   · `row+1/row+2 > 9` → `points[c][10] = true` 把列数组**撑长到 11**，
+     *     且 `fillPathPoints` 的清零循环只跑 `j < BOARD_ROWS`，于是这个幻影点
+     *     **跨调用残留在 AIEngine 的复用缓冲里**；
+     *   · `row-1/row-2 < 0` → 写成 `points[c][-1]` 这个**隐藏属性**，
+     *     `.length` 不变，肉眼完全看不出来，但值已被污染。
+     * 今天所有消费方都只遍历 `r < BOARD_ROWS`，所以 UI 无可见症状；
+     * 但任何改用 `.flat()` / `for...of` / `Object.keys` 的新代码都会踩中，
+     * 且会污染行/列索引敏感的逻辑（如 Zobrist、数组扁平化）。
+     *
+     * ⇒ 这里按「目标行是否越界」判：向下两个落点是 `row+1` 与 `row+2`，
+     * 约束等价于 `row+2 <= 9`（`row+1` 更宽松，被它包含）⇒ `rowHi2`；
+     * 向上同理约束于 `row-2 >= 0` ⇒ `rowLo2`。
+     * 非放宽分支靠 `row !== 9-side` / `row !== 5-side` 天然避开，无需改动。
      */
-    // 下方
-    if (col > 1 && qiPan[col - 1][row + 1] === -1 && !isTongBang(moveQiZi, qiPan[col - 2][row + 2])) {
+    const rowLo2 = row >= 2;
+    const rowHi2 = row <= BOARD_ROWS - 3;
+    // 下方（落点 row+1 / row+2，受 rowHi2 约束）
+    if (col > 1 && rowHi2 && qiPan[col - 1][row + 1] === -1 && !isTongBang(moveQiZi, qiPan[col - 2][row + 2])) {
       points[col - 2][row + 2] = true;
     }
-    if (col < 7 && qiPan[col + 1][row + 1] === -1 && !isTongBang(moveQiZi, qiPan[col + 2][row + 2])) {
+    if (col < 7 && rowHi2 && qiPan[col + 1][row + 1] === -1 && !isTongBang(moveQiZi, qiPan[col + 2][row + 2])) {
       points[col + 2][row + 2] = true;
     }
-    // 上方
-    if (col > 1 && qiPan[col - 1][row - 1] === -1 && !isTongBang(moveQiZi, qiPan[col - 2][row - 2])) {
+    // 上方（落点 row-1 / row-2，受 rowLo2 约束）
+    if (col > 1 && rowLo2 && qiPan[col - 1][row - 1] === -1 && !isTongBang(moveQiZi, qiPan[col - 2][row - 2])) {
       points[col - 2][row - 2] = true;
     }
-    if (col < 7 && qiPan[col + 1][row - 1] === -1 && !isTongBang(moveQiZi, qiPan[col + 2][row - 2])) {
+    if (col < 7 && rowLo2 && qiPan[col + 1][row - 1] === -1 && !isTongBang(moveQiZi, qiPan[col + 2][row - 2])) {
       points[col + 2][row - 2] = true;
     }
     return;
@@ -282,11 +310,27 @@ function calcShi(
   points: boolean[][], crossRiver?: boolean
 ) {
   // 揭棋：已翻开的士/仕不再受九宫限制（仍保持斜行一步）
+  //
+  // 【2026-10 审计 D2】行边界必须逐个落点判，不能给整块加一个 `row` 区间守卫。
+  //
+  // 士只走斜行**一步**，落点是 `row±1`。row 取值 0..9：
+  //   · 向下 `row+1` 越界 ⇔ row ≥ 10 —— 不可能发生 ⇒ **永远允许**；
+  //   · 向上 `row-1` 越界 ⇔ row < 1 ⇒ 仅 row 0 需要挡。
+  // 早先写成 `row >= 1 && row <= BOARD_ROWS - 2`（即 row ≤ 8），
+  // 那个上界是**多余且有害**的：它让**底线 row 9 的仕彻底无着法可走**
+  // （而按规则 5，已翻开的仕本就应当出九宫/过河，走到底线是合法可达局面）。
+  // 实测：红仕 @(2,9) 本仓库给 0 步，引擎却能走 c0d1（(2,9)→(3,8)）。
+  // 这就是百局压测里那批「引擎不认规则 5」分歧的**真正来源** ———
+  // 方向反了：不是引擎不懂规则 5，是**我们**把底线的仕判成了不能动。
+  //
+  // 教训：跨调用残留（撑长列数组 / `points[c][-1]` 隐藏属性）这类隐患，
+  // 修的时候很容易顺手把守卫写「对称好看」，从而引入真 bug。
+  // 判据只能是**目标落点是否越界**，不能是「整块是否在某个区间内」。
   if (crossRiver) {
-    if (col > 0 && !isTongBang(moveQiZi, qiPan[col - 1][row + 1])) points[col - 1][row + 1] = true;
-    if (col < 8 && !isTongBang(moveQiZi, qiPan[col + 1][row + 1])) points[col + 1][row + 1] = true;
-    if (col > 0 && !isTongBang(moveQiZi, qiPan[col - 1][row - 1])) points[col - 1][row - 1] = true;
-    if (col < 8 && !isTongBang(moveQiZi, qiPan[col + 1][row - 1])) points[col + 1][row - 1] = true;
+    if (col > 0 && row + 1 < BOARD_ROWS && !isTongBang(moveQiZi, qiPan[col - 1][row + 1])) points[col - 1][row + 1] = true;
+    if (col < BOARD_COLS - 1 && row + 1 < BOARD_ROWS && !isTongBang(moveQiZi, qiPan[col + 1][row + 1])) points[col + 1][row + 1] = true;
+    if (col > 0 && row - 1 >= 0 && !isTongBang(moveQiZi, qiPan[col - 1][row - 1])) points[col - 1][row - 1] = true;
+    if (col < BOARD_COLS - 1 && row - 1 >= 0 && !isTongBang(moveQiZi, qiPan[col + 1][row - 1])) points[col + 1][row - 1] = true;
     return;
   }
 

@@ -78,6 +78,7 @@ const JIEQI_RULE_LINES = [
   '暗子不算将军，也不攻击对方',
   '揭开的士、象可以过河',
   '吃掉的暗子不会补上新子',
+  '不支持复盘和悔棋',
 ];
 
 export default function PveSetupScreen() {
@@ -366,15 +367,13 @@ export default function PveSetupScreen() {
           </View>
           <Text style={styles.engineHint}>
             {/*
-              如实说明棋力来源，不虚报：
+              如实说明棋力来源，不虚报（2026-10 产品要求精简为一行）：
               · 象棋走本机内置皮卡鱼；
-              · 揭棋走**本机内置的揭棋引擎**（2026-10 接入，与象棋各自独立），
+              · 揭棋走**本机内置的揭棋引擎**（与象棋各自独立），
                 它和你一样看不到暗子真身，只按「未揭暗子池」推理；
                 引擎不可用时自动退回内置 AI 兜底（对局不中断）。
             */}
-            {isJieqi
-              ? '揭棋由本机内置揭棋引擎对弈，断网也能用；它和你一样看不到暗子真身，只按剩余棋种的可能性推算'
-              : '皮卡鱼引擎内置在本机运行，断网也能用，棋力不受网络影响'}
+            {isJieqi ? '内置揭棋引擎' : '内置皮卡鱼引擎'}
           </Text>
         </View>
 
@@ -391,13 +390,6 @@ export default function PveSetupScreen() {
             <FontAwesome6 name="arrow-right" size={18} color="#fff" style={{ marginLeft: 8 }} />
           </View>
         </TouchableOpacity>
-
-        {/* 揭棋额外说明：它与象棋的存档分开，且不支持复盘 */}
-        {isJieqi && (
-          <Text style={styles.footnote}>
-            揭棋与象棋各自保存一局，互不影响；揭棋暂不支持复盘
-          </Text>
-        )}
       </ScrollView>
 
       {/* 玩法说明弹窗（仅揭棋模式；与残局闯关同一套 AppModal + ModalButton 语言） */}
@@ -521,14 +513,6 @@ const styles = StyleSheet.create({
   },
   ruleModalFooter: {
     marginTop: 4,
-  },
-  footnote: {
-    marginTop: 16,
-    fontSize: FONT.caption,
-    lineHeight: 18,
-    color: COLORS.textMuted,
-    opacity: 0.6,
-    textAlign: 'center',
   },
   section: {
     marginBottom: 20,

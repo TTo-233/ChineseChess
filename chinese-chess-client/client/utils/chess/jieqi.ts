@@ -104,9 +104,26 @@ export function sideOfId(id: number): SideTag {
   return id <= 15 ? BLACK_SIDE : RED_SIDE;
 }
 
-/** 同类棋子的 id 清单（按方） */
+/**
+ * 同类棋子的 id 清单（按方）
+ *
+ * ⚠️ 【2026-10 审计 D3】`type` 可能来自**读档**的 `revealedType`，
+ * 而落盘结构不做校验 ⇒ 旧档/手改档里出现 `'king'` 之类非法值时，
+ * 原实现 `TYPE_IDS_BY_SIDE[key][type]` 返回 `undefined`，
+ * 上层 `ids.length` 直接抛 `TypeError: Cannot read properties of undefined`，
+ * 且抛点在 `RuleEngine.motionArgs` → `detectZhuo` → `makeMove` 里 —— 
+ * 表现为「一进续局点任何子就崩」。
+ * 故这里返回空数组而不是 undefined，并导出 `isValidJieqiPieceType` 供读档校验。
+ */
 function idsOfType(type: JieqiPieceType, side: SideTag): number[] {
-  return TYPE_IDS_BY_SIDE[keyOf(side)][type];
+  return TYPE_IDS_BY_SIDE[keyOf(side)][type] ?? [];
+}
+
+/** 棋种字面量是否合法（读档校验用；7 个合法值见 JieqiPieceType） */
+export function isValidJieqiPieceType(t: unknown): t is JieqiPieceType {
+  return typeof t === 'string' && Object.prototype.hasOwnProperty.call(
+    TYPE_IDS_BY_SIDE.red, t
+  );
 }
 
 /**
@@ -117,6 +134,9 @@ function idsOfType(type: JieqiPieceType, side: SideTag): number[] {
  * 故取该方该类第一个 id 即可。
  *
  * 注意卒/兵分属两方：黑方的 'zu' 映射到黑卒 id，红方的 'bing' 映射到红兵 id。
+ *
+ * ⚠️ 非法棋种返回 `null`（调用方按「无身份映射」处理），**不抛错** ——
+ * 否则一个坏存档会在走法生成的中途炸掉整局。见 D3。
  */
 export function representativeId(type: JieqiPieceType, side: SideTag): number | null {
   const ids = idsOfType(type, side);
@@ -262,6 +282,28 @@ export function makeShuffleRand(): (n: number) => number {
   return (n: number) => Math.floor(Math.random() * n);
 }
 
+/**
+ * 生成一个 32 位随机种子（【2026-10 审计 D1】新增）。
+ *
+ * 存在的理由：新开局必须**既用 CSPRNG 洗身份、又能复现**。
+ * 做法是「先随机出 seed，再由 seed 派生出确定性的 rand」——
+ * 这样 CSPRNG 的不可预测性被保留（洗牌结果仍不可猜），
+ * 而 identity.seed 一旦存进存档，续局就能用 makeSeededRand 逐格复现同一张身份表。
+ *
+ * 早期实现是「用 CSPRNG 直接洗牌、seed 却写死 0」，二者脱钩 ⇒ 无法复现。
+ */
+export function makeRandomSeed(): number {
+  const c = (globalThis as { crypto?: Crypto }).crypto;
+  if (c && typeof c.getRandomValues === 'function') {
+    const buf = new Uint32Array(1);
+    c.getRandomValues(buf);
+    // 避开 0：makeSeededRand(0) 会退回固定魔数，导致不同局撞同一张身份表
+    return buf[0] === 0 ? 0x9e3779b9 : buf[0] >>> 0;
+  }
+  const r = Math.floor(Math.random() * 0xffffffff);
+  return r === 0 ? 0x9e3779b9 : r >>> 0;
+}
+
 /** 可注入种子的确定性随机（测试/复盘用；生产洗牌请用 makeShuffleRand） */
 export function makeSeededRand(seed: number): (n: number) => number {
   let s = seed >>> 0 || 0x9e3779b9;
@@ -282,12 +324,37 @@ export function makeSeededRand(seed: number): (n: number) => number {
  *
  * 产出 GameState（variant='jieqi'，qiPan 上写占位 id，hiddenMask 除将帅全 true）
  * 与 JieqiIdentity（真相，绝不进 GameState）。
+ *
+ * @param randInt       身份洗牌随机源。**留空**，由本函数按 `seed` 造（推荐）；
+ *                      仅测试/复现场景才自己传入，且此时必须让 `seed` 与它同源。
+ * @param firstMoveSide 开局走棋方（揭棋规则 1 恒红先，仅显式要求黑先时才传 BLACK_SIDE）
+ * @param seed          本局的**可重放种子**。
+ *
+ * 【2026-10 审计 D1：seed 与 rand 必须成对且可复现】
+ * 此前这里写死 `buildJieqiIdentity(rand, 0)`，于是 `identity.seed` **恒为 0**。
+ * 而 `useNewGame.buildJieqiInitialGameState(seed)` 接受 seed 却 `void seed` 丢弃；
+ * 续局侧（screens/game/index.tsx:408 / :1064）又拿 `makeSeededRand(identity.seed)`
+ * 去复现初始局面 ⇒ 复现出的身份表与真实对局**不是同一张**。
+ * 之所以一直没炸：揭棋 FEN 里暗子一律输出 x/X（铁律 A），复现错的身份在
+ * 盘面上逐字节相同，只污染 determinization 的 seed 语义 ⇒ 表现为
+ * 「续局后引擎对同一批历史给出与上一局不同的池」。属于潜伏缺陷。
+ *
+ * 现在的契约（**单一入口**）：
+ *   · 传 `seed` ⇒ 身份完全由它决定，**可逐格复现**（推荐用法）；
+ *   · 不传 seed ⇒ 用 CSPRNG 造随机 seed，再由它派生 rand，
+ *     并把这个 seed 写进 identity，调用方**存下来**即可复现；
+ *   · 传了 `randInt` 又传了 `seed` ⇒ 二者必须同源（测试用 `makeSeededRand(seed)`），
+ *     否则以 `randInt` 为准，保证「identity.seed 能复现出同一张身份表」这个
+ *     **不变量**在任何调用方式下都成立。
  */
 export function createJieqiInitialState(
   randInt?: (n: number) => number,
-  firstMoveSide: SideTag = RED_SIDE
+  firstMoveSide: SideTag = RED_SIDE,
+  seed?: number
 ): { state: GameState; identity: JieqiIdentity } {
-  const rand = randInt ?? makeShuffleRand();
+  // 无论走哪条路，最终的 rand 都必须由 usedSeed 派生（除非外部自带 rand）。
+  const usedSeed = seed ?? makeRandomSeed();
+  const rand = randInt ?? makeSeededRand(usedSeed);
   const qiPan: number[][] = Array.from(
     { length: BOARD_COLS },
     () => new Array<number>(BOARD_ROWS).fill(-1)
@@ -304,7 +371,7 @@ export function createJieqiInitialState(
     if (i !== 0 && i !== 16) hiddenMask[i] = true;
   }
 
-  const identity = buildJieqiIdentity(rand, 0);
+  const identity = buildJieqiIdentity(rand, usedSeed);
 
   const state: GameState = {
     qiPan,

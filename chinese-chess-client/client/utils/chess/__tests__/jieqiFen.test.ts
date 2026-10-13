@@ -41,8 +41,8 @@ import {
   deserializeDeterminization,
   poolSummary,
 } from '../jieqiDeterminization';
-import { createJieqiInitialState } from '../jieqi';
-import type { GameState } from '../types';
+import { createJieqiInitialState, makeSeededRand } from '../jieqi';
+import { RED_SIDE, type GameState } from '../types';
 
 describe('jieqiFen · 初始局面', () => {
   it('初始局面棋盘段逐字符等于引擎常量', () => {
@@ -128,6 +128,39 @@ describe('jieqiFen · 暗子不泄漏真相', () => {
     // identity 不同但 FEN 必须相同：暗子一律 x
     expect(a.identity.hiddenType).toEqual(b.identity.hiddenType);
     expect(serializeBoard(a.state)).toBe(serializeBoard(b.state));
+  });
+
+  /**
+   * 【2026-10 审计 D1】seed 必须是可重放的**唯一契约**。
+   *
+   * 此前 `createJieqiInitialState` 写死 `buildJieqiIdentity(rand, 0)`，
+   * 于是 `identity.seed` 恒为 0；而续局侧
+   * （screens/game/index.tsx 的 :408 / :1064）用 `makeSeededRand(identity.seed)`
+   * 复现初始局面 —— 复现出的身份表与真实对局不是同一张。
+   * 因揭棋 FEN 里暗子一律输出 x/X，盘面逐字节相同，故一直潜伏未爆。
+   *
+   * 这条断言是那个「不能靠盘面发现」的 bug 的守门人：它直接比对**身份表**。
+   */
+  it('seed 能逐格复现同一张身份表（续局/重开的前提）', () => {
+    const seed = 0x1234abcd;
+    const a = createJieqiInitialState(makeSeededRand(seed), RED_SIDE, seed);
+    const b = createJieqiInitialState(makeSeededRand(seed), RED_SIDE, seed);
+    expect(a.identity.seed).toBe(seed);
+    expect(a.identity.hiddenType).toEqual(b.identity.hiddenType);
+  });
+
+  it('不同 seed 必须产出不同身份表（证明复现断言不是恒真）', () => {
+    const a = createJieqiInitialState(makeSeededRand(1), RED_SIDE, 1);
+    const b = createJieqiInitialState(makeSeededRand(2), RED_SIDE, 2);
+    expect(a.identity.hiddenType).not.toEqual(b.identity.hiddenType);
+  });
+
+  it('不传 seed 时也必须生成一个可复现的非零 seed（不能再恒为 0）', () => {
+    const { identity } = createJieqiInitialState();
+    expect(identity.seed).not.toBe(0);
+    // 拿到该 seed 就能复现出同一张身份表 —— 这是不变量
+    const replay = createJieqiInitialState(makeSeededRand(identity.seed), RED_SIDE, identity.seed);
+    expect(replay.identity.hiddenType).toEqual(identity.hiddenType);
   });
 
   it('FEN 中不含任何未翻开身份痕迹（只有 x/X）', () => {

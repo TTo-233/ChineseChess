@@ -471,10 +471,10 @@ function undoInPlace(state: GameState): MoveRecord | null {
   }
 
   // 4. 【揭棋】撤销翻开（与 undoMove 同口径，见其注释）
-  if (last.revealedType) {
-    state.revealedType![last.pieceId] = null;
-    state.hiddenMask![last.pieceId] = true;
-  }
+  //
+  // ⚠️ 【2026-10 审计 D4】此块与上面的「2b」**逐字节相同**，是连着写了两遍。
+  // 幂等所以从未出错，但重复的撤销逻辑本身就是漂移源（改一处忘了另一处）。
+  // 故删掉此块，只保留 2b。
 
   state.sideTag = !state.sideTag;
   return last;
@@ -557,7 +557,29 @@ export function makeMove(
   // 改为「只记棋种、不动 id」后，悔棋只需把 revealedType 写回 null，
   // 没有置换、没有槽位耗尽、undo 天然正确。
   const flipping = newState.variant === 'jieqi' && newState.hiddenMask?.[pieceId] === true;
-  const revealedType = flipping ? jieqiIdentity?.hiddenType[pieceId] ?? null : null;
+  /**
+   * 【2026-10 审计 D1：缺身份时必须报错，不能静默产出错局】
+   *
+   * 原实现 `jieqiIdentity?.hiddenType[pieceId] ?? null` ⇒ `doFlip` 变 false，
+   * 于是该暗子**永远翻不开**：既不写 revealedType 也不清 hiddenMask，
+   * 此后它一直按「棋位棋种」走法 —— 直接违反规则 3（走子即翻开），
+   * 且让 `hiddenMask[x]===true` 与「x 明明走过」这两个状态并存，
+   * 后续任何依赖 hiddenMask 的扫描（攻击判定/展开）都会把它当成没动过的暗子。
+   *
+   * 之所以一直没炸：所有生产调用点都传了 identity
+   * （screens/game 的 :640 / :888、jieqiHistory.ts:154）。
+   * 但 `jieqiIdentity` 是**可选**参数，`replayPlayer/index.tsx:85` 就没传，
+   * 而签名不会提醒任何人这一点 —— 漏传的后果是静默错局，比崩溃更难发现。
+   *
+   * ⇒ 揭棋下走暗子却没给身份表，直接抛错：宁可不走，也不能走出一局
+   * 「有子永远翻不开、且盘面看似正常」的假棋。
+   */
+  if (flipping && !jieqiIdentity) {
+    throw new Error(
+      `makeMove: 揭棋暗子 ${pieceId} 移动需要 jieqiIdentity（铁律 A：身份表不随 GameState 传递）`
+    );
+  }
+  const revealedType = flipping ? jieqiIdentity!.hiddenType[pieceId] ?? null : null;
   const doFlip = flipping && revealedType != null;
 
   // 更新棋盘：id 不变

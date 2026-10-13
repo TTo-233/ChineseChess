@@ -43,9 +43,16 @@
  * 竖屏纵向充裕，棋盘尺寸完全不受影响。
  */
 
-import { useMemo } from 'react';
-import { useBoardStyle } from './boardStyleStore';
 import { BOARD_H_PADDING, type BoardStyle } from './boardStyles';
+
+/**
+ * 注意：本文件只保留**纯函数** computeBoardLayoutBudget。
+ * 原来同文件里的 useBoardLayoutBudget（Hook）已移到 useBoardLayoutBudget.ts，
+ * 因为它 import useBoardStyle → boardStyleStore → AsyncStorage，
+ * 会把 RN/AsyncStorage 拖进任何 import 这里的布局单测（2026-10 实测：
+ * 布局单因此只能靠 mock 才能跑，布局回归断言极易被跳过）。
+ * 纯函数留在无 React 依赖的文件里，任何测试都能直接引用。
+ */
 
 /**
  * 棋盘最小可用高度（极矮屏下的保底值，与历史实现一致）
@@ -234,46 +241,4 @@ export function computeBoardLayoutBudget(
   const paddingTop = Math.max((hostHeight - contentHeight) / 2, 0);
 
   return { maxBoardHeight: board, paddingTop };
-}
-
-/** 基于当前棋盘样式的预算 Hook（用户切换棋盘样式时同步更新） */
-export function useBoardLayoutBudget(input: BoardLayoutBudgetInput): BoardLayoutBudgetResult {
-  const boardStyle = useBoardStyle();
-  const {
-    hostHeight,
-    screenWidth,
-    topFlowHeight,
-    bottomFlowHeight,
-    belowHostSlack,
-    minBoardHeight,
-    hostTopY,
-    viewportHeight,
-  } = input;
-  return useMemo(
-    () =>
-      computeBoardLayoutBudget(
-        {
-          hostHeight,
-          screenWidth,
-          topFlowHeight,
-          bottomFlowHeight,
-          belowHostSlack,
-          minBoardHeight,
-          hostTopY,
-          viewportHeight,
-        },
-        boardStyle
-      ),
-    [
-      hostHeight,
-      screenWidth,
-      topFlowHeight,
-      bottomFlowHeight,
-      belowHostSlack,
-      minBoardHeight,
-      hostTopY,
-      viewportHeight,
-      boardStyle,
-    ]
-  );
 }

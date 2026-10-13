@@ -37,13 +37,13 @@ import {
   OfflineSearchAbortedError,
 } from './offlineAiAdapter';
 import { getOfflineEngine } from './pikafish';
-import { isMoveKingSafe, type GameState } from './GameEngine';
+import { isMoveKingSafe, getValidMoves, type GameState } from './GameEngine';
 import { enumerateLegalMoves } from './RuleEngine';
 import type { AIDifficulty } from './types';
 import { getJieqiRuntime, buildJieqiSearchPayload, type JieqiRuntime } from './jieqiRuntime';
 import { isJieqiHostAvailable, runJieqiSession } from './pikafish/jieqiHost';
 import { getJieqiTier } from './pikafish/jieqiTier';
-import { consumeEngineLine, createInfoState, parseBestmove } from './jieqiUci';
+import { consumeEngineLine, createInfoState, parseBestmove, chooseUci, isCriticalErrorLine } from './jieqiUci';
 
 /**
  * 跑一次揭棋引擎搜索。
@@ -63,16 +63,63 @@ async function runJieqiEngine(
 
   const payload = buildJieqiSearchPayload(state, ctx);
 
+  /**
+   * 【2026-10 审计 D9：`degraded` 曾被计算但从不读取】
+   * 历史不完整时会退化为「纯 FEN 搜索」，代价是引擎**丢失重复局面感知**
+   * （影响长将长捉的重复局面判定与引擎自身的和棋判断）。
+   * 行为本身是对的（宁可少信息也不错信息），但此前完全静默 ⇒ 无法排查。
+   * 现在显式记录一次：频率若不是「极少」，说明历史重建出了问题。
+   */
+  if (payload.degraded) {
+    console.warn(
+      '[jieqi-engine] 历史重放不完整，已退化为纯 FEN 搜索（丢失重复局面感知）'
+    );
+  }
+
+  /**
+   * 【2026-10 审计 D3：只发 `go depth`，不发 `go movetime`】
+   *
+   * 揭棋引擎是 Pikafish `jieqi_old`，实测 `go depth 4 movetime 3000` 在 **~90ms**
+   * 就跑完（揭棋每层分支出暗子身份维度，搜索树比象棋大，但 depth 4 依然很浅）。
+   * ⇒ `movetime` 在实际档位下**从不生效**（depth 先耗尽），三档的
+   * `movetimeMs`（3000/6000/12000）全是死参数，用户看到的「大师档思考更久」
+   * 并没有发生。
+   *
+   * 更关键的是**确定性**：提示档要求「同一局面两次提示给同一着法」。
+   * 若只依赖 `depth` 上限，搜索结果确定；若让 `movetime` 真正生效，
+   * 则墙钟随机器负载浮动 → 深度浮动 → 提示可能给出不同着法，违背契约。
+   *
+   * ⇒ 统一「只发 depth」，让档位语义（棋力上限）与实际行为一致；
+   * 墙钟由 depth 自然决定（实测各档都在 0.1–2s 量级，手机上亦可接受）。
+   * `getJieqiTier` 的 `movetimeMs` 保留字段但改作「宿主侧墙钟上限」
+   * （见下方 runJieqiSession 的 timeout），不再发给引擎。
+   */
   const commands: string[] = ['uci', 'isready', `setoption name MultiPV value ${t.multiPV}`];
   if (payload.moves.length > 0) {
     commands.push(`position fen ${payload.fen} moves ${payload.moves.join(' ')}`);
   } else {
     commands.push(`position fen ${payload.fen}`);
   }
-  commands.push(`go depth ${t.depth} movetime ${t.movetimeMs}`);
+  commands.push(`go depth ${t.depth}`);
   commands.push('quit');
 
   const res = await runJieqiSession(commands, t.movetimeMs + 15000);
+
+  /**
+   * 【2026-10 审计 D8：显式识别引擎自杀】
+   * 引擎遇到非法局面/着法会输出 `info string CRITICAL ERROR` 并**直接退出**，
+   * 此时 bestmove 缺失 → parseBestmove 返回 null → 安全回落 TS AI。
+   * 行为本就正确，但此前是「巧合正确」，且 `isCriticalErrorLine` 零调用（死代码）。
+   * 现在显式判定：CRITICAL 错误视为**硬失败**，不再把它和「引擎没出着」混为一谈，
+   * 便于后续把它纳入「引擎不可用 → 切 TS AI 并提示」的统一降级口径。
+   */
+  const critical = res.lines.find(isCriticalErrorLine);
+  if (critical) {
+    if (process.env.NODE_ENV !== 'production') {
+      console.warn('[jieqi-engine] CRITICAL:', critical);
+    }
+    return null;
+  }
 
   const info = createInfoState();
   let bestLine: string | null = null;
@@ -82,7 +129,23 @@ async function runJieqiEngine(
       break;
     }
   }
-  const uci = bestLine ? parseBestmove(bestLine) : null;
+
+  /**
+   * 【2026-10 审计 D5：真正启用 `randomPick`】
+   * 此前 `jieqiTier.ts` 里 easy 档的 `randomPick: true` 是**死配置**：
+   * aiDispatcher 只 `parseBestmove`（恒取 PV1），`consumeEngineLine` 收集的
+   * multiPV 候选被直接丢弃 ⇒ 入门档与进阶档走的是同一条「恒取 PV1」的路径，
+   * 只有 depth 3 vs 6 的差别，没有配置里承诺的「随机削弱」。
+   *
+   * 现在：easy 档用 `chooseUci(info, true)` 从 multiPV 候选里随机挑，
+   * 其余档仍取 PV1（bestmove 兜底）。`chooseUci` 早已在 jieqiUci.ts 实现并
+   * 有单测覆盖，只是生产侧从未调用。
+   */
+  let uci: string | null = null;
+  if (t.randomPick) {
+    uci = chooseUci(info, true);
+  }
+  if (!uci && bestLine) uci = parseBestmove(bestLine);
   if (!uci) return null;
 
   const fromCol = uci.charCodeAt(0) - 97;
@@ -133,8 +196,27 @@ export interface HybridMoveResult extends AIMoveResult {
  */
 function rejectMoverUnsafe(state: GameState, move: AIMoveResult | null): AIMoveResult | null {
   if (!move) return null;
-  if (isMoveKingSafe(state, move.pieceId, move.toCol, move.toRow)) return move;
-  return null;
+  /**
+   * 【2026-10 审计 D2：补上「落点合法性」闸】
+   *
+   * 此前这里**只查送将**，不查落点是否真legal。对象棋来说本地皮卡鱼与本仓库
+   * 同源引擎，`rejectMoverUnsafe` 够用；但揭棋引擎是**另一套实现**
+   * （Pikafish `jieqi_old`，其「暗子按棋位走」与「已翻开士/象是否仍受九宫河界限制」
+   * 均未经源码逐行核实）。两边一旦对某个落点有分歧，引擎给的着法会直达
+   * `screens/game/index.tsx` 的 makeMove（它不校验），**盘面直接进入非法状态**，
+   * 且无法靠对方补救（引擎不吃将，对局永久僵死）。
+   *
+   * ⇒ 这里补 `getValidMoves` 落点检查：揭棋路径与象棋路径同款，只是揭棋更容易失配，
+   * 所以这道闸在揭棋上尤其关键。失败即回落（下面的兜底会挑一步合法棋）。
+   */
+  if (!isMoveKingSafe(state, move.pieceId, move.toCol, move.toRow)) return null;
+  try {
+    const pts = getValidMoves(state, move.pieceId);
+    if (!pts[move.toCol]?.[move.toRow]) return null;
+  } catch {
+    return null;
+  }
+  return move;
 }
 
 /**
