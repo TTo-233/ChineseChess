@@ -1,15 +1,25 @@
 /**
  * 生成自包含引擎宿主（两个产物，共享同一份 UCI 逻辑）
  *
- *   assets/engines/pikafish.worker.bin   → Web 端 Dedicated Worker（classic worker）
- *   assets/engines/pikafish.html         → Android/iOS WebView 离线页
+ *   assets/engines/pikafish_worker.bin → Web 端 Dedicated Worker（classic worker）
+ *   assets/engines/pikafish.page        → Android/iOS WebView 离线页
  *
  * ⚠️ worker 脚本用 **.bin** 后缀（而不是 .js）：.js 属于 Metro 的 sourceExts，
  *    会被 Babel/JSX 管线转译，那两段 5.5MB 的 base64 会被逐字符处理——
  *    启动慢到数十秒、内存峰值数百 MB，且**不报任何错**。
  *    .bin 登记进 metro.config.js 的 assetExts 后按原字节透传。
  *    它只是给 `new Worker(url)` 用的 URL，浏览器不关心后缀。
- *    （.html 本身就在 Expo 默认 assetExts 里，无需额外处理。）
+ *
+ * ⚠️ 产物文件名的 **stem 必须彼此不同**（2026-10 Android 构建阻塞修复）：
+ *    这些产物会被 Metro 打进 Android `res/raw/`，而 AAPT 以
+ *    「**去掉最后一个扩展名**的相对路径」作资源名，
+ *    `pikafish.page` 与 `pikafish.wasm` 会压成同一个
+ *    raw/assets_engines_pikafish → Duplicate resources，
+ *    构建在 mergeReleaseResources 失败（实测：Run gradlew 跑了近 6 分钟后报错）。
+ *    ⚠️ 改扩展名**没用**（被剥离的是最后一个点之后的任意后缀），
+ *       必须改扩展名之前的那一段。故命名统一为
+ *       pikafish_worker.bin / pikafish_wasm.wasm / pikafish_nnue.nnue / pikafish.page。
+ *    该约束由 client/scripts/verify-asset-resource-names.mjs 常态校验。
  *
  * ============================================================================
  * 【为什么在构建期把 UCI 逻辑内联进产物，而不是写 TS 让 Metro 打包】
@@ -56,11 +66,33 @@ const repoRoot = path.resolve(clientRoot, '..', '..');
 const serverAi = path.join(clientRoot, 'engine-source', 'pikafish');
 
 const OUT_DIR = path.join(clientRoot, 'assets', 'engines');
-const WORKER_OUT = path.join(OUT_DIR, 'pikafish.worker.bin');
-const HTML_OUT = path.join(OUT_DIR, 'pikafish.html');
+/**
+ * ⚠️ 每个产物文件名在「扩展名之前」的部分（stem）必须彼此不同，
+ *    否则 Android 构建会失败（2026-10 真实踩过，详见下方 HTML_OUT 的长注释）：
+ *
+ * AAPT 以「**去掉最后一个扩展名**的相对路径」生成 raw 资源名，于是
+ *   pikafish_wasm.wasm  → raw/assets_engines_pikafish_wasm
+ *   pikafish_nnue.nnue  → raw/assets_engines_pikafish_nnue
+ *   pikafish.page       → raw/assets_engines_pikafish
+ *   pikafish_worker.bin → raw/assets_engines_pikafish_worker
+ *
+ * ⚠️ 关键：**改扩展名无效**（被剥离的是"最后一个点之后的任意后缀"，
+ *    与后缀是什么无关）。必须改 stem。
+ *
+ * 该约束由 client/scripts/verify-asset-resource-names.mjs 常态校验（已进 pnpm -w validate），
+ * 因此新增引擎产物时它会立刻拦下，而不是让你等一次 6 分钟的 Gradle 构建。
+ */
+const WORKER_OUT = path.join(OUT_DIR, 'pikafish_worker.bin');
+/**
+ * 原生端离线页（内联了 wasm + NNUE 的 base64，单文件自包含）。
+ *
+ * 由屏幕外 WebView 加载，`.page` 后缀仅为与常规 HTML 资源区分（需在
+ * metro.config.js 的 assetExts 登记）。对 WebView 完全透明——它按内容解析。
+ */
+const HTML_OUT = path.join(OUT_DIR, 'pikafish.page');
 /** Web 端 Worker 直接 fetch 的二进制（不再 base64 内联，见下方性能说明） */
-const WASM_OUT = path.join(OUT_DIR, 'pikafish.wasm');
-const NNUE_OUT = path.join(OUT_DIR, 'pikafish.nnue');
+const WASM_OUT = path.join(OUT_DIR, 'pikafish_wasm.wasm');
+const NNUE_OUT = path.join(OUT_DIR, 'pikafish_nnue.nnue');
 
 const loaderPath = path.join(serverAi, 'pikafish.cjs');
 const wasmPath = path.join(serverAi, 'pikafish.wasm');
@@ -76,8 +108,6 @@ for (const p of [loaderPath, wasmPath, dataPath]) {
 const loaderSrc = fs.readFileSync(loaderPath, 'utf8');
 const wasmBuf = fs.readFileSync(wasmPath);
 const dataBuf = fs.readFileSync(dataPath);
-const wasmB64 = wasmBuf.toString('base64');
-const dataB64 = dataBuf.toString('base64');
 const sha256 = (b) => crypto.createHash('sha256').update(b).digest('hex');
 const wasmSha = sha256(wasmBuf);
 const dataSha = sha256(dataBuf);
@@ -218,7 +248,7 @@ const WORKER_BODY = `/* eslint-disable */
  * pikafish.wasm / pikafish.nnue，可在无 require/__dirname/fs 的环境运行。
  * Pikafish 引擎为 GPL-3.0，权重受其独立许可约束；本项目仅内部娱乐使用。
  *
- * 协议（与 pikafish.html 基本一致，差别只在 bootstrap 带 URL）：
+ * 协议（与 pikafish.page 基本一致，差别只在 bootstrap 带 URL）：
  *   in : {type:'bootstrap',wasmUrl,nnueUrl}
  *        {type:'search',seq,commands,randomPick} {type:'stop'} {type:'dispose'}
  *   out: {type:'host-loaded'} {type:'ready',banner,options} {type:'result',seq,result,fatal?}
@@ -402,9 +432,21 @@ const HTML_BODY = `<!DOCTYPE html>
 <script>
 /**
  * GENERATED FILE — DO NOT EDIT.
- * 由 client/scripts/gen-pikafish-host.mjs 生成（与 pikafish.worker.js 共享同一份 UCI 逻辑）。
- * 离线引擎页：不发任何网络请求，宿主脚本内联在本文件中。
- * 协议与 pikafish.worker.js 完全一致。
+ * 由 client/scripts/gen-pikafish-host.mjs 生成（与 pikafish_worker.bin 共享同一份 UCI 逻辑）。
+ *
+ * ⚠️ 原生端离线引擎页：**小页面 + 外部二进制**（不再内联 base64）。
+ *
+ *   历史上这里内联了 wasm + NNUE 的 base64（约 6.05 MiB 的单文件）。在真机上
+ *   代价很大（见 gen 脚本头部与 CLIENT-PIKAFISH-OFFLINE.md）：WebView 要解析
+ *   6MB 巨型字面量、再 atob 出 4.4MB 二进制，低端机内存峰值高、易被系统
+ *   OOM 杀掉渲染进程。现在改为与 Worker 同构的「小页面 + fetch 两个二进制」，
+ *   页面本身降到 ~200KB 量级，行为与 Web 端完全一致。
+ *
+ *   ⚠️ 前提是本页有一个**可用的同源 origin**：原生端它由 file:// 加载，
+ *   fetch 的相对地址会解析到同目录的文件。若拿不到 URL（bootstrap 没带），
+ *   会显式报 error 而不是静默挂起。
+ *
+ * 协议与 pikafish_worker.bin 完全一致。
  *
  * Pikafish 引擎：GPL-3.0（源二进制见 client/engine-source/pikafish/）。
  * NNUE 权重：受皮卡鱼官方 NNUE 协议约束（非 GPL，商用需另行授权）。
@@ -419,27 +461,27 @@ var send = function (msg) {
 };
 ${UCI_CORE}
 
-function b64ToBytes(b64) {
-  var clean = b64.replace(/\\s+/g, '');
-  var CHUNK = 32768;
-  var bin = '';
-  for (var i = 0; i < clean.length; i += CHUNK) {
-    bin += atob(clean.slice(i, i + CHUNK));
-  }
-  var bytes = new Uint8Array(bin.length);
-  for (var j = 0; j < bin.length; j++) bytes[j] = bin.charCodeAt(j);
-  return bytes;
-}
-
-var WASM_B64 = '${wasmB64}';
-var DATA_B64 = '${dataB64}';
 var DATA_SIZE = ${dataBuf.length};
 var WASM_BYTES = null;
 var DATA_BYTES = null;
 
-function ensureBinaries() {
-  if (!WASM_BYTES) WASM_BYTES = b64ToBytes(WASM_B64);
-  if (!DATA_BYTES) DATA_BYTES = b64ToBytes(DATA_B64);
+/** 拉取一个二进制资源（同源 file:// 或 http:// 均可） */
+function fetchBytes(url) {
+  return fetch(url, { credentials: 'same-origin' }).then(function (res) {
+    if (!res.ok) throw new Error('HTTP ' + res.status + ' for ' + url);
+    return res.arrayBuffer();
+  });
+}
+
+/** 并行拉取 wasm 与 nnue；任一失败都让 bootstrap 失败（由上层退避重试） */
+function loadBinaries(wasmUrl, nnueUrl) {
+  return Promise.all([fetchBytes(wasmUrl), fetchBytes(nnueUrl)]).then(function (bufs) {
+    WASM_BYTES = new Uint8Array(bufs[0]);
+    DATA_BYTES = new Uint8Array(bufs[1]);
+    if (DATA_BYTES.length !== DATA_SIZE) {
+      throw new Error('pikafish.nnue size mismatch: ' + DATA_BYTES.length + ' != ' + DATA_SIZE);
+    }
+  });
 }
 
 var fsStub = { readFile: function (p, cb) { cb(new Error('fs unavailable: ' + p)); } };
@@ -453,7 +495,6 @@ ${loaderSrc}
 var factory = mod.exports;
 
 function createEngine(onOutput) {
-  ensureBinaries();
   var config = {
     print: function () {},
     printErr: function (t) { onOutput('CRITICAL ERROR ' + t); },
@@ -494,9 +535,17 @@ var engine = null;
 var core = null;
 function getCore() { if (!core) core = PikaCore(send); return core; }
 
-function bootstrap() {
-  engine = createEngine(function (line) { getCore().onLine(line); });
-  engine.ready.then(function () {
+function bootstrap(msg) {
+  var wasmUrl = msg && msg.wasmUrl;
+  var nnueUrl = msg && msg.nnueUrl;
+  if (!wasmUrl || !nnueUrl) {
+    send({ type: 'error', message: 'bootstrap 缺少 wasmUrl/nnueUrl' });
+    return;
+  }
+  loadBinaries(wasmUrl, nnueUrl).then(function () {
+    engine = createEngine(function (line) { getCore().onLine(line); });
+    return engine.ready;
+  }).then(function () {
     engine.send('uci');
     engine.send('isready');
     getCore().handshake();
@@ -510,7 +559,7 @@ window.addEventListener('message', function (ev) {
   if (typeof msg === 'string') { try { msg = JSON.parse(msg); } catch (e) { return; } }
   if (!msg || !msg.type) return;
   try {
-    if (msg.type === 'bootstrap') { bootstrap(); return; }
+    if (msg.type === 'bootstrap') { bootstrap(msg); return; }
     if (msg.type === 'search') {
       if (!engine) { send({ type: 'error', message: 'engine not bootstrapped' }); return; }
       var c = getCore();
@@ -541,6 +590,26 @@ send({ type: 'host-loaded' });
 `;
 
 fs.mkdirSync(OUT_DIR, { recursive: true });
+/**
+ * 清理历史遗留的旧命名产物。
+ *
+ * ⚠️ 这一步不是"顺手删"，而是构建能否通过的**前提**：
+ * 旧名 `pikafish.html` 若留在 assets/engines/ 里，Metro 仍会把它打进
+ * res/raw/，资源名与 `pikafish.wasm` / `pikafish.nnue` 撞名，
+ * Android 构建又会以 Duplicate resources 失败——而生成脚本本身"看起来是绿的"。
+ */
+for (const stale of [
+  'pikafish.html',
+  'pikafish.wasm',
+  'pikafish.nnue',
+  'pikafish.worker.bin',
+]) {
+  const stalePath = path.join(OUT_DIR, stale);
+  if (fs.existsSync(stalePath)) {
+    fs.rmSync(stalePath);
+    console.log(`[gen-pikafish-host] 已清理旧命名产物 ${stale}`);
+  }
+}
 fs.writeFileSync(WORKER_OUT, WORKER_BODY, 'utf8');
 fs.writeFileSync(HTML_OUT, HTML_BODY, 'utf8');
 // Web 端 Worker 直接 fetch 这两个二进制（不再 base64 内联）
@@ -551,10 +620,10 @@ const ws = fs.statSync(WORKER_OUT).size;
 const hs = fs.statSync(HTML_OUT).size;
 console.log('[gen-pikafish-host] 已生成：');
 console.log(`  ${path.relative(clientRoot, WORKER_OUT)}  ${ws} B (${(ws / 1048576).toFixed(2)} MiB)  ← Web Worker（小）`);
-console.log(`  ${path.relative(clientRoot, HTML_OUT)}  ${hs} B (${(hs / 1048576).toFixed(2)} MiB)  ← 原生 WebView（内联）`);
+console.log(`  ${path.relative(clientRoot, HTML_OUT)}  ${hs} B (${(hs / 1048576).toFixed(2)} MiB)  ← 原生 WebView（小页面 + fetch 二进制）`);
 console.log(`  ${path.relative(clientRoot, WASM_OUT)}  ${wasmBuf.length} B`);
 console.log(`  ${path.relative(clientRoot, NNUE_OUT)}  ${dataBuf.length} B`);
-console.log(`  Web 端首启需传：${((ws + wasmBuf.length + dataBuf.length) / 1048576).toFixed(2)} MiB` +
-  `（原单文件方案为 ${(hs / 1048576).toFixed(2)} MiB）`);
+console.log('  两端首启需传：' + ((ws + wasmBuf.length + dataBuf.length) / 1048576).toFixed(2) + ' MiB' +
+  `（页面本身 ${(hs / 1048576).toFixed(2)} MiB，二进制与 Worker 共用同一对文件）`);
 console.log(`  wasm sha256 : ${wasmSha}`);
 console.log(`  data sha256 : ${dataSha}`);

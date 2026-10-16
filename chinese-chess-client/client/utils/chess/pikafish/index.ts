@@ -17,10 +17,10 @@
  */
 
 import { Platform } from 'react-native';
-import { Image } from 'react-native';
 
 import type { OfflineEngine } from '../offlineEngine';
 import type { EngineHostSource } from './engineTransport';
+import { resolveNativeAssetUri } from './nativeAsset';
 import { PikafishOfflineEngine } from './pikafishLocalEngine';
 import { LegacyTsEngine } from './legacyTsEngine';
 import { OfflineEngineOrchestrator } from './offlineOrchestrator';
@@ -49,38 +49,56 @@ export type { OfflineEngineStatus, LocalEngineSource } from './offlineOrchestrat
  *   惰性化之后，只有真正要用引擎时才 require，测试环境完全不会碰到它。
  */
 function requireWorkerAsset(): unknown {
-  return require('../../../assets/engines/pikafish.worker.bin');
+  return require('../../../assets/engines/pikafish_worker.bin');
 }
 
+/**
+ * ⚠️ 扩展名是 `.page` 而不是 `.html`（2026-10 Android 构建阻塞修复）。
+ * Metro 会把这些产物打进 Android `res/raw/`，AAPT 以「去扩展名的路径」作资源名，
+ * 同名不同扩展名会压成 Duplicate resources，让 mergeReleaseResources 失败。
+ * 详见 metro.config.js 的说明。
+ */
 function requireHtmlAsset(): unknown {
-  return require('../../../assets/engines/pikafish.html');
+  return require('../../../assets/engines/pikafish.page');
 }
 
 /** Web 端 Worker 直接 fetch 的二进制（不再 base64 内联，见生成脚本说明） */
 function requireWasmAsset(): unknown {
-  return require('../../../assets/engines/pikafish.wasm');
+  return require('../../../assets/engines/pikafish_wasm.wasm');
 }
 
 function requireNnueAsset(): unknown {
-  return require('../../../assets/engines/pikafish.nnue');
+  return require('../../../assets/engines/pikafish_nnue.nnue');
 }
 
 /**
  * 把 Metro 的资源 require 结果归一化成 URI。
  *
- * ⚠️ 形态因平台而异（2026-10 实测确认）：
+ * ⚠️ 形态因平台而异：
  *   · Web     → **字符串** `/assets/?unstable_path=....bin`
  *   · 原生    → **数字**（AssetRegistry 的资源 id）或 { uri }
  *   只判断 string / {uri} 会在原生上漏掉数字形态 → 解析抛错 →
  *   `OfflineEngineHost` **渲染期崩溃**（比降级严重得多）。
- *   数字形态用 React Native 的 `Image.resolveAssetSource` 换成 uri。
+ *
+ * ═══════════════════════════════════════════════════════════════════════════
+ * ⚠️⚠️ **仅限 Web 端使用（Worker 及其 fetch 的二进制）——原生端禁止用于 WebView 源**
+ *
+ * 这里的数字分支用 `Image.resolveAssetSource` 换 uri。它在**开发态**返回
+ * `http://localhost:8081/...`（真 URL，恰好能用），但在**打包态**返回的是
+ * Android **裸资源名**（无 scheme），WebView 无法导航且不报错 →
+ * 引擎永远「启动中」。这正是 2026-10 实机故障的根因。
+ *
+ * 原生端请一律走 `resolveNativeAssetUri()`（见 ./nativeAsset.ts）。
+ * ═══════════════════════════════════════════════════════════════════════════
  */
 function resolveAssetUri(asset: unknown): string | null {
   if (typeof asset === 'string' && asset.length > 0) return asset;
 
   if (typeof asset === 'number') {
-    // 原生：资源 id → uri
+    // Web 端数字形态（极少见）：用 Image.resolveAssetSource 换 uri。
+    // ⚠️ 这里**只服务 Web 端**。原生端绝不能走这条分支，见函数顶部的警示。
     try {
+      const { Image } = require('react-native') as typeof import('react-native');
       const resolved = Image.resolveAssetSource(asset) as { uri?: unknown } | null;
       if (resolved && typeof resolved.uri === 'string') return resolved.uri;
     } catch {
@@ -108,7 +126,7 @@ function resolveAssetUri(asset: unknown): string | null {
 function resolveWorkerUrl(): string {
   const uri = resolveAssetUri(requireWorkerAsset());
   if (uri) return uri;
-  throw new Error('无法解析引擎 Worker 资源 URL（assets/engines/pikafish.worker.bin 缺失或未被登记为资源）');
+  throw new Error('无法解析引擎 Worker 资源 URL（assets/engines/pikafish_worker.bin 缺失或未被登记为资源）');
 }
 
 /** 解析 Worker 需要 fetch 的二进制 URL（wasm + nnue） */
@@ -117,7 +135,7 @@ function resolveBinaryUrls(): { wasmUrl: string; nnueUrl: string } {
   const nnueUrl = resolveAssetUri(requireNnueAsset());
   if (!wasmUrl || !nnueUrl) {
     throw new Error(
-      '无法解析引擎二进制资源 URL（assets/engines/pikafish.wasm / pikafish.nnue 缺失或未被登记为资源）'
+      '无法解析引擎二进制资源 URL（assets/engines/pikafish_wasm.wasm / pikafish_nnue.nnue 缺失或未被登记为资源）'
     );
   }
   return { wasmUrl, nnueUrl };
@@ -127,27 +145,28 @@ function resolveBinaryUrls(): { wasmUrl: string; nnueUrl: string } {
 export type { EngineHostSource } from './engineTransport';
 
 /**
- * 解析 WebView 引擎页来源。
+ * 解析 WebView 引擎页来源（原生端）。
  *
- * · Web：asset 是字符串（就是资源 URL，同源可 fetch）→ 但 Web 端根本不挂 WebView，
- *   这里主要服务原生。
- * · 原生：asset 多为**数字 id** → 解析为 uri，交给 WebView 以 `{uri}` 加载。
- *   为什么不内联成 `{html}`：6MB 字符串过 RN 桥代价高，且原生端拿不到"文本"
- *   （数字 id 只能换 uri）。用 {uri} 让 WebView 自己去取，更稳。
+ * ⚠️ **这里必须是异步的，且必须经 nativeAsset 而不是 Image.resolveAssetSource。**
+ *
+ * 打包态下 `Image.resolveAssetSource(资源id)` 返回的是 Android **裸资源名**
+ * （如 `engines_pikafish`，无任何 scheme，见 @react-native/assets-registry
+ * 的 getAndroidResourceIdentifier）。它不是 URL，WebView 导航必然失败，
+ * 且**不会触发任何错误回调**——引擎于是一直停在「启动中」。
+ * 2026-10 实机故障的根因就是这里，现由 resolveNativeAssetUri 兜住。
+ *
+ * @see ./nativeAsset.ts 的完整根因说明
  */
-export function getEngineHostSource(): EngineHostSource {
+export async function getEngineHostSource(): Promise<EngineHostSource> {
   const asset = requireHtmlAsset();
 
-  // 已经是页面文本（极少见：bundler 把 .html 当文本模块导出字符串，
-  // 此时字符串本身不是 URL 而是 HTML 源码）——用包含 '<' 判定，避免误当 URL。
+  // bundler 把 .page 当文本模块导出时，字符串本身就是 HTML 源码（不是 URL）。
   if (typeof asset === 'string' && asset.trimStart().startsWith('<')) {
     return { html: asset };
   }
 
-  const uri = resolveAssetUri(asset);
-  if (uri) return { uri };
-
-  throw new Error('无法解析引擎离线页（assets/engines/pikafish.html 缺失或未被登记为资源）');
+  // 原生：资源 id → file:// 本地缓存 URI（WebView 可导航）
+  return { uri: await resolveNativeAssetUri(asset, 'pikafish.page', 'page') };
 }
 
 /** 是否需要挂载屏幕外引擎宿主（仅原生端；Web 走 Worker） */
@@ -175,7 +194,28 @@ function createPrimaryEngine(): OfflineEngine {
     );
   }
   if (Platform.OS === 'android' || Platform.OS === 'ios') {
-    return new PikafishOfflineEngine(() => createWebViewTransport());
+    /**
+     * 原生：屏幕外 WebView。
+     *
+     * ⚠️ wasm/nnue 的 URI 必须与页面同源且**可被 WebView 内的 fetch 访问**。
+     * 二者是各自独立的 res/raw 资源，因此**不能**把页面地址当基准去推相对路径
+     * （expo-asset 复制进 cache 目录后文件并不相邻）。必须逐个解析成 file:// URI，
+     * 再经 bootstrap 交给页面。
+     */
+    return new PikafishOfflineEngine(async () =>
+      createWebViewTransport({
+        wasmUrl: await resolveNativeAssetUri(
+          requireWasmAsset(),
+          'pikafish_wasm.wasm',
+          'wasm'
+        ),
+        nnueUrl: await resolveNativeAssetUri(
+          requireNnueAsset(),
+          'pikafish_nnue.nnue',
+          'nnue'
+        ),
+      })
+    );
   }
   // 其他平台（Expo Go 之外的少见环境）：直接判定不可用，由编排器降级
   return new PikafishOfflineEngine(() => {

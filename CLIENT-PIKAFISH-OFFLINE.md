@@ -1,5 +1,56 @@
 # 客户端本地皮卡鱼离线集成
 
+## 【真机二次定位】引擎在打包 APP 里依然起不来：真正根因（2026-10 定案）
+
+### 一句话结论
+
+上一轮修复把「Android 裸资源名无法被 WebView 导航」这个**症状**处理对了，
+但它依赖的 `expo-asset` **根本没有被装进 APP** —— 于是新写的转换函数
+一进真机就抛 `MODULE_NOT_FOUND`，两个引擎一次都没起来过。
+
+**最值得记住的教训：手写的 `declare module` 能骗过 tsc 和单测，却骗不过 Metro 与设备。**
+
+### 证据链（全部来自 adb 抓取的真机安装包，非推测）
+
+| 检查项 | 结果 | 含义 |
+|---|---|---|
+| `require.resolve('expo-asset')` | `MODULE_NOT_FOUND` | 打包期就解析不到 |
+| `client/package.json` | 无 `expo-asset` | 只是 expo 的**传递依赖** |
+| pnpm 严格布局 | 未提升到 `client/node_modules` | 无法直接 import |
+| APK 内 `expo.modules.asset.AssetModule` | **不存在** | 原生模块没进 dex |
+| APK 内引擎资源 `assets_engines_*` | **六个齐全**（resources.arsc key pool 内） | 资源**确实打进了包** |
+
+> 最后两行是本次定位的决定性对照：
+> **资源在包里，是"用什么去读它们"出了错。**
+> 这一点用 `resources.arsc` 的字符串池反查确认（该表字符串是 UTF-8，
+> 一开始误按 UTF-16 搜索而误判为"资源不在包里"，这个坑值得记一笔）。
+
+### 为什么上一版能一路绿灯
+
+那一版为了让它「类型上可用」，给 `expo-asset` 补了一份 `declare module` shim。
+结果是把这个**运行时依赖缺失**从编译期错误，降级成了运行期才炸、
+又被 `try/catch` 吞掉的静默降级：
+
+```
+tsc 全绿  +  869 单测全绿  +  Chromium 探针全绿  +  构建成功
+                    ↓
+              真机：引擎永远「启动中」
+```
+
+### 修复
+
+1. `expo-asset` 升为 **client 的直接依赖**（`~12.0.12`），原生模块随 prebuild 进 dex；
+2. **删除** `declarations.d.ts` 里的 `declare module 'expo-asset'` shim，
+   让 tsc 重新对这个包负责；
+3. `resolveViaExpoAsset` 里**去掉 try/catch 兜底** —— 缺依赖属于「打包配置坏了」，
+   必须以可辨识的异常冒到上层，而不是伪装成一次普通降级；
+4. `nativeEngineAsset.test.ts` 新增三条例外断言守住这一层：
+   `expo-asset` 必须是直接依赖、`require.resolve` 必须真的能解析、`Asset.fromModule` 必须真的存在。
+
+> 顺带排除的方案：**不用 `expo-file-system` 自己读字节**。
+> 同一份 APK 里 `expo.modules.filesystem.FileSystemModule` 同样**不存在**
+> （JS 能 resolve 但没进 native 侧），走它只会把同一个坑换个包名再踩一次。
+
 ## 这是什么
 
 把**皮卡鱼引擎**接进客户端，让 AI 走子**完全在本地运行**——
@@ -75,11 +126,17 @@ React Native 的 **Hermes 不支持 WebAssembly**，所以 WASM 引擎不能直�
 | Android / iOS | 屏幕外 WebView | 零尺寸、`pointerEvents=none`，仅作 JS 沙箱 |
 
 两条路径跑的是**同一份**引擎二进制（`client/engine-source/pikafish/`），
-由 `gen-pikafish-host.mjs` 打成两个自包含产物。
+由 `gen-pikafish-host.mjs` 打成两个产物（一个 Worker 脚本、一个离线页），
+**共用同一对 wasm / nnue 资源文件**。
 
 > 该目录 2026-10 从 `chinese-chess-server/ai/pikafish/` 迁来：它是**构建期**材料
 > （生成产物 + 逐字节溯源校验），运行时不加载，因此也从客户端部署包中排除
 > （`pack.ps1` / `pack.sh` 排除 `engine-source/`），产物 `assets/engines/` 随包分发。
+
+> ⚠️ **原生端的离线页是靠 `file://` 加载的，地址由 `expo-asset` 解析**
+> （不是 `Image.resolveAssetSource`，后者在打包态只给一个裸资源名，WebView 无法导航）。
+> 这条是实机能否启动的关键，详见本文【真正根因】一节与
+> `utils/chess/pikafish/nativeAsset.ts`。
 
 ### 三、三个实测结论（决定了整个方案）
 
@@ -164,12 +221,23 @@ client/utils/chess/
   __tests__/pikafishDifficulty.test.ts
 
 client/assets/engines/         构建产物（勿手工编辑）
-  pikafish.worker.bin          Web 端 classic Worker（约 6.06 MiB）
-  pikafish.html                原生端离线页（约 6.05 MiB）
+  pikafish_worker.bin          Web 端 classic Worker（0.20 MiB，靠 fetch 拉二进制）
+  pikafish.page                原生端离线页（0.20 MiB，同样靠 fetch 拉二进制）
+  pikafish_wasm.wasm           引擎二进制（0.48 MiB，两端共用）
+  pikafish_nnue.nnue           NNUE 权重（3.91 MiB，两端共用）
+  jieqi.page / jieqi_worker.bin / jieqi_wasm.wasm   揭棋（页内联 glue+wasm，0.57 MiB）
+
+client/utils/chess/pikafish/
+  nativeAsset.ts               原生资源 → file:// 可导航 URI（打包态根因修复所在）
+  jieqiWebViewBridge.ts        揭棋 WebView 命令式桥
 
 client/scripts/
   gen-pikafish-host.mjs        生成上面两个产物
+  gen-jieqi-host.mjs           生成揭棋产物
   verify-pikafish-engine-assets.mjs  产物完整性校验
+  verify-jieqi-engine-assets.mjs      揭棋产物完整性校验
+  verify-asset-resource-names.mjs     AAPT raw 资源名唯一性校验
+  verify-engine-in-chromium.mjs       在真实 Chromium 内核里端到端跑两个引擎
 
 client/engine-source/pikafish/  引擎源二进制（构建期材料，不入部署包）
   pikafish.cjs / pikafish.wasm / data/pikafish.data
@@ -305,13 +373,186 @@ Jest 环境无原生二进制会直接抛错。因此命令式桥（`webViewTran
   用户感知仍是即时的，但引擎会跑完当前预算才释放。
 - **移动端 WebView 可能被系统回收**，回收后承载上报 dead 并进入退避重试；
   回到前台会自动立刻重试一次。
-- **引擎资源约 10.9MB 入库**（worker 0.2 + wasm 0.48 + nnue 3.91 + html 6.06）；
-  比优化前的 12.1MB 略小，且 Web 端首启传输从 6.06MB 降到 4.59MB。
-- **原生端尚未真机验证**（需要 `expo prebuild` + development build，
-  仓内目前是 managed workflow、没有 `android/`、`ios/`、EAS 配置）。
+- **引擎资源约 4.6MB 入库**（worker 0.20 + page 0.20 + wasm 0.48 + nnue 3.91，
+  揭棋另计 1.0MB）；
+  其中**页面本身只有 0.20MB** —— 原生端与 Web 端共用同一对二进制，
+  首启实际需要传 4.59 MiB，比最早"单个 6.06MiB 内联页"的方案更小，
+  且低端机上的解析/内存峰值低一个数量级。
 - **测试文件不在 `tsc` 覆盖范围内**：`tsconfig.json` 显式 exclude 了
   `*.test.ts(x)`，因此接口签名变化不会被类型检查拦住（曾因此漏改一处调用）。
   改公共接口后需人工核对测试文件。
+
+## 【真正根因】打包态拿到的不是 URL，而是 Android「裸资源名」（2026-10 定案）
+
+> 本节是**定论**，取代下面两节里所有"产物没问题、只是 RN 接线坏了"的结论。
+> 那些结论是在 **Chromium 探针**上得出的，而探针（以及 Expo 开发态）**结构上
+> 看不到**本次故障，所以它们必然是假绿灯。
+
+### 症状
+
+打包 APP 后实机测试，两个引擎**都**起不来：
+
+- 象棋：一直「皮卡鱼启动中」，AI 一步不动；
+- 揭棋：一直「基础AI」，引擎从不参与走子。
+
+### 根因（已从 React Native 源码逐行核实，不是推测）
+
+`require('assets/engines/pikafish.page')` 在原生端返回**数字资源 id**。把它交给
+`Image.resolveAssetSource(id)` 之后走的是 RN 的 `AssetSourceResolver.defaultAsset()`，
+它有两条完全不同的分支：
+
+| 场景 | 走哪条 | 返回值 | WebView 能加载吗 |
+|---|---|---|---|
+| **开发态**（Metro 在跑） | `isLoadedFromServer()` | `http://localhost:8081/assets/...` | ✅ 真 URL |
+| **打包态**（无 serverUrl） | `resourceIdentifierWithoutScale()` | **`engines_pikafish`** | ❌ **不是 URL** |
+
+打包态那个返回值来自 `@react-native/assets-registry/path-support.js` 的
+`getAndroidResourceIdentifier()`：把资源路径去掉扩展名、小写、分隔符换 `_`、
+再剔除所有非 `[a-z0-9_]` 字符。它是给
+`Resources.getIdentifier(name, "raw", pkg)` 用的**资源名**，**没有 `http:`/
+`file:`/`asset:` 任何 scheme**。
+
+把它当 `source={{uri}}` 交给 Android WebView 的后果：
+
+1. WebView 把它当**相对路径**去解析 → 加载必然失败；
+2. 页面脚本压根没跑 → **`host-loaded` 永远不发**；
+3. **也不会触发 `onError` / `onHttpError`** ——「没有可加载的资源」不算网络错误，
+   所以承载死亡回调也不会来；
+4. 引擎只能干等到启动超时（45s）→ **永久降级**到兜底 AI，界面永远显示
+   「皮卡鱼启动中 / 基础AI」，且**全程没有任何报错**。
+
+### 为什么此前所有验证都是「假绿灯」——必须记住的教训
+
+| 验证手段 | 覆盖到打包态吗 | 原因 |
+|---|---|---|
+| Expo 开发态手测 | ❌ | Metro 在跑，走 `isLoadedFromServer()`，拿到真 http URL |
+| `verify-*-engine-assets.mjs` | ❌ | 只做 sha256 / 标记 / 体积校验，**从不执行页面** |
+| `verify-engine-in-chromium.mjs` | ❌ | 把页面用**本地 http server** 喂给浏览器 —— 又测了一遍"有可用 origin" |
+
+也就是说：**没有任何一个自动化测试触及过"裸资源名"这一形态**。
+这不是"运气不好"，而是验证手段与故障形态之间存在结构性盲区——
+所以光"再跑一遍验证"永远发现不了它。
+
+### 修复
+
+1. **原生端改走 `expo-asset`**（`utils/chess/pikafish/nativeAsset.ts`）：
+   它的 Android 原生实现（`AssetModule.kt` / `ResourceAsset.kt`）做的正是缺的那一步 ——
+   接收裸资源名 → `Resources.getIdentifier` → `openRawResource(resId)` 把字节流
+   复制进 cache → 返回 **`file://` URI**。那才是 WebView 能导航的地址。
+2. **交付前设一道硬闸**：解析结果必须带 scheme，否则直接抛错。
+   宁可降级，也**绝不**把无法加载的字符串递给 WebView —— 那正是本次故障的形态
+   （静默失败、无任何报错）。判据见 `isNavigableUri`，由
+   `__tests__/nativeEngineAsset.test.ts` 固化。
+3. **引擎页来源改为异步**：`getEngineHostSource` / `getJieqiHostSource` 现在返回
+   Promise，根布局用 `useState` + `useEffect` 异步挂载宿主。
+   同步解析要么拿到裸资源名、要么在渲染期抛错打崩 App，两者都不可接受。
+4. **原生端同时降体积**（顺手修掉的第二个真问题）：
+   引擎页原本内联 wasm+NNUE 的 base64，单文件 **6.05 MiB**，WebView 要解析 6MB
+   巨型字面量再 atob 出 4.4MB 二进制，低端机内存峰值高、易被系统 OOM 杀掉渲染进程。
+   现改为与 Worker 同构的「小页面（**0.20 MiB**）+ fetch 两个独立二进制」，
+   两个二进制与 Web 端**共用同一对文件**（不额外增大包体）。
+
+> ⚠️ 改动 `pikafishLocalEngine.doBoot` 时踩到的一个坑：承载工厂变成异步后，
+> **启动超时必须在第一个 `await` 之前起表**。否则工厂一旦挂起就永远没有超时，
+> Promise 悬空，对局会卡在「AI 回合」——比超时降级严重得多。
+> 同时刻意**不用 async Promise executor**（其抛出会变成永不被观察的悬空
+> rejected promise），改用同步 executor + 内层 async IIFE + 显式 `.catch`。
+
+### 真机验证状态
+
+以上修复已通过：Chromium 内核端到端（两个引擎都跑出真实 bestmove）、
+861 项单测、`tsc --noEmit`、eslint，以及全部引擎产物校验。
+**打包后的真机行为仍需在设备上确认一次** —— 这一条与本节开头承认的是同一个事实：
+自动化验证覆盖不到真机，只能靠一次实机冒烟。
+
+---
+
+## 原生端引擎无法启动：根因与验证（2026-10，已被上节取代）
+
+### 曾经的症状
+
+打包 APP 后实机测试：
+
+- 象棋对局一直显示「皮卡鱼启动中」，AI 一步不动；
+- 揭棋对局一直显示「基础AI」，引擎从不参与走子。
+
+### 根因一：React ref(null) 被误判为承载死亡（Pikafish）
+
+`webViewHost.tsx` 用的是**内联箭头 ref**：
+
+```tsx
+ref={(instance) => registerWebView(instance)}   // ❌
+```
+
+React 的 ref 语义是：回调引用变化时，**先以 `null` 调用旧 ref，再以实例调用新 ref**。
+每次重渲染（根布局 `useEffect`、Provider 状态、屏幕旋转、回前台…）都会走一遍这个循环。
+而当时的 `registerWebView(null)` 实现把它当成「承载加载失败」：
+
+```ts
+if (!instance && pageAlive) {
+  pageAlive = false;        // ← 之后 send() 首行直接 return
+  pendingOutbox.length = 0; // ← 排队中的 bootstrap 被丢弃
+  deadCb?.('WebView 引擎承载加载失败');
+}
+```
+
+`pageAlive` **只有**页面唯一一次 `host-loaded` 能置回 true，
+而重渲染发生在页面加载完成**之后**，于是没有任何恢复路径：
+`send()` 永久丢弃一切消息 → 引擎永远收不到 bootstrap → 界面永远「启动中」。
+
+**修复**（`webViewTransport.ts` + `webViewHost.tsx`）：
+
+1. ref 用 `useCallback` 稳定化，从根上消除「每渲染换 ref」；
+2. `registerWebView(null)` **只清实例引用**，不再改 `pageAlive`、不再清队列；
+   承载死亡改由真正的失败回调（`onError` / `onHttpError` /
+   `onRenderProcessGone` / `onContentProcessDidTerminate`）与组件真卸载上报；
+3. `send()` 在「页面已就绪但此刻没有注入句柄」（即 ref 的重渲染窗口）时
+   **改为排队**，并在 `registerWebView(instance)` 回来的那一刻补发
+   —— 避免正好撞上该窗口的 bootstrap / search 被丢进黑洞；
+4. 隐藏容器从 `width:0/height:0` 改为 **1×1 + `top/left:-100`**：
+   Android 的 WebView 在 0 尺寸容器里可能被跳过布局、甚至不执行页面渲染，
+   表现为「页面永远不发 `host-loaded`」。
+
+### 根因二：揭棋在原生端根本没有承载（jieqi）
+
+`jieqiHost.isJieqiHostAvailable()` 原先直接
+`return Platform.OS !== 'web' ? false : typeof Worker !== 'undefined'`，
+即**原生端永久返回 false**、直接走 TS 兜底（角标显示「基础AI」）。
+根因是揭棋只有 Web 端 Worker 产物，没有 WebView 产物，
+而 Hermes 既没有 Worker 也没有 WASM —— 原生端无路可走。
+
+现在补齐了 `assets/engines/jieqi.html`（自包含：glue + 内联 wasm），
+并新增与 `runSessionInWorker` 对称的 `runSessionInWebView`。
+
+### 验证方式（关键：不靠推断）
+
+产物层面用**真实 Chromium 内核**端到端跑通，而不是只做字节级校验：
+
+- `client/scripts/verify-*-engine-assets.mjs` 此前只做 sha256 与字符计数，
+  从不执行页面 —— 产物坏掉也照样绿灯；
+- 新增 CDP 探针（`client/scripts/verify-engine-in-chromium.mjs`）：
+  启动 `chrome --headless`、注入 `window.ReactNativeWebView` 桩
+  （**复刻原生注入时机**：页面脚本执行前）、
+  经本地 http 载入产物，然后跑真实的握手与搜索。
+
+已实测通过：
+
+```
+[probe] host-loaded ✓
+[probe] ready ✓ {"type":"ready","banner":"Pikafish dev-20240226-98b20a33 …"}
+[probe] bestmove ✓ h2e2 (depth 6, 5ms)
+[probe] PIKAFISH.HTML 端到端验证通过
+```
+
+> ⚠️ 探针里**不能用 `while` 忙等**轮询页面状态：忙等会占死主线程，
+> WASM 与引擎的回调根本跑不起来，表现为「引擎永远不 ready」的**假失败**。
+> 必须用 `setTimeout`/Promise 让出线程。
+
+因此原先「WebView 产物能不能跑」这个前提性问题到此有答案：
+**产物一直是好的**。但请注意这段推理**当时的结论是不完整的**——
+它只证明了"产物能跑"，没有证明"RN 侧把**打包态**资源正确地交给了 WebView"。
+真正的故障正在那一环（见上文【真正根因】），而本节用的 Chromium 探针结构上
+看不到它。
 
 ## 许可证
 

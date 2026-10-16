@@ -30,10 +30,10 @@ const clientRoot = path.resolve(here, '..');
 const repoRoot = path.resolve(clientRoot, '..', '..');
 const engineDir = path.join(clientRoot, 'assets', 'engines');
 
-const WORKER = path.join(engineDir, 'pikafish.worker.bin');
-const HTML = path.join(engineDir, 'pikafish.html');
-const WASM = path.join(engineDir, 'pikafish.wasm');
-const NNUE = path.join(engineDir, 'pikafish.nnue');
+const WORKER = path.join(engineDir, 'pikafish_worker.bin');
+const HTML = path.join(engineDir, 'pikafish.page');
+const WASM = path.join(engineDir, 'pikafish_wasm.wasm');
+const NNUE = path.join(engineDir, 'pikafish_nnue.nnue');
 
 const errors = [];
 const warns = [];
@@ -68,13 +68,13 @@ const REQUIRED_MARKERS = [
  * @param minSize 体积下限。意义是"能抓住被截断/未重新生成"。
  *
  * ⚠️ 2026-10 性能优化后两个产物的体积语义**不同**：
- *   · pikafish.worker.bin —— **小**（~200KB）：只有 loader + UCI 协议，
+ *   · pikafish_worker.bin —— **小**（~200KB）：只有 loader + UCI 协议，
  *     二进制靠 fetch 拉取（不再 base64 内联）。所以这里**不设** 4MiB 下限，
  *     改用"必须含 fetch 与 URL 字段"来保证它是新版产物；
  *     ⚠️ 但标记级判据的覆盖范围只有文件前 ~3%，loader 主体在盲区里 ——
  *     真正的强判据是文件末尾的 verifyEmbedsLoader（逐字符包含源 loader 全文），
  *     它才能抓住截断/等长破坏/旧 loader 产物。
- *   · pikafish.html —— 仍是大文件（内联 base64，供原生 WebView），保留下限校验。
+ *   · pikafish.page —— 仍是大文件（内联 base64，供原生 WebView），保留下限校验。
  */
 function checkFile(file, extraMarkers = [], minSize = 0) {
   if (!fs.existsSync(file)) {
@@ -146,30 +146,61 @@ const worker = checkFile(
   ["self.postMessage", "'use strict'", 'fetch(', 'wasmUrl', 'nnueUrl'],
   0
 );
-// HTML 仍在原生端内联二进制，保留体积下限
+/**
+ * ⚠️ 原生端页面同样是"小页面 + fetch"（2026-10 真机修复，与 Worker 同构）。
+ *
+ * 旧实现对 HTML 要求 ≥4MiB 并校验内嵌 DATA_B64，那是在**内联 base64** 时代
+ * 的判据。现在页面应当**很小**（~0.2MiB），并且**不得**再内联二进制：
+ *   · 若仍出现 DATA_B64 / WASM_B64 → 说明是旧产物，必须重新生成；
+ *   · 若体积回到 MiB 量级 → 说明又变回内联方案，真机内存/解析风险回归。
+ * 判据从"够大"翻转为"够小 + 不含内联二进制"，与新的生成方式一致。
+ */
 const html = checkFile(
   HTML,
-  ['<html', 'ReactNativeWebView', 'window.addEventListener'],
-  4 * 1024 * 1024
+  ['<html', 'ReactNativeWebView', 'window.addEventListener', 'fetch(', 'wasmUrl', 'nnueUrl'],
+  0
 );
+
+if (html) {
+  if (html.stat.size > 1024 * 1024) {
+    errors.push(
+      `pikafish.page 体积异常（${html.stat.size} B > 1MiB）：应当是「小页面 + fetch 二进制」，` +
+        `若达到 MiB 量级说明又退回内联 base64，真机内存/解析风险回归。` +
+        `请重新执行 node client/scripts/gen-pikafish-host.mjs`
+    );
+  }
+  for (const marker of ['var DATA_B64', 'var WASM_B64']) {
+    if (html.text.includes(marker)) {
+      errors.push(
+        `pikafish.page 仍内联二进制（${marker}）：原生端应改为 fetch 独立 wasm/nnue 资源。` +
+          `请重新执行 node client/scripts/gen-pikafish-host.mjs`
+      );
+    }
+  }
+}
 
 // 引擎**源**二进制（客户端自建，服务端已去 AI 化后不再引用服务端目录）
 const ENGINE_SRC = path.join(clientRoot, 'engine-source', 'pikafish');
+// ⚠️ 源文件名与产物文件名**故意不同**：engine-source/ 下的源不进包，可沿用
+//    引擎工程惯例的 pikafish.wasm / pikafish.data；而 assets/engines/ 下的产物会被
+//    Metro 打进 Android res/raw/，AAPT 以「去掉最后一个扩展名的路径」作资源名，
+//    同名不同扩展名会压成 Duplicate resources 让构建失败，故产物加了前缀。
+//    详见 client/scripts/verify-asset-resource-names.mjs。
 const wasmStat = verifyBinaryAsset(
   WASM,
-  'pikafish.wasm',
+  'pikafish_wasm.wasm',
   path.join(ENGINE_SRC, 'pikafish.wasm')
 );
 const nnueStat = verifyBinaryAsset(
   NNUE,
-  'pikafish.nnue',
+  'pikafish_nnue.nnue',
   path.join(ENGINE_SRC, 'data', 'pikafish.data')
 );
 
 // 旧的"内联 base64"Worker 应已不存在（否则说明没重新生成）
 if (worker && /var WASM_B64\s*=/.test(worker.text)) {
   errors.push(
-    'pikafish.worker.bin 仍是旧的"内联 base64"版本（含 WASM_B64）。' +
+    'pikafish_worker.bin 仍是旧的"内联 base64"版本（含 WASM_B64）。' +
       '请重新执行 node client/scripts/gen-pikafish-host.mjs'
   );
 }
@@ -178,47 +209,28 @@ if (worker && /var WASM_B64\s*=/.test(worker.text)) {
  * 深度校验：把产物里的 NNUE base64 解码回来，确认与仓库里的真身**逐字节一致**。
  *
  * 这是最强的一道校验：只要产物被转译/截断/重排，解码后的 sha256 必然不同。
+ *
+ * ⚠️ 2026-10 起两份产物都改为 fetch 独立二进制，**不再内联** base64，
+ *    因此这道"解码内嵌 base64"校验已无对象（传入 null 即跳过）。
+ *    NNUE 的字节一致性改由上面的 verifyBinaryAsset 对
+ *    assets/engines/pikafish_nnue.nnue 做**逐字节**比对来保证——同样严格，
+ *    且不再受转译破坏影响（它就是一个原封不动的资源文件）。
  */
-function verifyEmbeddedNnue(result, file) {
-  if (!result) return;
-  const m = /var DATA_B64 = '([A-Za-z0-9+/=]+)';/.exec(result.text);
-  if (!m || !m[1]) {
-    errors.push(`产物中找不到 DATA_B64（NNUE base64）: ${path.relative(clientRoot, file)}`);
-    return;
-  }
-  const nnuePath = path.join(
-    clientRoot,
-    'engine-source',
-    'pikafish',
-    'data',
-    'pikafish.data'
-  );
-  if (!fs.existsSync(nnuePath)) {
-    warns.push(`未找到仓库内 NNUE 原件（${nnuePath}），跳过逐字节比对`);
-    return;
-  }
-  const expected = fs.readFileSync(nnuePath);
-  const actual = Buffer.from(m[1], 'base64');
-  const eh = crypto.createHash('sha256').update(expected).digest('hex');
-  const ah = crypto.createHash('sha256').update(actual).digest('hex');
-  if (eh !== ah) {
-    errors.push(
-      `产物内嵌 NNUE 与仓库原件不一致（可能被转译破坏）：\n` +
-        `    原件 sha256 ${eh}\n` +
-        `    产物 sha256 ${ah}`
-    );
-  } else {
-    console.log(`  NNUE 逐字节一致: ${ah} (${expected.length} B)`);
-  }
+function verifyEmbeddedNnue(_result, _file) {
+  // 保留函数以兼容调用点；内联方案已下线，这里不再有任何可解码的 base64。
+  return;
 }
 
-// 只有 HTML（原生端）仍内联 base64 NNUE；Worker 改为 fetch 二进制，不再有 DATA_B64
-verifyEmbeddedNnue(html, HTML);
-
-// 旧的"内联 base64"Worker 残留检查（见上方 checkFile 调用处）
+// 旧的"内联 base64"残留检查（Worker 与页面都不得再内联）
 if (worker && /var DATA_B64\s*=/.test(worker.text)) {
   errors.push(
-    'pikafish.worker.bin 仍内联 DATA_B64（旧版产物）。' +
+    'pikafish_worker.bin 仍内联 DATA_B64（旧版产物）。' +
+      '请重新执行 node client/scripts/gen-pikafish-host.mjs'
+  );
+}
+if (html && /var DATA_B64\s*=/.test(html.text)) {
+  errors.push(
+    'pikafish.page 仍内联 DATA_B64（旧版产物）。' +
       '请重新执行 node client/scripts/gen-pikafish-host.mjs'
   );
 }
@@ -274,8 +286,8 @@ function verifyEmbedsLoader(result, label) {
   console.log(`  ${label} 完整内嵌 loader: ${loaderSrc.length} 字符（逐字符一致）`);
 }
 
-verifyEmbedsLoader(worker, 'pikafish.worker.bin');
-verifyEmbedsLoader(html, 'pikafish.html');
+verifyEmbedsLoader(worker, 'pikafish_worker.bin');
+verifyEmbedsLoader(html, 'pikafish.page');
 
 if (errors.length > 0) {
   console.error('verify-pikafish-engine-assets: 引擎产物校验失败：');
@@ -285,7 +297,7 @@ if (errors.length > 0) {
 }
 for (const w of warns) console.warn('  ! ' + w);
 console.log('verify-pikafish-engine-assets: 引擎产物校验通过 ✓');
-if (worker) console.log(`  pikafish.worker.bin ${worker.stat.size} B（小：靠 fetch 拉二进制）`);
-if (wasmStat) console.log(`  pikafish.wasm      ${wasmStat.size} B`);
-if (nnueStat) console.log(`  pikafish.nnue      ${nnueStat.size} B`);
-if (html) console.log(`  pikafish.html      ${html.stat.size} B（原生端内联）`);
+if (worker) console.log(`  pikafish_worker.bin ${worker.stat.size} B（小：靠 fetch 拉二进制）`);
+if (wasmStat) console.log(`  pikafish_wasm.wasm      ${wasmStat.size} B`);
+if (nnueStat) console.log(`  pikafish_nnue.nnue      ${nnueStat.size} B`);
+if (html) console.log(`  pikafish.page      ${html.stat.size} B（原生端：小页面 + fetch 二进制）`);

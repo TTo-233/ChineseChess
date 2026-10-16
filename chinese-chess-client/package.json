@@ -16,12 +16,14 @@
     "verify:server-parity": "node ../chinese-chess-server/build.js --check",
     "verify:rule-engine-parity": "node ../chinese-chess-server/scripts/verify-rule-engine-parity.mjs",
     "verify:board-assets": "node client/scripts/verify-board-assets.mjs",
+    "verify:asset-resource-names": "node client/scripts/verify-asset-resource-names.mjs",
     "verify:pikafish-engine-assets": "node client/scripts/verify-pikafish-engine-assets.mjs",
     "verify:jieqi-engine-assets": "node client/scripts/verify-jieqi-engine-assets.mjs",
+    "verify:engine-in-chromium": "node client/scripts/verify-engine-in-chromium.mjs",
     "gen:pikafish-host": "node client/scripts/gen-pikafish-host.mjs",
     "gen:jieqi-host": "node client/scripts/gen-jieqi-host.mjs",
     "test:client": "pnpm --filter expo-app run test:ci",
-    "validate": "pnpm run lint && pnpm run verify:server-parity && pnpm run verify:rule-engine-parity && pnpm run verify:board-assets && pnpm run verify:pikafish-engine-assets && pnpm run verify:jieqi-engine-assets && pnpm run test:client"
+    "validate": "pnpm run lint && pnpm run verify:server-parity && pnpm run verify:rule-engine-parity && pnpm run verify:board-assets && pnpm run verify:asset-resource-names && pnpm run verify:pikafish-engine-assets && pnpm run verify:jieqi-engine-assets && pnpm run verify:engine-in-chromium && pnpm run test:client"
   },
   "dependencies": {},
   "devDependencies": {},

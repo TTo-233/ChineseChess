@@ -138,8 +138,36 @@ describe('PikafishOfflineEngine：握手与能力', () => {
     const t = new FakeTransport();
     const engine = new PikafishOfflineEngine(() => t);
     const p = engine.init();
+    // ⚠️ 承载工厂现在是**异步**的（原生端要经 expo-asset 把 wasm/nnue 资源
+    //    解析成 file:// URI），onDead 回调是在 await 之后才注册的。
+    //    所以"承载刚建好就死亡"必须让出一个微任务再触发，否则回调还没接上、
+    //    死亡事件会被静默丢失（这正是本用例要防的丢事件场景）。
+    await Promise.resolve();
     t.deadCb?.('Worker 崩溃');
     await expect(p).rejects.toBeInstanceOf(OfflineEngineUnavailableError);
+  });
+
+  it('承载工厂是异步的：await 之后才建承载，握手仍能正常完成', async () => {
+    const t = new FakeTransport();
+    // 异步工厂：模拟原生端"先经 expo-asset 解析 file:// URI、再建承载"的真实时序
+    const engine = new PikafishOfflineEngine(async () => {
+      await Promise.resolve();
+      return t;
+    });
+    const p = engine.init();
+    // 工厂尚未 resolve：此刻引擎还没注册 onMessage/onDead，
+    // 过早触发的消息理应被忽略（不应让它把启动带崩）。
+    t.emit({ type: 'ready', banner: '过早的 ready', options: [] });
+
+    // 等工厂 resolve、引擎注册好回调并 start（Worker 承载 start 即就绪 →
+    // onReady 触发 → 下发 bootstrap）。此时承载已准备好，回一个真正的 ready。
+    await new Promise((r) => setTimeout(r, 0));
+    t.emit({ type: 'ready', banner: 'Pikafish async', options: [] });
+
+    const caps = await p;
+    // 必须是工厂 resolve 之后那一条 ready。早发的那条若被误接收会拿到错 banner。
+    expect(caps.banner).toBe('Pikafish async');
+    engine.dispose();
   });
 });
 

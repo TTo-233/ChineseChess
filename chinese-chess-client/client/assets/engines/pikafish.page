@@ -1,27 +1,41 @@
-/* eslint-disable */
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+<title>Pikafish Host</title>
+</head>
+<body>
+<script>
 /**
  * GENERATED FILE — DO NOT EDIT.
- * 由 client/scripts/gen-pikafish-host.mjs 生成。
- *   loader : client/engine-source/pikafish/pikafish.cjs
- *   wasm   : client/engine-source/pikafish/pikafish.wasm        (sha256 625dbdd6cb7717204ec25fa0fc5e4ba9f6278ab901a52294ff29b975302cd9f6)
- *   data   : client/engine-source/pikafish/data/pikafish.data  (sha256 d19746bb9eccbb8d65b5f7eaf9f5a9622a1ddde5847c12a0ef18afe864296ee2)
+ * 由 client/scripts/gen-pikafish-host.mjs 生成（与 pikafish_worker.bin 共享同一份 UCI 逻辑）。
  *
- * classic Web Worker（**不再内联二进制**）：收到 bootstrap 后用 fetch 并行拉取
- * pikafish.wasm / pikafish.nnue，可在无 require/__dirname/fs 的环境运行。
- * Pikafish 引擎为 GPL-3.0，权重受其独立许可约束；本项目仅内部娱乐使用。
+ * ⚠️ 原生端离线引擎页：**小页面 + 外部二进制**（不再内联 base64）。
  *
- * 协议（与 pikafish.html 基本一致，差别只在 bootstrap 带 URL）：
- *   in : {type:'bootstrap',wasmUrl,nnueUrl}
- *        {type:'search',seq,commands,randomPick} {type:'stop'} {type:'dispose'}
- *   out: {type:'host-loaded'} {type:'ready',banner,options} {type:'result',seq,result,fatal?}
- *        {type:'error',message} {type:'stopped',seq}
+ *   历史上这里内联了 wasm + NNUE 的 base64（约 6.05 MiB 的单文件）。在真机上
+ *   代价很大（见 gen 脚本头部与 CLIENT-PIKAFISH-OFFLINE.md）：WebView 要解析
+ *   6MB 巨型字面量、再 atob 出 4.4MB 二进制，低端机内存峰值高、易被系统
+ *   OOM 杀掉渲染进程。现在改为与 Worker 同构的「小页面 + fetch 两个二进制」，
+ *   页面本身降到 ~200KB 量级，行为与 Web 端完全一致。
  *
- * ⚠️ 后缀是 .bin 而非 .js：内容虽是 JS，但必须按静态资源原样透传（见脚本头部说明）。
- *    经典 Worker 不要求 MIME 为 JS，浏览器按 URL 取回后直接当脚本执行。
+ *   ⚠️ 前提是本页有一个**可用的同源 origin**：原生端它由 file:// 加载，
+ *   fetch 的相对地址会解析到同目录的文件。若拿不到 URL（bootstrap 没带），
+ *   会显式报 error 而不是静默挂起。
+ *
+ * 协议与 pikafish_worker.bin 完全一致。
+ *
+ * Pikafish 引擎：GPL-3.0（源二进制见 client/engine-source/pikafish/）。
+ * NNUE 权重：受皮卡鱼官方 NNUE 协议约束（非 GPL，商用需另行授权）。
+ * 本项目仅内部娱乐使用。
  */
 'use strict';
 
-var send = function (msg) { self.postMessage(msg); };
+var send = function (msg) {
+  if (window.ReactNativeWebView && window.ReactNativeWebView.postMessage) {
+    window.ReactNativeWebView.postMessage(JSON.stringify(msg));
+  }
+};
 
 var BANNER_RE = /\bPikafish\b/i;
 var DEV_RE = /developers/i;
@@ -140,30 +154,11 @@ function PikaCore(send) {
 }
 
 
+var DATA_SIZE = 4103914;
 var WASM_BYTES = null;
 var DATA_BYTES = null;
 
-/**
- * 从 URL 拉取二进制（**不再内联 base64**）。
- *
- * ============================================================================
- * 【为什么改成 fetch · 2026-10 性能优化（实测数据）】
- *
- * 原方案把 wasm + nnue 以 base64 内联进脚本。实测代价：
- *   · 体积膨胀 +38%：二进制 4.39MiB → 文本 6.06MiB；
- *   · 脚本本身 6.3MiB，Worker 启动要先解析这两段巨型字面量；
- *   · 本机 dev server 传 6.06MiB 实测约 3.6s，是"首次启动慢"的主因。
- *   （base64 解码本身只占 ~6ms，不是瓶颈；瓶颈是**传输**与**解析**。）
- *
- * 改为把 wasm/nnue 作为独立二进制资源后：
- *   · 传输 6.06MiB → 4.39MiB（-27.5%），且两个文件可**并行**下载；
- *   · Worker 脚本降到几十 KB，解析几乎不花时间；
- *   · 完全省掉 base64 解码与中间字符串。
- *
- * 页面侧（WebView）仍沿用内联 base64 的 html：原生 WebView 以 inline HTML 承载时
- * 没有可用的同源 origin，fetch 兄弟资源会被跨源/CORS 挡住，内联是唯一稳妥选择。
- * 两条路径共用同一份 UCI 逻辑（见 UCI_CORE），行为保持一致。
- */
+/** 拉取一个二进制资源（同源 file:// 或 http:// 均可） */
 function fetchBytes(url) {
   return fetch(url, { credentials: 'same-origin' }).then(function (res) {
     if (!res.ok) throw new Error('HTTP ' + res.status + ' for ' + url);
@@ -176,15 +171,12 @@ function loadBinaries(wasmUrl, nnueUrl) {
   return Promise.all([fetchBytes(wasmUrl), fetchBytes(nnueUrl)]).then(function (bufs) {
     WASM_BYTES = new Uint8Array(bufs[0]);
     DATA_BYTES = new Uint8Array(bufs[1]);
-    var expect = 4103914;
-    if (DATA_BYTES.length !== expect) {
-      throw new Error('pikafish.nnue size mismatch: ' + DATA_BYTES.length + ' != ' + expect);
+    if (DATA_BYTES.length !== DATA_SIZE) {
+      throw new Error('pikafish.nnue size mismatch: ' + DATA_BYTES.length + ' != ' + DATA_SIZE);
     }
   });
 }
 
-// 内联服务端 Emscripten 加载器：它顶层 require('fs') / __dirname，
-// 这里提供**永不被调用**的替身（真实加载走 getPreloadedPackage / instantiateWasm）。
 var fsStub = { readFile: function (p, cb) { cb(new Error('fs unavailable: ' + p)); } };
 function req(name) { if (name === 'fs') return fsStub; throw new Error('unexpected require: ' + name); }
 var mod = { exports: {} };
@@ -5448,14 +5440,7 @@ module.exports = Pikafish;
 
 var factory = mod.exports;
 
-/**
- * 创建引擎实例。
- *
- * ⚠️ 契约：factory 返回 Module['ready']（Promise），而 send_command / read_stdout
- *    被 loader 写在**传入的 config 对象**上。因此必须持有 config 引用。
- */
 function createEngine(onOutput) {
-  if (!WASM_BYTES || !DATA_BYTES) throw new Error('binaries not loaded');
   var config = {
     print: function () {},
     printErr: function (t) { onOutput('CRITICAL ERROR ' + t); },
@@ -5494,13 +5479,8 @@ function createEngine(onOutput) {
 
 var engine = null;
 var core = null;
-
 function getCore() { if (!core) core = PikaCore(send); return core; }
 
-/**
- * bootstrap 需要带上 wasm / nnue 的 URL（本 Worker 不再内联二进制）。
- * @param {{wasmUrl?:string, nnueUrl?:string}} msg
- */
 function bootstrap(msg) {
   var wasmUrl = msg && msg.wasmUrl;
   var nnueUrl = msg && msg.nnueUrl;
@@ -5520,8 +5500,9 @@ function bootstrap(msg) {
   });
 }
 
-self.onmessage = function (ev) {
-  var msg = ev.data;
+window.addEventListener('message', function (ev) {
+  var msg = ev && ev.data;
+  if (typeof msg === 'string') { try { msg = JSON.parse(msg); } catch (e) { return; } }
   if (!msg || !msg.type) return;
   try {
     if (msg.type === 'bootstrap') { bootstrap(msg); return; }
@@ -5536,17 +5517,19 @@ self.onmessage = function (ev) {
     if (msg.type === 'stop') {
       var cc = getCore();
       if (cc.isBusy()) { cc.stop(); return; }
-      if (engine && engine.send) { try { engine.send('stop'); } catch (e) {} }
+      if (engine) { try { engine.send('stop'); } catch (e) {} }
       return;
     }
     if (msg.type === 'dispose') {
       try { if (engine) { engine.send('stop'); engine.send('quit'); } } catch (e) {}
       engine = null; core = null;
-      return;
     }
   } catch (err) {
     send({ type: 'error', message: (err && err.message) || String(err) });
   }
-};
+});
 
 send({ type: 'host-loaded' });
+</script>
+</body>
+</html>

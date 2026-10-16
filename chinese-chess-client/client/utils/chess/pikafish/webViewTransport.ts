@@ -30,9 +30,9 @@ export function supportsWebViewTransport(): boolean {
   return Platform.OS === 'android' || Platform.OS === 'ios';
 }
 
-/* -------------------------------------------------------------------------- */
-/* 命令式桥（单例）                                                            */
-/* -------------------------------------------------------------------------- */
+/**
+ * 命令式桥（单例）                                                            
+ */
 
 let messageCb: Listener | null = null;
 let deadCb: DeadListener | null = null;
@@ -70,17 +70,50 @@ const pendingOutbox: Array<HostInbound> = [];
 /** 队列上限：异常情况下（页面永不加载）不至于无限堆积 */
 const OUTBOX_MAX = 16;
 
+/**
+ * 承载实例是否已被**真正**判死。
+ *
+ * ⚠️ 这是本文件最关键的一个标志（2026-10 实测根因修复）。
+ *
+ * 之前的实现把「ref 回调收到 null」直接当成"承载加载失败"：
+ *   pageAlive = false; pendingOutbox.length = 0; deadCb?.(...)
+ * 而 React 的 `ref={(i) => registerWebView(i)}`（内联箭头函数）**每次重渲染都会
+ * 先回调 null 再回调实例**——这是 React ref 的标准语义，不是卸载。
+ * 于是每一次 re-render（OfflineEngineHost 的 useEffect、Provider 状态变化、
+ * 屏幕旋转、AppState 切换…）都会：
+ *   ① pageAlive=false → ② **清空 bootstrap 队列** → ③ 上报承载死亡
+ * 而 `pageAlive` 只有 `host-loaded` 能设回 true，页面却只加载一次。
+ * 结果：原生端引擎**永久失联** —— send() 第一行就 return，bootstrap 再也发不出去，
+ * 界面上永远转"皮卡鱼启动中"。这与用户实机反馈完全一致。
+ *
+ * 现在把「ref 脱离」与「承载死亡」彻底分开：
+ *   · ref(null)          → 只清实例引用（那才是"暂时没法注入"的真实含义），
+ *                          **不动 pageAlive、不动队列**；
+ *   · onError/onHttpError/onRenderProcessGone/onContentProcessDidTerminate/
+ *     组件真卸载 → 才是承载死亡（dispatchWebViewDead）。
+ */
+let hostUnmounted = false;
+
 function inject(msg: HostInbound | HostSearchMessage): void {
   webViewInstance?.injectJavaScript(
     `window.dispatchEvent(new MessageEvent('message',{data:${JSON.stringify(msg)}}));true;`
   );
 }
 
+/** pageLoaded 已经成立时，bootstrap 等消息应立即注入而不是排队 */
+function isPageSettled(): boolean {
+  return pageLoaded && pageAlive;
+}
+
 export const webViewBridge = {
-  isReady: (): boolean => pageLoaded && pageAlive,
+  isReady: (): boolean => isPageSettled(),
   send(msg: HostInbound | HostSearchMessage): void {
     if (!pageAlive) return;
-    if (!pageLoaded) {
+    // 页面已就绪但此刻拿不到注入句柄（React 重渲染的中间态，ref 短暂为 null）：
+    // 直接 inject 会把消息丢进黑洞。必须**排队**，等下一次 registerWebView(instance)
+    // 或 host-loaded 时补发 —— 否则正好撞上这个窗口的 bootstrap / search 会永久丢失，
+    // 表现就是"引擎明明起来了却一直不出招"。
+    if (!isPageSettled() || !webViewInstance) {
       // 页面还没加载完：握手类消息排队，等 host-loaded 后补发（见上方 P0-1 说明）
       if (msg.type === 'search') return;
       if (pendingOutbox.length < OUTBOX_MAX) {
@@ -96,16 +129,25 @@ export const webViewBridge = {
   },
 };
 
+/**
+ * 注入句柄重新可用时把队列里的消息立刻补发（不等下一次 host-loaded）。
+ *
+ * ⚠️ 这是上面"重渲染窗口"的补救：ref 从 null 变回实例的那一刻调用它。
+ */
+function flushOutbox(): void {
+  if (!isPageSettled() || !webViewInstance) return;
+  if (pendingOutbox.length === 0) return;
+  const queued = pendingOutbox.splice(0, pendingOutbox.length);
+  for (const m of queued) inject(m);
+}
+
 /** 供组件内部转发上行消息 */
 export function dispatchWebViewMessage(msg: HostOutbound): void {
   if (msg.type === 'host-loaded') {
     pageLoaded = true;
     pageAlive = true;
     // 页面就绪：按序补发排队的握手消息（bootstrap 就在其中）
-    if (pendingOutbox.length > 0) {
-      const queued = pendingOutbox.splice(0, pendingOutbox.length);
-      for (const m of queued) inject(m);
-    }
+    flushOutbox();
   }
   messageCb?.(msg);
 }
@@ -119,9 +161,44 @@ export function dispatchWebViewDead(): void {
   deadCb?.('WebView 引擎承载不可用');
 }
 
-/** 供组件注册/注销真实 WebView 实例 */
+/**
+ * 供组件注册/注销真实 WebView 实例。
+ *
+ * ============================================================================
+ * 【2026-10 实测根因修复：ref(null) 不等于承载死亡】
+ *
+ * 原实现在 `instance === null && pageAlive` 时直接判死并清空队列。React 的
+ * `ref={(i) => registerWebView(i)}` 是内联箭头函数，**每次重渲染都会先传 null
+ * 再传实例**（React ref 的标准语义）。于是任意一次 re-render 都会把承载打成"死亡"：
+ * pageAlive=false、bootstrap 队列被清空、上报 onDead。
+ * 而 pageAlive 只有页面唯一一次 `host-loaded` 能置回 true —— 之后再无恢复路径，
+ * `send()` 首行 `if (!pageAlive) return` 永久丢弃一切消息。
+ * 用户实机表现：象棋对局永远"皮卡鱼启动中"、AI 不动。
+ *
+ * 修复：`null` 只表示"此刻没有可注入的实例"（组件重渲染的中间态），
+ * 承载死亡改由真正的失败回调（onError / onHttpError / 渲染进程被杀 /
+ * 组件卸载）经 dispatchWebViewDead 上报，两者语义不再混用。
+ * 队列也不在这里清：把"实例暂时没了"当成"会话该丢弃"，会让正好赶上
+ * 重渲染的那一次 bootstrap 永久丢失。
+ */
 export function registerWebView(instance: Injectable | null): void {
   webViewInstance = instance;
+  if (instance) {
+    hostUnmounted = false;
+    // 注入句柄回来了：把重渲染窗口里排队的消息立刻补发（否则那一次 bootstrap 会丢）
+    flushOutbox();
+    return;
+  }
+  // 卸载与"重渲染中间态"要区分：只有在**从未成功挂载过**时才认为宿主不存在。
+  // 已经收到过 host-loaded 说明页面活着，只是此刻拿不到注入句柄 → 保留状态。
+  if (!pageLoaded && !pageAlive) {
+    hostUnmounted = true;
+  }
+}
+
+/** 宿主是否已被卸载（渲染期可查，避免抛错打崩 App） */
+export function isWebViewHostUnmounted(): boolean {
+  return hostUnmounted;
 }
 
 /**
@@ -160,6 +237,7 @@ export function __resetWebViewBridgeForTest(): void {
   pageAlive = true;
   webViewInstance = null;
   pendingOutbox.length = 0;
+  hostUnmounted = false;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -171,8 +249,14 @@ export function __resetWebViewBridgeForTest(): void {
  *
  * 启动本身没有"创建"动作（组件在根布局挂载），这里只做平台校验并触发 bootstrap；
  * 若组件尚未挂载，报错由上层捕获 → 降级到兜底引擎，绝不让对局卡住。
+ *
+ * ⚠️ binaryUrls：原生端页面**不再内联** wasm/nnue 的 base64（2026-10 真机性能/内存
+ * 修复），改为与 Worker 同构的 fetch 两个独立二进制资源。因此 bootstrap 必须带上
+ * 它们在原生端的 file:// URI，否则页面会因拿不到 URL 而无法启动引擎。
  */
-export function createWebViewTransport(): EngineTransport {
+export function createWebViewTransport(
+  binaryUrls?: { wasmUrl: string; nnueUrl: string }
+): EngineTransport {
   let started = false;
   /** 承载真正就绪后的回调（由 doBoot 传入，用于在其后下发 bootstrap） */
   let readyCb: (() => void) | null = null;
@@ -196,6 +280,15 @@ export function createWebViewTransport(): EngineTransport {
         readyFired = true;
         readyCb?.();
       }
+    },
+
+    bootstrapMessage() {
+      // 原生端页面靠 fetch 拿二进制，与 Worker 承载同构。
+      // 传 null 而不是空对象：页面会显式报「bootstrap 缺少 wasmUrl/nnueUrl」
+      // 而不是拿着 undefined 去 fetch 出一个难以理解的报错。
+      return binaryUrls
+        ? { type: 'bootstrap', wasmUrl: binaryUrls.wasmUrl, nnueUrl: binaryUrls.nnueUrl }
+        : { type: 'bootstrap' };
     },
 
     send(msg) {

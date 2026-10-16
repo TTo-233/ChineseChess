@@ -178,3 +178,82 @@ describe('WebView 承载：bootstrap 不得被丢弃（P0-1）', () => {
     expect(deadReason).toBeNull();
   });
 });
+
+/**
+ * ============================================================================
+ * 【2026-10 实机根因回归】React ref(null) 不等于承载死亡
+ * ============================================================================
+ *
+ * 现象（用户实机）：象棋对局永远"皮卡鱼启动中"，AI 一步不动。
+ * 根因：webViewHost 用 `ref={(i) => registerWebView(i)}`（内联箭头），
+ * 每次 re-render 都先回调 null 再回调实例；而 registerWebView 把 null 判成
+ * "承载加载失败" → pageAlive=false + 清空 bootstrap 队列 + 上报 onDead。
+ * pageAlive 只有页面唯一一次 host-loaded 能置回 true，页面不会再加载 →
+ * `send()` 首行 `if (!pageAlive) return` 永久丢弃一切消息，引擎再也无法 bootstrap。
+ *
+ * 这组断言把「ref 短暂为 null 不得打断承载」与「排队消息必须在句柄回来后补发」
+ * 两条契约固化下来。
+ */
+describe('WebView 承载：React ref(null) 是重渲染中间态，不是承载死亡', () => {
+  beforeEach(() => {
+    __resetWebViewBridgeForTest();
+  });
+
+  afterEach(() => {
+    __resetWebViewBridgeForTest();
+  });
+
+  it('registerWebView(null) 不得把承载判死、不得触发 onDead', () => {
+    const wv = makeFakeWebView();
+    registerWebView(wv);
+    dispatchWebViewMessage({ type: 'host-loaded' } as HostOutbound);
+
+    const t = createWebViewTransport();
+    let deadCalls = 0;
+    t.onMessage(() => { /* noop */ });
+    t.onDead(() => {
+      deadCalls += 1;
+    });
+    t.start();
+
+    // 模拟一次 re-render：React 先回调旧 ref(null)，再回调新 ref(instance)
+    registerWebView(null);
+    registerWebView(wv);
+
+    expect(deadCalls).toBe(0);
+    expect(webViewBridge.isReady()).toBe(true);
+  });
+
+  it('ref(null) 窗口里发出的 bootstrap 会在句柄回来后补发（不丢）', () => {
+    const wv = makeFakeWebView();
+    registerWebView(wv);
+    dispatchWebViewMessage({ type: 'host-loaded' } as HostOutbound);
+
+    // 模拟：正好撞上重渲染中间态，此刻没有注入句柄
+    registerWebView(null);
+    webViewBridge.send({ type: 'bootstrap' });
+    expect(wv.injected.length).toBe(0); // 排队中，没有黑洞丢弃
+
+    // 句柄回来 → 立刻补发
+    registerWebView(wv);
+    const msgs = messagesIn(wv.injected);
+    expect(msgs.some((m) => m.type === 'bootstrap')).toBe(true);
+  });
+
+  it('反复 re-render 不会让引擎永久失联（多次 null→instance 循环后仍可用）', () => {
+    const wv = makeFakeWebView();
+    registerWebView(wv);
+    dispatchWebViewMessage({ type: 'host-loaded' } as HostOutbound);
+
+    for (let i = 0; i < 10; i += 1) {
+      registerWebView(null);
+      registerWebView(wv);
+    }
+
+    // 循环之后引擎仍能收消息
+    webViewBridge.send({ type: 'bootstrap' });
+    const msgs = messagesIn(wv.injected);
+    expect(msgs.some((m) => m.type === 'bootstrap')).toBe(true);
+    expect(webViewBridge.isReady()).toBe(true);
+  });
+});

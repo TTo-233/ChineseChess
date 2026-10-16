@@ -69,7 +69,7 @@ type Pending = {
 };
 
 export class PikafishOfflineEngine implements OfflineEngine {
-  private transportFactory: () => EngineTransport;
+  private transportFactory: () => EngineTransport | Promise<EngineTransport>;
 
   private transport: EngineTransport | null = null;
   private caps: EngineCapabilities | null = null;
@@ -79,7 +79,7 @@ export class PikafishOfflineEngine implements OfflineEngine {
   private pending: Pending | null = null;
   private disposed = false;
 
-  constructor(transportFactory: () => EngineTransport) {
+  constructor(transportFactory: () => EngineTransport | Promise<EngineTransport>) {
     this.transportFactory = transportFactory;
   }
 
@@ -104,9 +104,13 @@ export class PikafishOfflineEngine implements OfflineEngine {
   }
 
   private doBoot(): Promise<EngineCapabilities> {
+    // ⚠️ 不用 async Promise executor（no-async-promise-executor）：
+    //   async executor 里抛出的异常会变成一个**永不被观察**的悬空 rejected
+    //   promise（外层 Promise 已经构造完，不会再捕获它），故障就此静默丢失。
+    //   这里改用同步 executor + 内层 async IIFE，并显式 catch 兜住所有出口。
     return new Promise<EngineCapabilities>((resolve, reject) => {
       let settled = false;
-      // 超时预算随承载类型而定（WebView 加载 6MB 内联页更慢），
+      // 超时预算随承载类型而定（WebView 路径更慢），
       // 但定时器必须在**知道承载类型之后**才能设，所以先建承载再起表。
       let timer: ReturnType<typeof setTimeout> | null = null;
       let bootBudgetMs = BOOT_TIMEOUT_MS;
@@ -139,9 +143,25 @@ export class PikafishOfflineEngine implements OfflineEngine {
         reject(e);
       };
 
+      /**
+       * ⚠️ armTimer() 必须在本 IIFE 的第一个 await **之前**调用。
+       *
+       * 承载工厂现在是异步的（原生端要经 expo-asset 把 wasm/nnue 资源解析成
+       * file:// URI 才能下发给页面）。若把起表放在 await 之后，一旦工厂挂起就
+       * **永远不会有超时**——Promise 悬空，对局卡在「AI 回合」，比超时降级严重得多。
+       */
+      armTimer();
+
+      // 内层 async IIFE：承载工厂可能是异步的（见上方说明）。
+      // 显式 catch 兜住所有出口，确保任何意外都不会变成悬空的 rejected promise。
+      void (async () => {
       let t: EngineTransport;
       try {
-        t = this.transportFactory();
+        /**
+         * 承载工厂现在**可能是异步的**（原生端要经 expo-asset 把 wasm/nnue 资源
+         * 解析成 file:// URI 才能下发给页面）。同步工厂用 await 也能正常拿到值。
+         */
+        t = await this.transportFactory();
         this.transport = t;
         bootBudgetMs =
           t.kind === 'webview' ? WEBVIEW_BOOT_TIMEOUT_MS : BOOT_TIMEOUT_MS;
@@ -156,7 +176,6 @@ export class PikafishOfflineEngine implements OfflineEngine {
         );
         return;
       }
-      armTimer();
 
       t.onMessage((msg) => this.onHostMessage(msg, markReady, markBootError));
       t.onDead((reason) => {
@@ -192,6 +211,14 @@ export class PikafishOfflineEngine implements OfflineEngine {
               )
         );
       }
+      })().catch((err) => {
+        // 兜底：IIFE 内任何未预期异常都不能悬空，必须转成启动失败让上层降级。
+        markBootError(
+          new OfflineEngineUnavailableError(
+            `引擎启动过程异常: ${err instanceof Error ? err.message : String(err)}`
+          )
+        );
+      });
     });
   }
 

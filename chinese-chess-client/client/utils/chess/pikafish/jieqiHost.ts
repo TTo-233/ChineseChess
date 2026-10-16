@@ -4,7 +4,7 @@
  * ============================================================================
  * 【⚠️ 架构约束（实测得出，务必先读）】
  *
- * 我们编译的 `jieqi.wasm` 使用**标准 Emscripten IO 契约**：
+ * 我们编译的 `jieqi_wasm.wasm` 使用**标准 Emscripten IO 契约**：
  *   · 命令 → `stdin` 回调
  *   · 输出 → `print` / `printErr` 回调
  *   · `main()` → 进入 `UCI::loop()`，**同步阻塞**地 getline(cin) 直到 EOF
@@ -31,6 +31,15 @@
  *
  * ============================================================================
  */
+
+import { Platform } from 'react-native';
+
+import type { EngineHostSource } from './engineTransport';
+import { resolveNativeAssetUri } from './nativeAsset';
+import {
+  runSessionInWebView,
+  supportsJieqiWebView,
+} from './jieqiWebViewBridge';
 
 export interface JieqiSessionResult {
   lines: string[];
@@ -121,8 +130,8 @@ function resolveWorkerUrl(): string {
   // "Invalid call ... require(modulePath)"），导致**整个 bundle 编译失败**、
   // 应用回退到旧 bundle —— 表现为揭棋静默走 TS AI 兜底（踩过）。
   // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const asset = require('../../../assets/engines/jieqi.worker.bin');
-  return normalizeAssetUrl(asset, '揭棋 Worker 资源（assets/engines/jieqi.worker.bin）');
+  const asset = require('../../../assets/engines/jieqi_worker.bin');
+  return normalizeAssetUrl(asset, '揭棋 Worker 资源（assets/engines/jieqi_worker.bin）');
 }
 
 /**
@@ -138,8 +147,8 @@ function resolveWorkerUrl(): string {
  */
 function resolveWasmUrl(): string {
   // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const asset = require('../../../assets/engines/jieqi.wasm');
-  return normalizeAssetUrl(asset, '揭棋引擎二进制（assets/engines/jieqi.wasm）');
+  const asset = require('../../../assets/engines/jieqi_wasm.wasm');
+  return normalizeAssetUrl(asset, '揭棋引擎二进制（assets/engines/jieqi_wasm.wasm）');
 }
 
 /**
@@ -186,30 +195,78 @@ export function getJieqiWasmUrl(): string {
 }
 
 /**
- * 产物是否齐备（缺任一产物时上层应直接降级到 TS AI，而不是报错）
+ * 揭棋引擎页的加载来源（类型定义在 engineTransport，避免循环依赖）
  *
- * 【2026-10 审计 D4：必须同时检查「承载能力」】
+ * ⚠️ 只在文件顶部 `import type` 引入，不做 re-export：
+ *    `export type { X } from './y'` 只是转发，本文件内拿不到本地名 X。
+ */
+export type { EngineHostSource };
+
+/**
+ * 惰性 require 揭棋离线页（理由同上面的静态字符串要求）
  *
- * 原实现只 `require` 两个资源，于是**任何平台都返回 true**。但本模块唯一的
- * 承载路径是 Web Worker，而 `runJieqiSession` 在 `typeof Worker === 'undefined'`
- * 时直接抛错。于是原生端（Android/iOS）会：
- *   1. 走进引擎分支（isJieqiHostAvailable() 为 true）；
- *   2. 每次搜索都在 runJieqiSession 里抛错；
- *   3. 被上层 catch → **静默回落 TS AI**；
- *   4. 角标却因为 (1) 一直显示「揭棋引擎启动中」——
- *      用户看到的是一个**永远启动不了**的引擎 + 永久降级的棋力，且毫无提示。
+ * ⚠️ 扩展名是 `.page` 而不是 `.html`（2026-10 Android 构建阻塞修复）：
+ * Metro 会把这些产物打进 Android `res/raw/`，AAPT 以「去扩展名的路径」作资源名，
+ * `jieqi.html` 与 `jieqi_wasm.wasm` 会压成同一个 raw/assets_engines_jieqi
+ * → Duplicate resources，构建在 mergeReleaseResources 失败（实测过）。
+ */
+function requireHtmlAsset(): unknown {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  return require('../../../assets/engines/jieqi.page');
+}
+
+/**
+ * 解析揭棋离线页来源（原生端用）。
  *
- * ⚠️ 象棋侧是靠 WebView 承载解决的（pikafish/index.ts 的 createPrimaryEngine
- * 有 android/ios 分支），而揭棋**没有** WebView transport。故这里不能假装
- * 支持原生，只能诚实地按「Worker 可用」判定：
- *   · Web（Expo web / 打包后的浏览器）：Worker 可用 ⇒ 引擎可用；
- *   · 原生：返回 false ⇒ 立刻走 TS AI，且角标不再谎称「启动中」。
+ * ⚠️ 与 pikafish/index.ts 的 getEngineHostSource 同构，且**同样必须异步**：
+ *   · 产物本身是 HTML 文本 → 直接 `{ html }` 内联；
+ *   · 原生端 require 到的是**资源 id** → 必须经 resolveNativeAssetUri 转成
+ *     `file://` 本地缓存 URI。用 Image.resolveAssetSource 在打包态会得到
+ *     **裸资源名**（无 scheme），WebView 导航静默失败 → 揭棋永远「基础AI」。
+ *     这正是 2026-10 实机故障的根因之一。
  *
- * 若将来为揭棋补 WebView 承载，应在此改为与象棋同样的三态判定。
+ * @see ./nativeAsset.ts 的完整根因说明
+ */
+export async function getJieqiHostSource(): Promise<EngineHostSource> {
+  const asset = requireHtmlAsset();
+  if (typeof asset === 'string' && asset.trimStart().startsWith('<')) {
+    return { html: asset };
+  }
+  return { uri: await resolveNativeAssetUri(asset, 'jieqi.page', 'page') };
+}
+
+/**
+ * 产物与承载是否齐备（缺任一产物时上层应直接降级到 TS AI，而不是报错）
+ *
+ * ============================================================================
+ * 【2026-10 三态判定：Worker 或 WebView，任一可用即可】
+ *
+ * 原实现只认 Worker，并给原生端硬编码 `return false`，于是：
+ *   1. 原生端每次都走 TS 兜底，角标显示「基础AI」，揭棋引擎永不参与；
+ *   2. 即使补齐了 WebView 产物，也无法表达"原生现在也能用了"。
+ *
+ * 现在改为按平台各问一次实际能力：
+ *   · Web    → Worker 是否存在 + 产物能否解析；
+ *   · 原生    → 离线页资源能否解析（承载由根布局挂载，能力即产物）。
+ *
+ * ⚠️ 这里**只判断"能不能"，不判断"此刻是否就绪"**——就绪与否由
+ *   runSessionInWebView 的挂起/超时表达，不由上层预判。
+ *
+ * ⚠️ 原生端**只能做同步的粗判**：getJieqiHostSource 现在是异步的
+ *   （要经 expo-asset 把资源 id 换成 file:// 缓存 URI），Promise 无法在
+ *   同步 try/catch 里捕获失败。因此这里退化为「产物能被 require 出来
+ *   就认为可用」，真正的失败（URI 解析不出）由 runSessionInWebView 抛出、
+ *   走正常降级路径 —— 不要在这里假装能校验出解析结果。
  */
 export function isJieqiHostAvailable(): boolean {
-  if (typeof Worker === 'undefined') return false;
   try {
+    if (supportsJieqiWebView()) {
+      // 原生：WebView 承载。产物缺失/未登记 → require 直接抛，判不可用（诚实降级）。
+      // 只验证 require 能成功；URI 解析结果不在同步判定范围内（见上方说明）。
+      requireHtmlAsset();
+      return true;
+    }
+    if (typeof Worker === 'undefined') return false;
     resolveWorkerUrl();
     resolveWasmUrl();
     return true;
@@ -219,7 +276,7 @@ export function isJieqiHostAvailable(): boolean {
 }
 
 /**
- * 跑一次揭棋 UCI 会话。
+ * 跑一次揭棋 UCI 会话（自动按平台选承载：Web → Worker，原生 → WebView）。
  *
  * @param commands  完整命令序列（最后应含 `quit`）
  * @param timeoutMs 墙钟上限
@@ -228,8 +285,29 @@ export async function runJieqiSession(
   commands: string[],
   timeoutMs: number
 ): Promise<JieqiSessionResult> {
+  if (supportsJieqiWebView()) {
+    // 原生：屏幕外 WebView。命令以 injectJavaScript 下发，
+    // 页面把整段喂给一次性实例，跑完回 {type:'done', banner, lines}。
+    const res = await runSessionInWebView(commands, timeoutMs);
+    if (res.type === 'error') {
+      throw new Error(String(res.message ?? '揭棋引擎错误'));
+    }
+    if (res.type !== 'done') {
+      throw new Error(`揭棋引擎返回了非预期消息: ${res.type}`);
+    }
+    const lines = Array.isArray(res.lines) ? res.lines.filter((l) => typeof l === 'string') : [];
+    const banner = typeof res.banner === 'string' ? res.banner : '';
+    // 与 Worker 路径保持同一套 option 提取口径（见 runSessionInWorker 的 done 处理）
+    const options: string[] = [];
+    for (const l of lines) {
+      const m = /^option\s+name\s+(\S+)/i.exec(l.trim());
+      if (m) options.push(m[1]);
+    }
+    return { lines, banner, options };
+  }
+
   if (typeof Worker === 'undefined') {
-    throw new Error('当前环境不支持 Web Worker，无法运行揭棋引擎');
+    throw new Error('当前环境既不支持 WebView 承载也不支持 Web Worker，无法运行揭棋引擎');
   }
   return runSessionInWorker(
     getJieqiWorkerUrl(),

@@ -34,6 +34,11 @@ const ASSET_MIME_TYPES = {
   // 否则 base64 会被 Babel 逐字符处理，启动极慢且内存峰值高；必须原样透传。
   '.wasm': 'application/wasm',
   '.nnue': 'application/octet-stream',
+  // 引擎离线页。⚠️ 扩展名是 .page 而不是 .html：这些产物会被 Metro 打进
+  // Android 的 res/raw/，AAPT 以「去扩展名的路径」作资源名，
+  // 同目录下 pikafish.html 与 pikafish.wasm 会撞名 → Duplicate resources，
+  // 构建在 mergeReleaseResources 失败（实测过）。
+  '.page': 'text/html; charset=utf-8',
   // .bin = 引擎 worker 脚本。经典 Worker 由浏览器按 URL 直接执行，不依赖 MIME，
   // 这里给一个明确类型避免部分服务器返回 text/plain 之外的怪值。
   '.bin': 'text/javascript',
@@ -106,28 +111,36 @@ function devAssetMiddleware(req, res, next) {
 const existingBlockList = [].concat(config.resolver.blockList || []);
 
 /**
- * 【本地皮卡鱼引擎产物：必须原样透传，绝不能进转译管线】
+ * 【本地引擎产物：必须原样透传，绝不能进转译管线】
  *
- * assets/engines 下的两个文件各约 6MB（内联 base64 的 WASM + 4MB NNUE）：
+ * assets/engines 下的文件（worker 脚本 + 离线页 + wasm + nnue）：
  *   · pikafish.worker.bin —— classic Worker 脚本
- *   · pikafish.html        —— 原生端离线引擎页（html 本身就在 assetExts 里）
+ *   · pikafish.page        —— 原生端离线引擎页
+ *   · jieqi.worker.bin / jieqi.page / jieqi.wasm
+ *   · pikafish.wasm / pikafish.nnue
  *
- * 做法是**用非源码扩展名**（.bin / .html），并把它们登记进 assetExts：
+ * 做法是**用非源码扩展名**并把它们登记进 assetExts：
  *   Metro 只转译 sourceExts 里的扩展名，assetExts 里的文件按原字节作为静态资源提供。
- * 因此那两段巨型 base64 不会被 Babel/JSX 管线逐字符处理——
+ * 因此那些巨型 base64 不会被 Babel/JSX 管线逐字符处理——
  * 否则启动会慢到数十秒、内存峰值数百 MB，而且**没有任何报错**。
+ *
+ * ⚠️ 扩展名必须**各自唯一**（2026-10 Android 构建阻塞修复）：
+ *   这些产物会被 Metro 打进 Android 的 `res/raw/`，而 AAPT 生成资源名的规则是
+ *   「**去掉最后一个扩展名**的完整路径」。于是若两个产物只差扩展名
+ *   （`pikafish.wasm` 与 `pikafish.html`），它们会压成同一个
+ *   `raw/assets_engines_pikafish` → `Duplicate resources`，
+ *   构建在 :app:mergeReleaseResources 失败（实测：Run gradlew 报错）。
+ *   现用 .bin / .page / .wasm / .nnue 四种互不相同的扩展名规避。
  *
  * 注意：worker 脚本用 .bin 后缀不影响 `new Worker(url)`：它只当作 URL，
  * 浏览器不关心扩展名。⚠️ 切勿改用 blockList —— 那会让文件**无法被 require 解析**
  * （blockList 的语义是"从模块图里删掉"，不是"跳过转译"），导致 require 直接失败。
- *
- * .html 已在 Expo 默认 assetExts 中（见上面的 ASSET_MIME_TYPES 注释区），
- * 无需重复登记；这里只补 .wasm/.nnue/.bin。
  */
 config.resolver.assetExts = [].concat(config.resolver.assetExts || [], [
   'wasm',
   'nnue',
   'bin', // 引擎 worker 脚本（内容是 JS，但必须按资源原样透传）
+  'page', // 引擎离线页（原生 WebView 承载；见上方 AAPT 资源名冲突说明）
 ]);
 
 
