@@ -71,12 +71,21 @@ export default ({ config }: ConfigContext): ExpoConfig => {
       // 启动画面通过上方 splash 字段配置（原生闪屏展示应用图标），
       // 不额外配置 expo-splash-screen 插件做 JS 自定义控制；
       // Android 12+ 系统级图标闪屏由系统控制。
+
+      // 相册/相机选图：**显式关闭录音权限**。
+      // ⚠️ 2026-10-17 真机取证：音效无声与音频路由被切到通信路由有关，
+      //    而 RECORD_AUDIO 会让系统把本应用归类为「通话类」应用，
+      //    音频策略上更容易走 earpiece / INCALL_MUSIC，媒体扬声器不出声。
+      // ⚠️ 必须写成显式的 `false`：expo-image-picker 的插件是
+      //    `if (microphonePermission !== false) { +RECORD_AUDIO }`
+      //    （withImagePicker.js:34-35）——**省略该 key 会让它取默认值并加上权限**，
+      //    这正是本次改动前 APK 里 RECORD_AUDIO 的真实来源（不是 expo-camera）。
       [
         "expo-image-picker",
         {
           "photosPermission": `允许象棋人机对战App访问您的相册，以便您上传或保存图片。`,
           "cameraPermission": `允许象棋人机对战App使用您的相机，以便您直接拍摄照片上传。`,
-          "microphonePermission": `允许象棋人机对战App访问您的麦克风，以便您拍摄带有声音的视频。`
+          "microphonePermission": false
         }
       ],
       [
@@ -89,8 +98,15 @@ export default ({ config }: ConfigContext): ExpoConfig => {
         "expo-camera",
         {
           "cameraPermission": `允许象棋人机对战App使用相机以拍摄照片和视频。`,
-          "microphonePermission": `允许象棋人机对战App访问您的麦克风，以便您拍摄带有声音的视频。`,
-          "recordAudioAndroid": true
+          // 同样必须显式 false：省略时插件会填入默认麦克风用途说明。
+          "microphonePermission": false,
+          // ⚠️ 必须保持 false：expo-camera 插件是
+          //    `recordAudioAndroid && 'android.permission.RECORD_AUDIO'`
+          //    （withCamera.js:18），只有显式 false 才不会申请录音。
+          //    录音会让系统把本应用归为「通话类」，音频路由被切到
+          //    earpiece / INCALL_MUSIC —— 2026-10-17 真机取证中音效无声的方向。
+          //    本工程没有任何 CameraView / launchCamera 调用，录音纯属多余。
+          "recordAudioAndroid": false
         }
       ]
     ],
