@@ -40,7 +40,7 @@ import { useMoveEffect } from '@/hooks/useMoveEffect';
 import { useBoardFrame } from '@/hooks/useBoardFrame';
 import { useBattleClock } from '@/hooks/useBattleClock';
 import { useBattleStateSync } from '@/hooks/useBattleStateSync';
-import { playJiangJunSound, playSound, preloadSounds, unloadAllSounds } from '@/utils/SoundManager';
+import { playJiangJunSound, playSound, acquireSoundSession, releaseSoundSession } from '@/utils/SoundManager';
 import { getOnlineServerUrl } from '@/utils/serverConfig';
 import { applyServerNow, serverElapsedMs, serverNow, serverRemainingSec } from '@/utils/serverClock';
 import { getRoomSessionToken, peekRoomSessionToken, clearRoomSessionToken } from '@/utils/playerIdentity';
@@ -492,10 +492,12 @@ export default function LanBattleScreen() {
     seenEmojiIdsRef.current.add(msg.id);
     setActiveEmojis(prev => [...prev, { id: msg.id, playerId: msg.playerId, emoji: msg.emoji, receivedAt: Date.now() }]);
   }, []);
-  // 预加载常用音效并预热音频模式（联机对局同样播放走子音效，避免首声漏播）；退出对局时释放全部音效
+  // 占用音频会话（联机对局同样播放走子音效，避免首声漏播）。
+  // 【v5】引用计数：栈上可能同时存在多个会发声的屏（如 /spectate），
+  // 由最后一个使用者离开时才真正释放，避免先弹出的屏拆掉别人的音频。
   useEffect(() => {
-    preloadSounds();
-    return () => { unloadAllSounds(); };
+    void acquireSoundSession();
+    return () => { void releaseSoundSession(); };
   }, []);
   const gameStartTimeRef = useRef<number>(0);
   const [gameDuration, setGameDuration] = useState(0);

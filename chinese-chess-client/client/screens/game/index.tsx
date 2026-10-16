@@ -56,7 +56,7 @@ import {
 } from '@/utils/chess/offlineAiAdapter';
 import { getBestMoveOffline, getHintMoveOffline, type HybridMoveResult } from '@/utils/chess/aiDispatcher';
 import { isMoveBanned, enumerateLegalMoves, getMoveBanReason, banReasonNotice } from '@/utils/chess/RuleEngine';
-import { playSound, playJiangJunSound, unloadAllSounds, preloadSounds, preloadGameEndSounds } from '@/utils/SoundManager';
+import { playSound, playJiangJunSound, acquireSoundSession, releaseSoundSession } from '@/utils/SoundManager';
 import { RED_SIDE, BLACK_SIDE } from '@/utils/chess/types';
 // 【揭棋】被吃棋子显示：角位内容塞进 BoardEdgeSlot 的槽位，定位全交给「带」。
 // 分组口径见 utils/chess/jieqiCaptured（暗子只出背面图），
@@ -338,12 +338,17 @@ export default function GameScreen() {
   // 吃子/将军特效（含连续将军节流策略）
   const { moveEffect, triggerMoveEffect } = useMoveEffect();
 
-  // 加载存档；并在进入对局时预加载常用音效、预热音频模式
-  // （预加载会为每条音轨做一次静音预热，消除首步音效的按需加载延迟与
-  //   音轨首次入混的竞态；成因与对策详见 utils/SoundManager 头注释）
+  // 加载存档；并在进入对局时占用音频会话（预载常用音效、预热音频模式）
+  //
+  // 【v5】改用**引用计数**的会话占用（acquireSoundSession / releaseSoundSession）。
+  // 旧写法是每个会发声的屏各自 `preloadSounds()` + 在 useEffect([]) 清理里
+  // `unloadAllSounds()`。而导航用的是 router.push，同一个 Stack 上可以同时
+  // 叠着多个会发声的屏（lanGame 依次 push 过 /lanBattle 与 /spectate），
+  // 先弹出的那一屏的清理会拆掉仍在挂载的那些屏的音频，且它们不会重新预载
+  // ⇒ 越走越哑。引用计数保证"最后一个使用者离开才真正释放"。
+  // 会话内部持有音频焦点（见 utils/SoundManager 头注释第二、四节）。
   useEffect(() => {
-    preloadSounds();
-    preloadGameEndSounds();
+    acquireSoundSession();
     if (shouldContinueEndgame && initialEndgame && !loaded) {
       // 残局闯关：继续挑战（恢复局内存档）
       loadEndgameBattle().then((save) => {
@@ -425,9 +430,8 @@ export default function GameScreen() {
     } else {
       setLoaded(true);
     }
-    // 退出对局时释放全部音效资源（原生播放器与音频会话），
-    // 避免已加载音效被系统媒体会话持续识别为“无声播放中”
-    return () => { unloadAllSounds(); };
+    // 退出对局时释放音频会话（仅当没有其他会发声的屏仍在使用）
+    return () => { void releaseSoundSession(); };
   }, []);
 
   // 弹窗状态

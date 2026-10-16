@@ -40,7 +40,7 @@ import { capHostHeightToViewport } from '@/utils/chess/boardLayoutBudget';
 import { boardAlignedRowStyle } from '@/utils/chess/boardContentWidth';
 import { useBoardStyle } from '@/utils/chess/boardStyleStore';
 import { useBackgroundStyle } from '@/utils/chess/backgroundStyleStore';
-import { playSound, playJiangJunSound, preloadSounds, unloadAllSounds } from '@/utils/SoundManager';
+import { playSound, playJiangJunSound, acquireSoundSession, releaseSoundSession } from '@/utils/SoundManager';
 import { FONT } from '@/utils/typography';
 
 // 主题色 - 浅色复古系（与人机对战一致）
@@ -189,10 +189,11 @@ export default function ReplayPlayerScreen() {
   // 只读棋盘：所有交互为空操作
   const noop = useCallback(() => undefined, []);
 
-  // 预加载常用音效并预热音频模式（复盘"下一步"同样播放走子音效）；退出时释放
+  // 占用音频会话（复盘"下一步"同样播放走子音效）。
+  // 【v5】引用计数：最后一个使用者离开时才真正释放（见 utils/SoundManager）。
   useEffect(() => {
-    preloadSounds();
-    return () => { unloadAllSounds(); };
+    void acquireSoundSession();
+    return () => { void releaseSoundSession(); };
   }, []);
 
   // 下一步：前进一格并播放该步的走子音效（将军/吃子/走子）；滑块拖动与"上一步"不播音

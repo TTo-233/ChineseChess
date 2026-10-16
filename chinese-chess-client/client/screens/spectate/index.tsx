@@ -21,7 +21,7 @@ import GameBottomBar, {
   type GameMenuItem,
 } from '@/components/GameBottomBar';
 import { useMoveEffect } from '@/hooks/useMoveEffect';
-import { playJiangJunSound, playSound, preloadSounds, unloadAllSounds } from '@/utils/SoundManager';
+import { playJiangJunSound, playSound, acquireSoundSession, releaseSoundSession } from '@/utils/SoundManager';
 import { getOnlineServerUrl } from '@/utils/serverConfig';
 import { serverNow } from '@/utils/serverClock';
 import { BattleSocket } from '@/utils/battleSocket';
@@ -342,10 +342,12 @@ export default function SpectateScreen() {
     return () => clearInterval(timer);
   }, [activeEmojis.length]);
 
-  // 预加载常用音效并预热音频模式（观战同样播放走子音效，避免首声漏播）；退出观战时释放全部音效
+  // 占用音频会话（观战同样播放走子音效，避免首声漏播）。
+  // 【v5】引用计数：/lanBattle 与 /spectate 常同时挂在同一个栈上，
+  // 由最后一个使用者离开时才真正释放（见 utils/SoundManager）。
   useEffect(() => {
-    preloadSounds();
-    return () => { unloadAllSounds(); };
+    void acquireSoundSession();
+    return () => { void releaseSoundSession(); };
   }, []);
 
   // 进入观战：注册观战者并拉取初始快照
