@@ -71,12 +71,37 @@ type NativeState = {
   grantFocus: boolean | (() => boolean);
   /** requestAudioFocus 的累计调用次数（对应 AVManager.java:355） */
   focusRequests: number;
+  /**
+   * 【v6 真机取证】AudioPolicy 分配输出设备的延迟（毫秒）。
+   *
+   * 真机上（华为 PTP-AN10 / Android 17）实测到：ExoPlayer 起播的那一刻，
+   * AudioTrack 常常还没拿到输出设备（dumpsys 里 deviceIds 为空），
+   * 此时 updateVolumeMuteAndDuck() 算出的增益是 -inf；
+   * 而原生**不会**在设备就绪后再重算一次 ⇒ 音量永久停在近静音。
+   * 这个字段用来复现该现象：>0 表示前 N 毫秒内没有输出设备。
+   */
+  delayedGrantMs: number;
+  /** enableDelayedDeviceGrant 被调用的时刻 */
+  grantedAt: number;
 };
 
 let native: NativeState;
 
 function resetNative(): void {
-  native = { acquired: false, appPaused: false, grantFocus: true, focusRequests: 0 };
+  native = {
+    acquired: false,
+    appPaused: false,
+    grantFocus: true,
+    focusRequests: 0,
+    delayedGrantMs: 0,
+    grantedAt: Date.now(),
+  };
+}
+
+/** AudioPolicy 是否已经给 AudioTrack 分配了输出设备。 */
+function hasOutputDevice(): boolean {
+  if (native.delayedGrantMs <= 0) return true;
+  return Date.now() - native.grantedAt >= native.delayedGrantMs;
 }
 
 /** 对应 AVManager.java:339-360 acquireAudioFocus()。失败即抛（调用方据此中止）。 */
@@ -134,9 +159,20 @@ class FakeSound {
     return this.shouldPlay && this.effectiveVolume >= 0 && true;
   }
 
-  /** SimpleExoPlayerData.java:258-263 —— 无焦点一律 0f */
+  /**
+   * SimpleExoPlayerData.java:258-263 → AVManager.getVolumeForDuckAndFocus()
+   *
+   * 【v6】真实增益还要看 AudioPolicy 有没有给这条 AudioTrack 分配输出设备：
+   * 真机上设备常常晚几十~几百毫秒才就绪，期间 AudioFlinger 记的
+   * `G db` 就是 -inf。原生**只在这里**写一次音量，设备就绪后不会重算，
+   * 于是音量永久停在 -inf ⇒ 扬声器端只剩 -49dB 的近静音信号。
+   */
   private updateVolumeMuteAndDuck(): void {
-    this.effectiveVolume = native.acquired ? 1 : 0;
+    if (!native.acquired || !hasOutputDevice()) {
+      this.effectiveVolume = 0; // 真机对应 G db = -inf
+    } else {
+      this.effectiveVolume = 1;
+    }
   }
 
   /** 对应 PlayerData.java:316-379 的 setStatus 收尾 */
@@ -494,5 +530,102 @@ describe('【v5】实例环：连响必须落在不同实例上', () => {
     expect(at).toBeDefined();
     // 素材装载已完成，这里只应剩原生调用往返；给足 200ms 余量仍远小于 v3 的 260ms+重发
     expect(at! - t0).toBeLessThan(200);
+  }, 30000);
+});
+
+describe('【v6】真机取证修复：起播瞬间设备未就绪导致音量停在 -inf', () => {
+  // 真实故障（华为 PTP-AN10 / Android 17，2026-10 实测）：
+  //   · 扬声器输出线程信号功率稳定在 -49dB（正常应≈0dB）⇒ 有信号但小到听不见；
+  //   · dumpsys media.audio_flinger 里我们进程的音轨 AT::add 时 G db 即为 -inf；
+  //   · 18 个常驻实例中有 12 个拿不到输出设备（deviceIds 为空）。
+  // 成因：原生把音量写进播放器的唯一路径 updateVolumeMuteAndDuck()
+  //   只在 playAsync() 内部跑一次，那一刻 AudioPolicy 还没分配输出设备。
+  // 只有「起播后重复触发 playAsync」的修法才能让音量恢复正常。
+
+  function enableDelayedDeviceGrant(delayMs: number) {
+    native.delayedGrantMs = delayMs;
+    native.grantedAt = Date.now();
+  }
+
+  it('设备延迟就绪时，必须补推 playAsync 才能把音量写进播放器', async () => {
+    const sm = await loadSoundManager();
+    await sm.preloadSounds();
+    enableDelayedDeviceGrant(250);
+
+    void sm.playSound('go');
+    // 刚起播的瞬间还没拿到设备 ⇒ 这一遍必然是 0（真机 -inf）
+    const early = sounds.filter((s) => s.name === 'go').map((s) => s.effectiveVolume);
+    expect(Math.max(...early)).toBe(0);
+
+    // 等补推生效（>250ms）
+    await new Promise((r) => setTimeout(r, 600));
+
+    const later = sounds.filter((s) => s.name === 'go').map((s) => s.effectiveVolume);
+    // 关键断言：补推之后真的有实例拿到了非 0 音量
+    expect(Math.max(...later)).toBe(1);
+  }, 30000);
+
+  it('设备已就绪时（Web / 多数机型）行为不变，不引入额外延迟', async () => {
+    const sm = await loadSoundManager();
+    await sm.preloadSounds();
+    enableDelayedDeviceGrant(0);
+
+    const t0 = Date.now();
+    await sm.playSound('go');
+    const go = sounds.filter((s) => s.name === 'go');
+    // 首次起播就已经有音量（无需等补推）
+    expect(Math.max(...go.map((s) => s.effectiveVolume))).toBe(1);
+    const at = go.map((s) => s.audibleAt()).find((t): t is number => t !== null);
+    expect(at! - t0).toBeLessThan(200);
+  }, 30000);
+
+  it('补推不得依赖 setVolumeAsync（它不触发增益重算）', async () => {
+    const sm = await loadSoundManager();
+    await sm.preloadSounds();
+    enableDelayedDeviceGrant(250);
+
+    void sm.playSound('go');
+    await new Promise((r) => setTimeout(r, 600));
+
+    // 装载时的 setVolume(1) 是允许的（只有一次）；播放期间不得再有
+    for (const s of sounds) {
+      const playTimeSetVol = s.calls.filter(
+        (c) => c.op.startsWith('setVolume:') && c.op !== 'setVolume:1'
+      ).length;
+      expect(playTimeSetVol).toBe(0);
+    }
+    // 而补推确实发生过（playAsync 被再次调用）
+    const replays = sounds
+      .filter((s) => s.name === 'go')
+      .reduce((n, s) => n + s.calls.filter((c) => c.op === 'play').length, 0);
+    expect(replays).toBeGreaterThanOrEqual(2);
+  }, 30000);
+
+  it('常驻短音效实例数必须是 2（18 个实例时有 12 个拿不到输出设备）', async () => {
+    const sm = await loadSoundManager();
+    await sm.preloadSounds();
+    const snap = sm.__debugPoolSnapshot();
+    expect(snap.go).toBe(2);
+    expect(snap.eat).toBe(2);
+  }, 30000);
+
+  it('卸载必须取消在途的补推定时器（不给已卸载实例继续发指令）', async () => {
+    const sm = await loadSoundManager();
+    await sm.preloadSounds();
+
+    void sm.playSound('go');
+    // 立刻卸载：补推定时器最早在 90ms 才触发，这里必须抢在它前面。
+    await new Promise((r) => setTimeout(r, 10));
+    await sm.unloadAllSounds();
+    const before = sounds
+      .filter((s) => s.name === 'go')
+      .reduce((n, s) => n + s.calls.length, 0);
+    await new Promise((r) => setTimeout(r, 700));
+    const after = sounds
+      .filter((s) => s.name === 'go')
+      .reduce((n, s) => n + s.calls.length, 0);
+
+    // 卸载之后不应再有补推指令落到这些实例上
+    expect(after).toBe(before);
   }, 30000);
 });

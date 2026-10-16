@@ -87,6 +87,48 @@
  * HTMLAudioElement，没有上面的焦点机制；本版的 `setPositionAsync(0) + playAsync()`
  * 在 Web 上同样有效，且**不再需要** v3 为绕开「Web 的 setStatusForMedia 不处理
  * volume」而加的补拉音量分支。Web 与真机共用同一条代码路径，无需分叉。
+ *
+ * ===========================================================================
+ * v6：真机取证推翻了 v5 的部分结论
+ * ===========================================================================
+ * 拿到真机（华为 PTP-AN10 / Android 17 / SDK 37）后，用
+ * dumpsys media.audio_flinger + dumpsys audio 直接量到了事实，
+ * 结论与 v5 的推断**并不一致**，特此更正：
+ *
+ *   ① v5 认定「焦点申请失败导致 0f 音量」——**不成立**。
+ *      dumpsys audio 里的 requestAudioFocus 记录是
+ *      `AA=USAGE_MEDIA/... req=3 flags=0x0`，req=3 即
+ *      AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK，且**申请成功**；
+ *      全程只有 2 次申请，说明 v5 设计的"整局只申请一次焦点"确实生效了。
+ *
+ *   ② 真正的现象是**"有信号但小到听不见"**，不是"没有信号"：
+ *      扬声器输出线程（AUDIO_DEVICE_OUT_SPEAKER）的 Signal power history
+ *      在每次音效播放时稳定在 **-49.3dB / -47.3dB**，50ms 粒度下能看到
+ *      -43.5 / -42.8 / -40.7 —— 信号是真实存在的，只是比正常低约 45dB；
+ *      同期 `AT::remove` 行的 `FrmCnt=21216` 说明素材确实被完整推给了混音器。
+ *      ⇒ 所以"播放头不动"这个旧判断本身就是错的。
+ *
+ *   ③ 真正的根因是**音量被写成了 -inf（增益 0）**：
+ *      我们进程的音轨在 `AT::add` 那一刻 `G db` 就是 **-inf**（对照
+ *      STREAM_MUSIC=50/160、mutedState:none，排除系统静音/流静音）。
+ *
+ *   ④ 为什么是 -inf：原生把 JS 请求的音量写进播放器的**唯一**路径是
+ *      `SimpleExoPlayerData.updateVolumeMuteAndDuck()`，它**只在
+ *      playAsync() 内部被调用一次**（SimpleExoPlayerData.java:154）。
+ *      那一刻 ExoPlayer 刚起播，**AudioPolicy 还没给这条 AudioTrack
+ *      分配输出设备**（dumpsys audio 里 18 个实例有 12 个
+ *      `deviceIds:[]`，6 个 `deviceIds:[2]`=扬声器）；
+ *      没有输出设备 ⇒ 增益 -inf。等设备分配完成，原生**不会**再重算音量，
+ *      音量就此永久停在 -inf —— 这才是"声音小到听不见"的来源。
+ *
+ *   ⑤ 因此修法有两条（本版实施）：
+ *      a) **起播后重复触发 playAsync()**（VOLUME_REINFORCE_DELAYS_MS）。
+ *         每触发一次原生就重跑一遍 updateVolumeMuteAndDuck()，设备就绪后
+ *         增益随之恢复正常。注意必须用 playAsync()：
+ *         setVolumeAsync() 走 applyNewStatus，**不**触发增益重算，写了也白写。
+ *      b) **把常驻实例数从 4 降到 2**（SHORT_RING_SIZE）。每个 AudioTrack 都要
+ *         向 AudioPolicy 申请输出设备，实例过多时相当一部分拿不到，
+ *         那些实例等于白建。
  */
 
 import { Audio } from 'expo-av';
@@ -108,12 +150,14 @@ const SOURCES: Record<string, number> = {
 /**
  * 短音效（走子/吃子/选子/走错）的实例环大小。
  *
- * 取 4 的理由：最短的连响是「我方走子 → AI 应招」，间隔 300ms
- * （screens/game 无特效时 aiDelay=300），而走子素材 275~406ms，
- * 也就是说第二声响起时第一声**还在播**。4 个实例 ⇒ 环形轮转的间隔下界
- * 4×406≈1.6s，远大于任何现实的连续落子速度，不会出现"抢占正在播的实例"。
+ * ⚠️ 真机取证（华为 PTP-AN10 / Android 17，2026-10）后**由 4 改为 2**：
+ * 每个 AudioTrack 都要向AudioPolicy 申请一个输出设备，而该机型上
+ * **同时存活 18 个实例时有 12 个拿不到设备**（`deviceIds:[]`），
+ * 那些实例的增益恒为 -inf、永远推不动播放头，等于白建。
+ * 2 个实例已足够覆盖「我方走子（~300ms）→ 300ms 后 AI 应招」这一最短连响，
+ * 且把常驻实例数压到系统能全部分配的水平。
  */
-const SHORT_RING_SIZE = 4;
+const SHORT_RING_SIZE = 2;
 
 /** 长音效（胜负语音、将军语音）的实例环大小：这类素材本身就很长，不需要并发。 */
 const LONG_RING_SIZE = 1;
@@ -138,6 +182,34 @@ const MAX_PLAY_ATTEMPTS = 3;
 
 /** 失败重试前的等待时间：给系统一点时间完成焦点的授予/回收。 */
 const RETRY_BACKOFF_MS = 60;
+
+/**
+ * 起播后「补推音量」的重试间隔（毫秒）。
+ *
+ * 这是本版最关键的一处修复。真机取证（华为 PTP-AN10 / Android 17）：
+ *   · 扬声器输出线程的信号功率在每次音效播放时稳定在 **-49dB**，
+ *     而正常播放应在 0dB 附近 ⇒ 声音"有信号但小到听不见"；
+ *   · 同期 dumpsys media.audio_flinger 里我们进程的音轨
+ *     `AT::add` 时 `G db` 就是 **-inf**，`FrmCnt` 在 add 时为 0；
+ *   · 18 个常驻实例里有 12 个 `deviceIds` 为空，即拿不到输出设备。
+ *
+ * 成因：原生把 JS 请求的音量写入播放器的**唯一**路径是
+ * `SimpleExoPlayerData.updateVolumeMuteAndDuck()`，而它**只在
+ * playAsync() 内部被调用一次**（SimpleExoPlayerData.java:154）。
+ * 那一刻 ExoPlayer刚起播，AudioPolicy 还没给这条 AudioTrack 分配输出设备，
+ * gain 算出来是 -inf；等设备分配完成，原生**不会**再重算一次音量，
+ * 音量就此永久停在近静音状态。
+ *
+ * 而 `setVolumeAsync()` 走的是 setStatus → applyNewStatus，
+ * **不会**触发 updateVolumeMuteAndDuck，所以单靠它无效；
+ * 必须让播放器**再走一次 playAsync**（即再进一次
+ * playPlayerWithRateAndMuteIfNecessary）才会重算并写入真实音量。
+ *
+ * 时点选取：实测设备就绪要 200~400ms，故窗口取到 500ms，
+ * 覆盖低端机最慢的情况；这些都是 setTimeout 异步补推，
+ * **不阻塞** playSound 返回，也不推迟起播。
+ */
+const VOLUME_REINFORCE_DELAYS_MS = [0, 90, 220, 360, 500];
 
 // ---------------------------------------------------------------------------
 // 类型
@@ -179,6 +251,14 @@ let sessionId = 0;
 let audioModeReady = false;
 
 let appStateBound = false;
+
+/**
+ * 在途的「补推音量」定时器。
+ *
+ * 卸载全部音效时必须把它们清掉：否则已卸载的实例还会被继续下指令，
+ * 既浪费 native 调用，也会在会话作废后又把音量写到不该存在的播放器上。
+ */
+const activeReinforceTimers = new Set<Array<ReturnType<typeof setTimeout>>>();
 
 // ---------------------------------------------------------------------------
 // 音频模式
@@ -348,20 +428,58 @@ function hasRing(name: string): boolean {
 // 播放
 // ---------------------------------------------------------------------------
 
-/** 对单个实例起播。抛出的异常由调用方处理（换实例重试）。 */
-async function startSlot(slot: Slot): Promise<void> {
+/**
+ * 起播并**确保音量真的落到播放器上**。抛出的异常由调用方处理（换实例重试）。
+ *
+ * 起播后必须在多个时点**重复触发一次 playAsync()**：每触发一次，
+ * 原生都会重跑一遍 playPlayerWithRateAndMuteIfNecessary()，
+ * 其中的 updateVolumeMuteAndDuck() 才会把当前音量写进播放器。
+ * 起播瞬间 AudioPolicy 往往还没分配输出设备（deviceIds 为空），
+ * 那一次算出来的增益是 -inf；稍后再触发一次，设备已就绪，
+ * 增益才恢复正常（成因与真机数据见VOLUME_REINFORCE_DELAYS_MS 的注释）。
+ *
+ * 注意这里用的是 playAsync() 而不是 setVolumeAsync()：
+ * 后者走 setStatus → applyNewStatus，**不会**调用
+ * updateVolumeMuteAndDuck，写进去的值不会生效。
+ */
+async function startSlot(slot: Slot, isAlive: () => boolean): Promise<void> {
   // 回到开头：素材播完后播放器停在 STATE_ENDED，此时把 playWhenReady
   // 重新置 true **不会**让它继续播，必须先 seek 离开 ENDED。
   //
   // ⚠️ 这里刻意**不用** pauseAsync()：它会连带把 mShouldPlay 置 false，
   // 从而让 requiresAudioFocus() 为假、原生在 setStatus 收尾时放弃音频焦点
-  // （PlayerData.java:377 → AVManager.java:372-379）。焦点一丢，
-  // 下一声的 playAsync 就要重新申请，而申请失败时原生会跳过
-  // "更新音量"与"开始播放"两行（SimpleExoPlayerData.java:151-158），
-  // 结果就是整条音轨从头到尾音量 0f、播放头不动 —— 完全无声。
+  // （PlayerData.java:377 → AVManager.java:372-379）。
   // setPositionAsync 只传 positionMillis，不碰 mShouldPlay，焦点得以保留。
   await slot.sound.setPositionAsync(0);
   await slot.sound.playAsync();
+
+  // 补推音量：不 await 整段，避免把音效的起播延迟到 500ms 之后。
+  // 每一步都在会话仍有效时才动手，防止给已卸载的实例继续发指令。
+  const timers: Array<ReturnType<typeof setTimeout>> = [];
+  for (const delay of VOLUME_REINFORCE_DELAYS_MS) {
+    if (delay === 0) continue; // 第 0 次就是上面那次 playAsync
+    const timer = setTimeout(() => {
+      if (!isAlive()) return;
+      // 只重播当前位置，不回到开头：此时播放头正处在素材中段，
+      // 再 seek 一次反而会把已经播出的部分截掉、并可能让重播超过素材末尾。
+      void slot.sound.playAsync().catch(() => {
+        /* 补推失败无所谓：真正的兜底是外层的换实例重试 */
+      });
+    }, delay);
+    timers.push(timer);
+  }
+
+  // 最后一个定时器负责把这一组从注册表里摘掉，避免 Set 无限增长。
+  // 必须与补推定时器**放在同一个数组**里，否则 unloadAllSounds
+  // 清空注册表后，这个清理定时器仍会存活并对已卸载的实例做计数。
+  const lastDelay = VOLUME_REINFORCE_DELAYS_MS[VOLUME_REINFORCE_DELAYS_MS.length - 1];
+  timers.push(
+    setTimeout(() => {
+      activeReinforceTimers.delete(timers);
+    }, lastDelay + 50)
+  );
+
+  activeReinforceTimers.add(timers);
 }
 
 /**
@@ -399,7 +517,7 @@ export async function playSound(name: string): Promise<void> {
 
       const slot = acquireSlot(ring);
       try {
-        await startSlot(slot);
+        await startSlot(slot, () => mySession === sessionId);
         return; // resolve 即代表这一遍确实在出声（见头注释第四节第 3 点）
       } catch (e) {
         console.warn(`[SoundManager] 播放 '${name}' 第 ${attempt + 1} 次失败（多为音频焦点未获批），换实例重试:`, e);
@@ -498,6 +616,13 @@ export async function releaseSoundSession(): Promise<void> {
 export async function unloadAllSounds(): Promise<void> {
   sessionId++;
   ringTasks.clear();
+
+  // 取消在途的补推音量定时器：会话已作废，且实例即将被卸载，
+  // 再往下发指令只会打到不存在的播放器上。
+  for (const timers of activeReinforceTimers) {
+    for (const t of timers) clearTimeout(t);
+  }
+  activeReinforceTimers.clear();
 
   const pending: Promise<unknown>[] = [];
   for (const [, ring] of rings) {
