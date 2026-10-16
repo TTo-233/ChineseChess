@@ -89,46 +89,39 @@
  * volume」而加的补拉音量分支。Web 与真机共用同一条代码路径，无需分叉。
  *
  * ===========================================================================
- * v6：真机取证推翻了 v5 的部分结论
+ * v7：真机取证第三次更正——真正的根因是「音频被切到电话通信路由」
  * ===========================================================================
- * 拿到真机（华为 PTP-AN10 / Android 17 / SDK 37）后，用
- * dumpsys media.audio_flinger + dumpsys audio 直接量到了事实，
- * 结论与 v5 的推断**并不一致**，特此更正：
+ * 前两版的推断都被设备数据推翻了，这一版才是最终结论。
  *
- *   ① v5 认定「焦点申请失败导致 0f 音量」——**不成立**。
- *      dumpsys audio 里的 requestAudioFocus 记录是
- *      `AA=USAGE_MEDIA/... req=3 flags=0x0`，req=3 即
- *      AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK，且**申请成功**；
- *      全程只有 2 次申请，说明 v5 设计的"整局只申请一次焦点"确实生效了。
+ * v6 曾依据「扬声器 -49dB、AT::add 增益 -inf」判断是
+ * 「起播瞬间设备未就绪导致音量写不进去」，据此加了补推 playAsync。
+ * **真机 dumpsys audio 显示了那一切的真正来源**：
  *
- *   ② 真正的现象是**"有信号但小到听不见"**，不是"没有信号"：
- *      扬声器输出线程（AUDIO_DEVICE_OUT_SPEAKER）的 Signal power history
- *      在每次音效播放时稳定在 **-49.3dB / -47.3dB**，50ms 粒度下能看到
- *      -43.5 / -42.8 / -40.7 —— 信号是真实存在的，只是比正常低约 45dB；
- *      同期 `AT::remove` 行的 `FrmCnt=21216` 说明素材确实被完整推给了混音器。
- *      ⇒ 所以"播放头不动"这个旧判断本身就是错的。
+ *     setCommunicationRouteForClient for uid: 10430 device: type:speaker
+ *       from API: setSpeakerphoneOn(true) from u/pid:10430/12898
+ *     updateCommunicationRoute, preferredCommunicationDevice: type:speaker
  *
- *   ③ 真正的根因是**音量被写成了 -inf（增益 0）**：
- *      我们进程的音轨在 `AT::add` 那一刻 `G db` 就是 **-inf**（对照
- *      STREAM_MUSIC=50/160、mutedState:none，排除系统静音/流静音）。
+ * 即：**本应用自己把音频路由切到了通信扬声器**。它同时解释了此前所有异常——
+ * 输出线程出现 `AUDIO_OUTPUT_FLAG_INCALL_MUSIC`、出现 earpiece 输出线程、
+ * 音轨 `AT::add` 增益 -inf、扬声器端只剩 -49dB（通信路由下的音效走的是
+ * 电话听筒的音量曲线，本来就不该从媒体扬声器出声）。
+ * 补推多少次 playAsync 都没用：路由不对，增益永远算不对。
  *
- *   ④ 为什么是 -inf：原生把 JS 请求的音量写进播放器的**唯一**路径是
- *      `SimpleExoPlayerData.updateVolumeMuteAndDuck()`，它**只在
- *      playAsync() 内部被调用一次**（SimpleExoPlayerData.java:154）。
- *      那一刻 ExoPlayer 刚起播，**AudioPolicy 还没给这条 AudioTrack
- *      分配输出设备**（dumpsys audio 里 18 个实例有 12 个
- *      `deviceIds:[]`，6 个 `deviceIds:[2]`=扬声器）；
- *      没有输出设备 ⇒ 增益 -inf。等设备分配完成，原生**不会**再重算音量，
- *      音量就此永久停在 -inf —— 这才是"声音小到听不见"的来源。
+ * 触发链（expo-av 16.0.8，AVManager.java）：
+ *   JS `Audio.setAudioModeAsync(payload)`
+ *     → AVManager.setAudioMode(map)                          :406
+ *     → if (map.containsKey(PLAY_THROUGH_EARPIECE))         :413 ← 只要 key 存在就进
+ *     → updatePlaySoundThroughEarpiece(mShouldRouteThroughEarpiece) :415
+ *     → mAudioManager.setMode(...)                          :393
+ *     → mAudioManager.setSpeakerphoneOn(true)               :394 ← 元凶
  *
- *   ⑤ 因此修法有两条（本版实施）：
- *      a) **起播后重复触发 playAsync()**（VOLUME_REINFORCE_DELAYS_MS）。
- *         每触发一次原生就重跑一遍 updateVolumeMuteAndDuck()，设备就绪后
- *         增益随之恢复正常。注意必须用 playAsync()：
- *         setVolumeAsync() 走 applyNewStatus，**不**触发增益重算，写了也白写。
- *      b) **把常驻实例数从 4 降到 2**（SHORT_RING_SIZE）。每个 AudioTrack 都要
- *         向 AudioPolicy 申请输出设备，实例过多时相当一部分拿不到，
- *         那些实例等于白建。
+ * **关键**：写成 `playThroughEarpieceAndroid: false` 同样会触发上述整条链，
+ * 只是把开关拨到另一个方向。唯一安全的做法是**不在 payload 里放这个 key**。
+ *
+ * 因此 v5 关于「焦点」的结论、v6 关于「设备延迟就绪」的结论都不成立：
+ *   · 焦点：真机 requestAudioFocus 是 req=3 且申请成功，从未失败；
+ *   · 增益补推：路由被切到通信路由时，重算多少次都是通信路由的音量。
+ * 两者都在处理症状，没有触及路由这个根因。
  */
 
 import { Audio } from 'expo-av';
@@ -267,18 +260,32 @@ const activeReinforceTimers = new Set<Array<ReturnType<typeof setTimeout>>>();
 /**
  * 下发音频模式。幂等；失败时会把标记复位，下次调用会重试。
  *
- * 注意：`setAudioModeAsync` **不会**修改原生侧的 `mAcquiredAudioFocus`
- * （AVManager.java:405-429 只动 mIsDuckingAudio 与 mStaysActiveInBackground），
- * 所以它**不是**修复焦点丢失的手段——真正的手段见 `resetFocusForRetry`。
- * 这里只负责静音开关、duck 策略这些常规设置。
+ * ⚠️ **绝不传 `playThroughEarpieceAndroid`**（2026-10-17 真机取证，第三次）。
+ * 只要 payload 里出现这个 key，expo-av 就会立刻执行
+ * `AVManager.updatePlaySoundThroughEarpiece()`（AVManager.java:414-415），
+ * 而该函数**无论取值真假都会**：
+ *       mAudioManager.setMode(...);            // 切音频模式
+ *       mAudioManager.setSpeakerphoneOn(true); // 切到通信扬声器
+ * 即使写成 `false` 也一样触发——开关被拨动了，只是拨到另一个方向。
+ *
+ * 真机 dumpsys audio 抓到的现场（uid 10430 = 本应用）：
+ *       setCommunicationRouteForClient ... type:speaker
+ *         from API: setSpeakerphoneOn(true) from u/pid:10430/12898
+ *       updateCommunicationRoute, preferredCommunicationDevice: type:speaker
+ * 后果是音频被切到**电话通信路由**：输出线程出现
+ * `AUDIO_OUTPUT_FLAG_INCALL_MUSIC`、音轨 `AT::add` 时增益为 -inf、
+ * 扬声器端只剩 -49dB 的近静音信号 —— 也就是用户听不到的根因。
+ * 前两版（v5 的焦点问题、v6 的增益补推）方向都不对，这条才是。
+ *
+ * 另外 `shouldDuckAndroid: false` 也是必需的：它让原生把
+ * mIsDuckingAudio 置 false，避免被导航音/提示音压低半音量。
  */
 async function ensureAudioMode(): Promise<void> {
   if (audioModeReady) return;
   try {
     await Audio.setAudioModeAsync({
       playsInSilentModeIOS: true,
-      shouldDuckAndroid: false, // 不被导航音/提示音压低半音量
-      playThroughEarpieceAndroid: false,
+      shouldDuckAndroid: false,
       staysActiveInBackground: false,
     });
     audioModeReady = true;

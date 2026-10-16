@@ -629,3 +629,60 @@ describe('【v6】真机取证修复：起播瞬间设备未就绪导致音量�
     expect(after).toBe(before);
   }, 30000);
 });
+
+describe('【v7】真机根因：音频模式绝不携带 earpiece key', () => {
+  // 真机取证（2026-10-17，第三次）：
+  //   dumpsys audio 里出现
+  //     setCommunicationRouteForClient for uid: 10430 device: type:speaker
+  //       from API: setSpeakerphoneOn(true) from u/pid:10430/12898
+  //     updateCommunicationRoute, preferredCommunicationDevice: type:speaker
+  //   即本应用把音频切到了**电话通信路由**。这是所有症状的根因：
+  //   输出线程 AUDIO_OUTPUT_FLAG_INCALL_MUSIC、音轨增益 -inf、
+  //   扬声器只剩 -49dB 近静音。
+  //
+  // 触发链（expo-av AVManager.java:413-415 → :393-394）：
+  //   只要 setAudioModeAsync 的 payload **含有** playThroughEarpieceAndroid
+  //   这个 key（哪怕值是 false），就会执行
+  //       setMode(...) + setSpeakerphoneOn(true)
+  //   把音频路由切到通信扬声器。唯一安全的做法是整个 key 都不放。
+
+  it('setAudioModeAsync 的 payload 绝不含 playThroughEarpieceAndroid', async () => {
+    const sm = await loadSoundManager();
+    await sm.preloadSounds();
+
+    const calls = (Audio.setAudioModeAsync as jest.Mock).mock.calls;
+    expect(calls.length).toBeGreaterThanOrEqual(1);
+    for (const [payload] of calls) {
+      expect(payload).toBeDefined();
+      // 核心断言：这个 key 一个都不能出现
+      expect(Object.keys(payload as object)).not.toContain('playThroughEarpieceAndroid');
+      expect('playThroughEarpieceAndroid' in (payload as object)).toBe(false);
+    }
+  }, 30000);
+
+  it('音频模式仍应显式关闭 duck（否则被提示音压低半音量）', async () => {
+    const sm = await loadSoundManager();
+    await sm.preloadSounds();
+
+    const [payload] = (Audio.setAudioModeAsync as jest.Mock).mock.calls.at(-1)!;
+    expect(payload).toMatchObject({
+      playsInSilentModeIOS: true,
+      shouldDuckAndroid: false,
+      staysActiveInBackground: false,
+    });
+  }, 30000);
+
+  it('即便走 resetFocusForRetry 重下音频模式，也不会带上 earpiece key', async () => {
+    const sm = await loadSoundManager();
+    await sm.preloadSounds();
+
+    // 播放失败会触发 resetFocusForRetry → 重新下发音频模式
+    native.grantFocus = false;
+    await sm.playSound('go');
+
+    const calls = (Audio.setAudioModeAsync as jest.Mock).mock.calls;
+    for (const [payload] of calls) {
+      expect(Object.keys(payload as object)).not.toContain('playThroughEarpieceAndroid');
+    }
+  }, 30000);
+});
