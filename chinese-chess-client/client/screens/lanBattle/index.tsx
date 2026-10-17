@@ -2730,7 +2730,7 @@ export default function LanBattleScreen() {
                 ref 用于点按瞬间实测窗口坐标锚定下拉栏；onLayout 值仅作回退锚点 */}
             <View
               ref={myNameRowRef}
-              style={[styles.nameRow, styles.nameRowMe, nameRowStyle, { zIndex: 40 }]}
+              style={[styles.nameRow, styles.nameRowMe, nameRowStyle]}
               pointerEvents="box-none"
               onLayout={(e) => {
                 const { y, height } = e.nativeEvent.layout;
@@ -3241,6 +3241,9 @@ export default function LanBattleScreen() {
           hidden={bottomBarHidden}
           actions={lanBarActions}
           menuItems={lanMenuItems}
+          // 弹出卡片固定与按钮行同宽（见 GameBottomBarProps.popupWidthMode）：
+          // 卡片上沿与我方名角标行纵向相邻，宽度随按键数变化会与角标边界"错位"。
+          popupWidthMode="row"
         />
       </View>
     </Screen>

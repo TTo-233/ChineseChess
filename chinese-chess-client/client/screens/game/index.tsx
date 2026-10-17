@@ -1703,10 +1703,26 @@ const styles = StyleSheet.create({
     // 药丸宽度 = 文案宽度，角位带保证左端与右端内容不重叠（见 BoardEdgeSlot 文件头上界论证）。
   },
   // 残局说明入口：贴在引擎标识角标右侧（标题栏下线后无处安放说明弹窗触发器）
+  //
+  // 【C-93】与 AI 药丸的垂直对齐（2026-10 实机：说明标识比药丸「稍微靠下」）。
+  // 成因：顶带是 flexDirection:'row' + alignItems:'flex-end'（见 BoardEdgeSlot 约束 2），
+  // 两个子项都贴**同一条下沿**。药丸 aiNameChip 高 ≈ AI_ROW_MIN_HEIGHT(26)，
+  // 而本盒原先只有 padding:2 ⇒ 高 = 图标 14 + 上下 4 = 18。
+  // 两者下沿齐平、高度却不同 ⇒ 中心线必然错开 (26-18)/2 = 4px，图标看着就偏下。
+  //
+  // 修法不是加负 margin 去凑数字，而是**让两个盒子等高**：
+  // 本盒高度锁 AI_ROW_MIN_HEIGHT，内部双向居中，于是
+  //   药丸中心 = 下沿 - 13，本盒中心 = 下沿 - 13 ⇒ 圆点/文案与图标共线。
+  // 用「固定高度 + 贴下沿」而不是 alignSelf:'stretch'：若某天被吃棋子把带撑高，
+  // stretch 会让本盒居中到**带**的中心，而药丸仍贴下沿，对齐反而再次跑掉；
+  // 固定高度的两个盒子都锚在下沿，相对关系不受带高影响。
   aiNameRowInfo: {
     marginLeft: 8,
     padding: 2,
     flexShrink: 0,
+    height: AI_ROW_MIN_HEIGHT,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   // 棋盘 + 底部操作栏的内容宿主（顶部标题栏已于 2026-10 下线，宿主直接顶到安全区下方）
   boardHost: {

@@ -135,6 +135,15 @@ export interface GameBottomBarProps {
   barBackgroundImage?: ImageSourcePropType;
   /** 按钮行宽度样式（跟随棋盘本体宽度，见 boardAlignedRowStyle）；未传则铺满通栏 */
   widthStyle?: object;
+  /**
+   * 弹出卡片宽度策略：
+   *   'auto'（默认）= 先取「两个按键槽宽」，再用 [POPUP_MIN_CARD_WIDTH, 行宽×78%] 夹取；
+   *   'row' = 固定与按钮行**同宽**（卡片左右边缘与底栏按钮行严格对齐，不再随按键数变化）。
+   *
+   * lanBattle 用 'row'：该页弹窗与棋盘右下角的我方名角标在纵向相邻，
+   * 卡片忽宽忽窄会让两者的边界看起来"错位"；锁死成行宽后卡片与底栏成为同一条竖向版心。
+   */
+  popupWidthMode?: 'auto' | 'row';
   /** 外层附加样式（如上边距） */
   style?: object;
 }
@@ -146,6 +155,7 @@ export default function GameBottomBar({
   bottomInset = 0,
   barBackgroundImage,
   widthStyle,
+  popupWidthMode = 'auto',
   style,
 }: GameBottomBarProps) {
   const [menuOpen, setMenuOpen] = useState(false);
@@ -255,6 +265,7 @@ export default function GameBottomBar({
             anchorIndex={menuIndex}
             actionCount={actions.length}
             rowWidth={rowWidth}
+            widthMode={popupWidthMode}
             onBackdropPress={closeMenu}
             onItemPress={handleMenuItem}
           />
@@ -275,6 +286,8 @@ interface PopupMenuProps {
   actionCount: number;
   /** 按钮行实测宽度（px）；0 = 首帧尚未测量，回退到屏幕宽 */
   rowWidth: number;
+  /** 见 GameBottomBarProps.popupWidthMode */
+  widthMode: 'auto' | 'row';
   onBackdropPress: () => void;
   onItemPress: (item: GameMenuItem) => void;
 }
@@ -321,6 +334,7 @@ function PopupMenu({
   anchorIndex,
   actionCount,
   rowWidth,
+  widthMode,
   onBackdropPress,
   onItemPress,
 }: PopupMenuProps) {
@@ -342,11 +356,18 @@ function PopupMenu({
   const effectiveRowWidth = rowWidth > 0 ? rowWidth : windowWidth;
   const slots = Math.max(actionCount, 1);
   const slotWidth = effectiveRowWidth / slots;
-  const cardWidth = Math.max(
-    POPUP_MIN_CARD_WIDTH,
-    Math.min(slotWidth * 2, effectiveRowWidth * POPUP_MAX_CARD_FRACTION)
-  );
-  // 卡片水平居中于锚点按钮（菜单键），再整体夹进行内避免贴边
+  // 'row' 模式：宽度恒定等于按钮行宽 —— 不再随按键数/槽宽变化，
+  // 卡片左右边缘与底栏按钮行严格对齐（lanBattle 的需求，见 popupWidthMode 注释）。
+  // 'auto' 模式：先取「两个按键槽宽」，再用 [下限, 行宽×上限] 夹一次。
+  const cardWidth =
+    widthMode === 'row'
+      ? effectiveRowWidth
+      : Math.max(
+          POPUP_MIN_CARD_WIDTH,
+          Math.min(slotWidth * 2, effectiveRowWidth * POPUP_MAX_CARD_FRACTION)
+        );
+  // 卡片水平居中于锚点按钮（菜单键），再整体夹进行内避免贴边。
+  // 'row' 模式下卡片与行等宽，左边缘恒为 0（公式自动得出同一结果，无需分支）。
   const anchorCenter =
     anchorIndex >= 0 && actionCount > 0 ? (anchorIndex + 0.5) * slotWidth : slotWidth / 2;
   const cardLeft = Math.max(

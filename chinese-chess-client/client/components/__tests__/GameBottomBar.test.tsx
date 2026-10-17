@@ -275,6 +275,63 @@ describe('GameBottomBar 按键回调契约', () => {
     });
   });
 
+  /**
+   * lanBattle 要求：弹出卡片宽度**固定等于按钮行宽**（与下方菜单项同宽）。
+   *
+   * 该页我方名角标行贴在卡片正上方，卡片宽度随按键数（等待 2 键 / 对局 4 键 /
+   * 结束 3 键）忽宽忽窄时，两者的左右边界对不齐，实机看起来就是"错位"。
+   * 因此新增 popupWidthMode='row'：宽度恒等于实测行宽，左右边缘与底栏严格对齐。
+   */
+  describe("popupWidthMode='row'：卡片固定与按钮行同宽", () => {
+    function openRowMenu(actions: GameBottomBarActionInput[], rowWidth: number) {
+      const tree = renderBar(
+        <GameBottomBar actions={actions} menuItems={MENU_ITEMS} popupWidthMode="row" />
+      );
+      layoutRow(tree, rowWidth);
+      act(() => {
+        pressByLabel(tree, '菜单').props.onPress();
+      });
+      return tree;
+    }
+
+    it('宽度恒等于实测行宽，与按键数无关', () => {
+      // 同一行宽下，4 键与 2 键的卡片宽度必须完全一致（槽宽不再参与）
+      const narrow = openRowMenu(NARROW_ACTIONS, 400);
+      const wide = openRowMenu(WIDE_ACTIONS, 400);
+      expect(cardWidth(narrow)).toBe(400);
+      expect(cardWidth(wide)).toBe(400);
+    });
+
+    it('卡片左右边缘与按钮行严格对齐（left 恒为 0）', () => {
+      for (const rowWidth of [320, 400, 640, 900]) {
+        const tree = openRowMenu(NARROW_ACTIONS, rowWidth);
+        const { left, width } = cardBox(tree);
+        expect(left).toBe(0);
+        expect(width).toBe(rowWidth);
+        expect(left + width).toBe(rowWidth);
+      }
+    });
+
+    it("'auto' 模式仍保持原自适应行为（未被 row 模式改写）", () => {
+      // 回归护栏：默认行为必须仍是「两槽 + 上下限夹取」，否则人机/回放页观感回退
+      const auto = openMenu(NARROW_ACTIONS, 400);
+      expect(cardWidth(auto)).not.toBe(400);
+    });
+
+    it('指向三角仍正对菜单键，且不越过卡片边界', () => {
+      const rowWidth = 400;
+      const tree = openRowMenu(NARROW_ACTIONS, rowWidth);
+      const arrow = tree.root.findByProps({ testID: 'game-bottom-bar-popup-arrow' });
+      const arrowStyle = StyleSheet.flatten(arrow.props.style) as Record<string, unknown>;
+      const arrowLeft = (arrowStyle.left as number) + (arrowStyle.marginLeft as number);
+      const anchorCenter = (rowWidth / NARROW_ACTIONS.length) / 2;
+
+      expect(arrowLeft).toBeGreaterThanOrEqual(0);
+      expect(arrowLeft).toBeLessThanOrEqual(rowWidth);
+      expect(Math.abs(arrowLeft - anchorCenter)).toBeLessThan(ARROW_HALF_SIZE * 2);
+    });
+  });
+
   describe('收起后的弹层必须彻底不参与命中测试（2026-10 线上问题：底栏上方隐形按钮）', () => {
     /**
      * 线上症状：菜单收起后，底栏正上方仍有一块看不见但能点的区域，
