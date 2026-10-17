@@ -170,6 +170,18 @@ config.resolver.blockList = [
 
   // 5. pnpm 临时目录（避免 ENOENT 错误）
   /.*node_modules\/\.pnpm\/.*_tmp_\d+.*/,
+
+  // 6. write-file-atomic 的 .tmpdir 临时目录（避免 dev server 启动即崩）
+  // 实测崩过三次，路径形如：
+  //   client/.declarations.d.ts.<pid>.<uuid>.tmpdir
+  //   client/utils/chess/pikafish/.nativeAsset.ts.<pid>.<uuid>.tmpdir
+  // Metro 的 FallbackWatcher（Windows 无原生 watcher 时的回退）在目录扫描中
+  // 对这种「瞬时存在的目录」注册 fs.watch，目录在注册完成前就被原子写流程
+  // 删除/改名，watch 回调抛 ENOENT → @expo/cli 全局错误处理直接 throw，
+  // dev server 退出（exit 1）。blockList 正是 watcher 的过滤口径
+  // （metro/src/node-haste/DependencyGraph/createFileMap.js getIgnorePattern），
+  // 加入后这些临时目录不再被 walk/watch；它们本来也不是模块，对模块图零影响。
+  /.*\.tmpdir$/,
 ];
 
 
