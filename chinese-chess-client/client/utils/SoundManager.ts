@@ -122,6 +122,55 @@
  *   · 焦点：真机 requestAudioFocus 是 req=3 且申请成功，从未失败；
  *   · 增益补推：路由被切到通信路由时，重算多少次都是通信路由的音量。
  * 两者都在处理症状，没有触及路由这个根因。
+ *
+ * ===========================================================================
+ * v8：第四次真机取证——v5 的核心不变式被证伪；死轨必须重建而非重发
+ * ===========================================================================
+ * 路由修好（v7）之后，同一台真机（PTP-AN10）的 dumpsys media.audio_flinger
+ * 显示出**两种**此前被混为一谈的故障形态：
+ *
+ *   A.【播放了，但增益极低】（音量 3/16 时）
+ *      音轨 Server 正常推进 300~500ms（素材完整渲染），
+ *      `G db` ≈ -39 —— 这正是华为音量曲线把 3/16 映射到的值。
+ *      功率历史峰值 -48~-60dB，扬声器上几乎不可闻。
+ *      ⇒ **这不是 bug**：App 不该劫持系统媒体音量；用户把媒体音量调高即恢复
+ *        （13/16 时同一链路实测功率峰值 -19.4dB，清晰可闻）。
+ *
+ *   B.【死轨：播放器 resolve 了，混音器却一帧都没消费】（任何音量下偶发）
+ *      真机实测（22:02，音量 13/16）：
+ *        AT::add   G db=-inf  PortVol=-6.3  FrmRdy=19008（数据全就绪）
+ *        AT::remove G db=-inf  Server=0（0 帧被混音器消费）Flags=0x008(terminated)
+ *      同一时刻 dumpsys audio 里 requestAudioFocus(req=3) 成功、焦点就在本应用。
+ *      即：**JS 侧 playAsync() 成功 resolve，而原生播放器既没推进播放头、
+ *      增益也没写入** —— AudioFlinger 从未激活这条音轨。
+ *
+ *      由此，v5 的关键断言「playAsync() resolve ⇒ 音量必然已写入、必然在播」
+ *      **被真机证伪**。而 v6 的定时补推 playAsync 对形态 B 无效：
+ *      ExoPlayer 的 playWhenReady 已是 true，再调 playAsync 是 no-op，
+ *      不会触发 TrackSelection 重新激活音轨。
+ *
+ *   v8 的修法（预防为主 + 检测兜底）：
+ *     1. **预热激活（真机复验后确定的最终修复）**：死轨专打「预载后从未播过
+ *        的实例的首次激活」（23:13/23:29 两局首两声全灭；22:19 第二声即活；
+ *        用户 21:46 局交互多、首声已过激活窗口所以全活）。装载每个实例后
+ *        立即做一次静音试播（setVolume(0) → playAsync → 80ms → 复位），
+ *        把首次激活在 0 音量下烧掉 —— 用户全程无感知。
+ *        真机复验（23:41）：走子 + AI 应招两条音轨全部正常渲染
+ *        （G=-19dB、Server 完整推进、0x600 正常结束），死轨绝迹。
+ *     2. **起播双时点自检**（200/450ms positionMillis）：覆盖其它"播放头
+ *        真没推进"的设备形态；判死 → 重建实例并补播当声。
+ *        ⚠️ 注意 expo-av 的 isPlaying ≡ playWhenReady，真机死轨它也是 true，
+ *        不能作为判活依据；而 positionMillis 直读 ExoPlayer（真实），但
+ *        真机死轨上 ExoPlayer 时钟照样推进 —— 本机型上此判据偏"判活"，
+ *        真正兜底是第 3 条。
+ *     3. **1.2s 健康巡检**：系统在 ~1s 回收死 AudioTrack（Flags 0x008），
+ *        此后对该实例的任何操作都会抛错 —— 用轻量探针（setPositionAsync）
+ *        检出被回收的实例，标记 dead 并重建替补（不补播，当声已错过）。
+ *     4. 重建滑窗限流（2 次/10s），防止异常情形下无限重建。
+ *
+ *   ⚠️ 环境音量提示（非 bug）：媒体音量 3/16 时华为音量曲线映射到 ≈-39dB，
+ *      扬声器上基本不可闻 —— App 不劫持系统音量，调高媒体音量即恢复
+ *      （13/16 → ≈-19dB，实测清晰可闻）。
  */
 
 import { Audio } from 'expo-av';
@@ -204,6 +253,58 @@ const RETRY_BACKOFF_MS = 60;
  */
 const VOLUME_REINFORCE_DELAYS_MS = [0, 90, 220, 360, 500];
 
+/**
+ * 起播自检的时点（毫秒）与死轨重播等待。
+ *
+ * 【v8】真机对照实验（PTP-AN10）证明存在「playAsync 成功 resolve、
+ * 混音器却一帧都没消费」的死轨形态（v5 的不变式在真机上不成立）：
+ *   · 死轨特征：AT::add 后 Server 恒为 0、增益 -inf，~1s 后被以
+ *     terminated 移除；同一时刻焦点申请成功、无任何 JS 异常。
+ *   · 有效恢复：**换一个全新实例**（22:19 实测新音轨立即正常出声）；
+ *     对原实例再调 playAsync 是 no-op（playWhenReady 已为 true）。
+ *
+ * 自检取 200ms：素材 300~450ms，若播放头在 200ms 时已推进，这条音轨
+ * 必然活着（不会再死）；若没推进，就是死轨，立刻重建。正常路径只多
+ * 一次 getStatusAsync 往返，不引入任何可感知延迟。
+ */
+const PLAYBACK_CHECK_MS = 200;
+/** 第二自检时点（毫秒）：450ms 处仍未推进才判死（见 verifyAlive 注释）。 */
+const PLAYBACK_CHECK_SECOND_MS = 450;
+/**
+ * 【v8】实例健康巡检时点：1200ms（系统 AudioTrack 回收点 ~1s 之后）。
+ * 此时对死实例做任何操作都会抛错——那是唯一可靠的死亡信号。
+ */
+const DEAD_TRACK_PROBE_MS = 1200;
+/**
+ * 【v8】预热激活的静音试播时长（毫秒）。
+ * 覆盖 AudioTrack init + AudioPolicy 激活窗口（实测首帧出声 ~100ms），
+ * 又短到用户不可感知（音量为 0）。
+ */
+const WARMUP_PLAY_MS = 80;
+/**
+ * 自检判活的最小推进量（毫秒）：低于它视为死轨。
+ *
+ * ⚠️ 阈值必须小于**最短素材的时长**：select.mp3 实测约 26ms——它在 200ms
+ * 自检时刻早已播完、播放头停在素材末尾（≈26ms）。判活依据因此是
+ * 「播放头推进到过 ≥ 该阈值」的**历史事实**，而不是当前值——真机死轨的
+ * Server 恒为 0（从未推进过），而正常播放哪怕播完了也推进过。
+ * 为此 createSlot 起播后记录 isPlaying 的轨迹比单点读数可靠：
+ * playAsync 成功 + didJustFinish/position≥阈值 两者其一即可判活。
+ */
+const PLAYBACK_CHECK_MIN_ADVANCE_MS = 20;
+/** 判定死轨后，重建实例前的等待（给原生释放坏播放器的时间）。 */
+const DEAD_TRACK_REBUILD_DELAY_MS = 80;
+/**
+ * 【v8 防失控】单个音效名在短时间内允许的最大重建次数。
+ * 真机对照里死轨是**偶发**的（22:02 一次、22:19 即正常）；若实现有缺陷
+ * 或系统处于某种持续拒绝的状态，无上限的「重建→自检→再重建」会空转打爆
+ * CPU 与 AudioTrack 资源（测试曾因此挂死）。到限后放弃本声、保留现场
+ * 交给下一次播放的常规重试路径。
+ */
+const MAX_REBUILDS_PER_RING = 2;
+/** 重建计数的滑窗时长（毫秒）。 */
+const REBUILD_WINDOW_MS = 10_000;
+
 // ---------------------------------------------------------------------------
 // 类型
 // ---------------------------------------------------------------------------
@@ -215,6 +316,13 @@ type Slot = {
   durationMs: number;
   /** 在此时刻之前该实例视为"正在占用"。 */
   busyUntil: number;
+  /**
+   * 【v8】该实例是否已被自检判定为死轨（播放器原生层损坏）。
+   * 死实例会被 getRing 的重建流程替换掉，不再参与环形取用。
+   */
+  dead?: boolean;
+  /** 【v8】实例标识：重建后自增，供日志区分新旧实例。 */
+  bornAt: number;
 };
 
 /** 某个音效的实例环。 */
@@ -224,6 +332,10 @@ type Ring = {
   cursor: number;
   /** 上一次起播时刻，用于「同一音效最小间隔」节流。 */
   lastPlayAt: number;
+  /** 【v8】该音效名（重建死实例时需要知道重建谁）。 */
+  name: string;
+  /** 【v8】最近的死轨重建时刻（滑窗限流用，见 MAX_REBUILDS_PER_RING）。 */
+  rebuildAt: number[];
 };
 
 // ---------------------------------------------------------------------------
@@ -332,7 +444,7 @@ function ringSizeOf(name: string): number {
 }
 
 /** 装载单个实例。 */
-async function createSlot(name: string): Promise<Slot | null> {
+async function createSlot(name: string, opts?: { skipWarmup?: boolean }): Promise<Slot | null> {
   const source = SOURCES[name];
   if (source === undefined) return null;
   try {
@@ -350,10 +462,54 @@ async function createSlot(name: string): Promise<Slot | null> {
     } catch {
       /* 读不到时长不影响播放，退化成 TAIL_GUARD_MS 的下限 */
     }
-    return { sound, durationMs, busyUntil: 0 };
+    const slot: Slot = { sound, durationMs, busyUntil: 0, dead: false, bornAt: Date.now() };
+    if (!opts?.skipWarmup) {
+      await warmupSlot(slot, name);
+    }
+    return slot;
   } catch (e) {
     console.warn(`[SoundManager] 装载音效 '${name}' 失败:`, e);
     return null;
+  }
+}
+
+/**
+ * 【v8 真机预防】实例「预热激活」：静音试播一次，烧掉首次激活的高失败率。
+ *
+ * 真机对照（PTP-AN10）得出的规律：
+ *   · 23:13 / 23:29 两局：进对局后立即走子 → **预载后从未播过的实例**
+ *     首次激活双双失败（AudioFlinger：AT::add 后 Server 恒 0、G=-inf、
+ *     恰 1s 后被系统回收 Flags 0x008）——expo-av 16.0.8 的 JS API
+ *     （positionMillis/isPlaying/isLoaded）对此**完全不可见**；
+ *   · 22:19 对照：首声死后，同一实例的第二次 playAsync 由 ExoPlayer
+ *     重新 init AudioTrack，**立即恢复正常**（功率 -19.4dB 实测可闻）；
+ *   · 用户 21:46 那局：进对局后先有多轮点击交互（select 已播过），
+ *     走子时早已过了"首次激活"窗口 → 全部正常。
+ *
+ * 结论：死轨专打「首次激活」。与其当声不可检测地丢，不如在装载时
+ * 用**静音试播**把首次激活烧掉：
+ *   setVolume(0) → playAsync（真实申请焦点+init AudioTrack）
+ *   → ~80ms → setPositionAsync(0) → setVolume(1) 复原。
+ * 用户全程无感知（0 音量）；此后实例的每次 playAsync 都不再是"首次"。
+ */
+async function warmupSlot(slot: Slot, name: string): Promise<void> {
+  try {
+    await slot.sound.setVolumeAsync(0);
+    await slot.sound.playAsync();
+    await sleep(WARMUP_PLAY_MS);
+    // 复位：不 pauseAsync（焦点不变式），直接 seek 回开头 + 音量复原。
+    // 若素材在试播中播完（极短素材），seek 离开 ENDED 让下次可播。
+    await slot.sound.setPositionAsync(0);
+    await slot.sound.setVolumeAsync(1);
+  } catch (e) {
+    // 预热失败不阻塞装载：真机上焦点申请总归能成功（req=3 实测），
+    // 失败极罕见；就算首播仍踩死轨，还有 1.2s 巡检重建兜底。
+    console.warn(`[SoundManager][v8] '${name}' 预热激活失败（不阻塞）:`, e);
+    try {
+      await slot.sound.setVolumeAsync(1);
+    } catch {
+      /* 复原失败忽略 */
+    }
   }
 }
 
@@ -392,7 +548,7 @@ async function getRing(name: string): Promise<Ring | null> {
     }
 
     if (slots.length === 0) return null;
-    const ring: Ring = { slots, cursor: 0, lastPlayAt: 0 };
+    const ring: Ring = { slots, cursor: 0, lastPlayAt: 0, name, rebuildAt: [] };
     rings.set(name, ring);
     return ring;
   })();
@@ -401,25 +557,27 @@ async function getRing(name: string): Promise<Ring | null> {
   return task;
 }
 
-/** 从环里取一个可用实例：优先空闲，其次取最早空闲的那个。 */
-function acquireSlot(ring: Ring): Slot {
+/** 从环里取一个可用实例：优先空闲，其次取最早空闲的那个；跳过死实例。 */
+function acquireSlot(ring: Ring): Slot | null {
   const now = Date.now();
-  let chosen: Slot | null = null;
+  const alive = ring.slots.filter((s) => !s.dead);
+  if (alive.length === 0) return null;
 
-  for (let i = 0; i < ring.slots.length; i++) {
-    const idx = (ring.cursor + i) % ring.slots.length;
-    const slot = ring.slots[idx];
+  let chosen: Slot | null = null;
+  for (let i = 0; i < alive.length; i++) {
+    const idx = (ring.cursor + i) % alive.length;
+    const slot = alive[idx];
     if (slot.busyUntil <= now) {
       chosen = slot;
-      ring.cursor = (idx + 1) % ring.slots.length;
+      ring.cursor = (alive.indexOf(slot) + 1) % alive.length;
       break;
     }
   }
 
   if (!chosen) {
     // 全都占着（极少见）：拿最早空闲的那个，宁可截断也不静默。
-    chosen = ring.slots.reduce((a, b) => (a.busyUntil <= b.busyUntil ? a : b));
-    ring.cursor = (ring.slots.indexOf(chosen) + 1) % ring.slots.length;
+    chosen = alive.reduce((a, b) => (a.busyUntil <= b.busyUntil ? a : b));
+    ring.cursor = (alive.indexOf(chosen) + 1) % alive.length;
   }
 
   chosen.busyUntil = now + Math.max(chosen.durationMs, TAIL_GUARD_MS) + TAIL_GUARD_MS;
@@ -443,13 +601,164 @@ function hasRing(name: string): boolean {
  * 其中的 updateVolumeMuteAndDuck() 才会把当前音量写进播放器。
  * 起播瞬间 AudioPolicy 往往还没分配输出设备（deviceIds 为空），
  * 那一次算出来的增益是 -inf；稍后再触发一次，设备已就绪，
- * 增益才恢复正常（成因与真机数据见VOLUME_REINFORCE_DELAYS_MS 的注释）。
+ * 增益才恢复正常（成因与真机数据见 VOLUME_REINFORCE_DELAYS_MS 的注释）。
  *
- * 注意这里用的是 playAsync() 而不是 setVolumeAsync()：
- * 后者走 setStatus → applyNewStatus，**不会**调用
- * updateVolumeMuteAndDuck，写进去的值不会生效。
+ * 【v8 追加】起播自检：playAsync() resolve **不再等于**真的在播——
+ * 真机对照实验抓到过「resolve 成功但混音器 0 帧消费」的死轨
+ * （详见文件头 v8 一节）。200ms 时读一次播放头：
+ *   · 推进了 → 音轨活着，收工；
+ *   · 没推进 → 死轨：标记 dead 并**重建全新实例**重播一次
+ *     （对死实例再调 playAsync 是 no-op，重建是唯一有效恢复手段）。
  */
-async function startSlot(slot: Slot, isAlive: () => boolean): Promise<void> {
+/**
+ * 【v8】起播自检 + 死轨重建。
+ *
+ * ⚠️ 真机判据修正记录（PTP-AN10，23:13 对照实验）：
+ *   · 死轨形态：AT::add 后 Server 恒 0、G=-inf，**恰好 1s 后被系统回收**
+ *     （Flags 0x000→0x008，疑似 Android 14+ 的 idle AudioTrack 回收）；
+ *   · 该回收发生在原生层，ExoPlayer 的 positionMillis 照常推进
+ *     （getExtraStatusFields 直读 mSimpleExoPlayer.getCurrentPosition()），
+ *     **JS 侧无从分辨**——双时点 position 判据在真机上恒判活，自检空转；
+ *   · 但实例被系统回收后，下一次对它的 setPositionAsync/playAsync **必然抛错**
+ *     （AudioTrack 已 release）→ 落进既有的"换实例重试"路径。
+ *
+ * 因此本函数做两件事：
+ *   1. 双时点 position 判活（覆盖"播放头真的没推进"的设备/形态）；
+ *   2. 【1.2s 巡检】系统回收点(1s)之后读一次状态并对实例做一次轻量探针
+ *      （setPositionAsync(0)）：
+ *        · 探针成功 → 实例还活着（正常轨）；
+ *        · 探针抛错 → 实例已被系统回收 → 标记 dead、立即重建替补。
+ *      巡检不重播当前声（已错过），只为**下一声**准备好健康实例。
+ * 每一步都打 console.warn，保证真机上可在 Metro 日志观测整条链路。
+ */
+async function verifyAlive(slot: Slot, name: string, isAlive: () => boolean): Promise<void> {
+  if (!isAlive() || slot.dead) return;
+
+  const readOnce = async (): Promise<'alive' | 'dead' | 'pending'> => {
+    try {
+      const st = await slot.sound.getStatusAsync();
+      if (!st.isLoaded) return 'dead';
+      if (st.didJustFinish === true) return 'alive';
+      if (
+        typeof st.positionMillis === 'number' &&
+        st.positionMillis >= PLAYBACK_CHECK_MIN_ADVANCE_MS
+      ) {
+        return 'alive';
+      }
+      return 'pending';
+    } catch {
+      return 'dead';
+    }
+  };
+
+  const first = await readOnce();
+  if (first === 'alive') return;
+  if (!isAlive() || slot.dead) return;
+  if (first === 'pending') {
+    await sleep(PLAYBACK_CHECK_SECOND_MS - PLAYBACK_CHECK_MS);
+    if (!isAlive() || slot.dead) return;
+    const second = await readOnce();
+    if (second === 'alive') return;
+    if (second === 'pending') {
+      // 双时点播放头都停在 0：某些设备上死轨 position 照样推进读不出来，
+      // 但也确有"真的没推进"的形态——按死轨处理。
+      console.warn(`[SoundManager][v8] '${name}' 双时点播放头未推进，判死重建`);
+    }
+  }
+
+  // 起播自检判死：当声还没播出去 → 重建后立刻重播一次
+  await markDeadAndRebuild(slot, name, isAlive, true);
+}
+
+/**
+ * 【v8】1.2s 实例健康巡检：系统 AudioTrack 回收点之后，用一次轻量探针
+ * 检出"已被回收"的死实例并重建替补（不重播当前声，已错过）。
+ */
+async function healthProbe(slot: Slot, name: string, isAlive: () => boolean): Promise<void> {
+  if (!isAlive() || slot.dead) return;
+  try {
+    // 探针：seek 到当前位置（不动播放状态）。实例若已被系统回收，
+    // 原生层会抛 IllegalStateException——那就是死亡信号。
+    const st = await slot.sound.getStatusAsync();
+    if (!isAlive() || slot.dead) return;
+    if (!st.isLoaded) {
+      slot.dead = true;
+      console.warn(`[SoundManager][v8] '${name}' 巡检：实例已卸载（系统回收），重建替补`);
+      await markDeadAndRebuild(slot, name, isAlive, false);
+      return;
+    }
+    await slot.sound.setPositionAsync(Math.max(0, st.positionMillis ?? 0));
+    // 探针成功：实例健康，无需处理
+  } catch {
+    if (!isAlive() || slot.dead) return;
+    slot.dead = true;
+    console.warn(`[SoundManager][v8] '${name}' 巡检：实例操作抛错（已被系统回收），重建替补`);
+    await markDeadAndRebuild(slot, name, isAlive, false);
+  }
+}
+
+/**
+ * 【v8】把死实例移出环并重建替补（滑窗限流）。
+ * @param replay 重建完成后是否用新实例把这一声补播出去
+ * （自检判死时 true——当声还没播出；巡检判死时 false——当声已错过）。
+ */
+async function markDeadAndRebuild(
+  slot: Slot,
+  name: string,
+  isAlive: () => boolean,
+  replay: boolean
+): Promise<void> {
+  slot.dead = true;
+  await slot.sound.unloadAsync().catch(() => {
+    /* 卸载失败忽略 */
+  });
+  if (!isAlive()) return;
+  let ring = rings.get(name);
+  if (!ring) return;
+
+  // 重建上限：防止异常情形下无限重建（见 MAX_REBUILDS_PER_RING 注释）
+  const nowMs = Date.now();
+  ring.rebuildAt = ring.rebuildAt.filter((t) => nowMs - t < REBUILD_WINDOW_MS);
+  if (ring.rebuildAt.length >= MAX_REBUILDS_PER_RING) {
+    console.warn(`[SoundManager][v8] '${name}' 重建次数达上限（${MAX_REBUILDS_PER_RING}/${REBUILD_WINDOW_MS}ms）`);
+    return;
+  }
+  ring.rebuildAt.push(nowMs);
+
+  await sleep(DEAD_TRACK_REBUILD_DELAY_MS);
+  if (!isAlive()) return;
+  ring = rings.get(name);
+  if (!ring) return;
+  // 一次性清掉环里所有死实例，再补足到环大小
+  const alive = ring.slots.filter((s) => !s.dead);
+  for (const d of ring.slots.filter((s) => s.dead)) {
+    await d.sound.unloadAsync().catch(() => {
+      /* 已卸载/卸载失败忽略 */
+    });
+  }
+  ring.slots = alive;
+  const need = Math.max(1, ringSizeOf(name) - ring.slots.length);
+  let firstFresh: Slot | null = null;
+  for (let i = 0; i < need; i++) {
+    const fresh = await createSlot(name);
+    if (fresh) {
+      fresh.busyUntil = Date.now() + TAIL_GUARD_MS;
+      ring.slots.push(fresh);
+      if (!firstFresh) firstFresh = fresh;
+      console.warn(`[SoundManager][v8] '${name}' 已重建替补实例（环内 ${ring.slots.length} 个）`);
+    }
+  }
+  // 自检判死场景：当声还没播出去 → 用新实例补播（巡检场景 replay=false，已错过）
+  if (replay && firstFresh) {
+    try {
+      await startSlot(firstFresh, name, isAlive);
+    } catch {
+      /* 补播失败：交给调用方既有重试路径，绝不抛出 */
+    }
+  }
+}
+
+async function startSlot(slot: Slot, name: string, isAlive: () => boolean): Promise<void> {
   // 回到开头：素材播完后播放器停在 STATE_ENDED，此时把 playWhenReady
   // 重新置 true **不会**让它继续播，必须先 seek 离开 ENDED。
   //
@@ -487,14 +796,29 @@ async function startSlot(slot: Slot, isAlive: () => boolean): Promise<void> {
   );
 
   activeReinforceTimers.add(timers);
+
+  // 【v8】起播自检（不阻塞 playSound 返回）：
+  //   · 双时点（200/450ms）position 判活 → 判死重建；
+  //   · 1.2s 健康巡检 → 检出被系统回收的实例并重建替补。
+  const checkTimer = setTimeout(() => {
+    void verifyAlive(slot, name, isAlive);
+  }, PLAYBACK_CHECK_MS);
+  const probeTimer = setTimeout(() => {
+    void healthProbe(slot, name, isAlive);
+  }, DEAD_TRACK_PROBE_MS);
+
+  // 自检定时器也要纳入卸载清理（与补推定时器同一注册表）
+  timers.push(checkTimer);
+  timers.push(probeTimer);
 }
 
 /**
  * 播放一个音效。**永不抛出**。
  *
- * 失败语义（依据 SoundManager 头注释第二节第 ⑤ 步）：`playAsync()` 的
- * reject 意味着原生没能拿到音频焦点，因而既没有更新音量、也没有开始播放。
- * 这时换另一个实例重试，并复位音频模式。
+ * 失败语义：
+ *   · playAsync() reject（焦点申请被拒等）→ 换实例重试 + 复位音频模式（v5 语义）；
+ *   · playAsync() resolve 但播放头不推进（死轨，v8 真机实测形态）→
+ *     由 startSlot 的起播自检发现并**重建实例**重播。
  */
 export async function playSound(name: string): Promise<void> {
   try {
@@ -523,9 +847,25 @@ export async function playSound(name: string): Promise<void> {
       ring.lastPlayAt = Date.now();
 
       const slot = acquireSlot(ring);
+      if (!slot) {
+        // 全部实例都是死轨（理论上到不了：死实例会被立即重建替换）。
+        // 重建一个再播，宁可慢一点也不静默。
+        const fresh = await createSlot(name);
+        if (!fresh) return;
+        ring.slots.push(fresh);
+        try {
+          await startSlot(fresh, name, () => mySession === sessionId);
+          return;
+        } catch (e) {
+          console.warn(`[SoundManager] '${name}' 重建实例后仍播放失败:`, e);
+          await resetFocusForRetry();
+          await sleep(RETRY_BACKOFF_MS);
+          continue;
+        }
+      }
       try {
-        await startSlot(slot, () => mySession === sessionId);
-        return; // resolve 即代表这一遍确实在出声（见头注释第四节第 3 点）
+        await startSlot(slot, name, () => mySession === sessionId);
+        return; // resolve 即代表这一遍已下发成功（死轨由自检兜底，见 startSlot）
       } catch (e) {
         console.warn(`[SoundManager] 播放 '${name}' 第 ${attempt + 1} 次失败（多为音频焦点未获批），换实例重试:`, e);
         await resetFocusForRetry();
