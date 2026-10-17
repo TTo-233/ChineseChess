@@ -153,10 +153,14 @@
  *     1. **预热激活（真机复验后确定的最终修复）**：死轨专打「预载后从未播过
  *        的实例的首次激活」（23:13/23:29 两局首两声全灭；22:19 第二声即活；
  *        用户 21:46 局交互多、首声已过激活窗口所以全活）。装载每个实例后
- *        立即做一次静音试播（setVolume(0) → playAsync → 80ms → 复位），
- *        把首次激活在 0 音量下烧掉 —— 用户全程无感知。
- *        真机复验（23:41）：走子 + AI 应招两条音轨全部正常渲染
- *        （G=-19dB、Server 完整推进、0x600 正常结束），死轨绝迹。
+ *        立即静音试播一次：setVolume(0) → playAsync → 80ms（完成 AudioTrack
+ *        初始化与 AudioPolicy 激活）→ seek 到素材末尾（立即 ENDED、无声）
+ *        → 恢复音量 1，**不回位**（回位交给真正播放的 startSlot）。
+ *        ⚠️ v8.1：初版在末尾 seek 回 0 再恢复音量，而 ExoPlayer 在 ENDED +
+ *        playWhenReady=true 下 seek 回流会立即重播——整段声音漏了出来
+ *        （用户 2026-10-18 反馈"好像没有静音预热"即此）。现在停 ENDED 不回位。
+ *        真机复验（00:12）：预热音轨全部 G=-inf、~80ms 即 flush（T/0x600）；
+ *        真实走子 G=-6.3dB、444ms 完整渲染（S/0x600），死轨绝迹。
  *     2. **起播双时点自检**（200/450ms positionMillis）：覆盖其它"播放头
  *        真没推进"的设备形态；判死 → 重建实例并补播当声。
  *        ⚠️ 注意 expo-av 的 isPlaying ≡ playWhenReady，真机死轨它也是 true，
@@ -276,11 +280,15 @@ const PLAYBACK_CHECK_SECOND_MS = 450;
  */
 const DEAD_TRACK_PROBE_MS = 1200;
 /**
- * 【v8】预热激活的静音试播时长（毫秒）。
- * 覆盖 AudioTrack init + AudioPolicy 激活窗口（实测首帧出声 ~100ms），
- * 又短到用户不可感知（音量为 0）。
+ * 【v8】预热激活参数。
+ * 静音播 80ms 完成 AudioTrack init + AudioPolicy 激活，随后 seek 到末尾
+ * 让播放立即结束（无声），再回位、恢复音量。
+ * ⚠️ v8.1：不是"播完整段"——那会让预载串行等到素材结束（10 实例 6s+），
+ * 拖慢进对局后立刻走子的首次播放。
  */
-const WARMUP_PLAY_MS = 80;
+const WARMUP_ACTIVATE_MS = 80;
+/** 读不到素材时长时，seek 目标的兜底值（ExoPlayer 会钳到真实 duration）。 */
+const WARMUP_END_FALLBACK_MS = 2000;
 /**
  * 自检判活的最小推进量（毫秒）：低于它视为死轨。
  *
@@ -487,19 +495,44 @@ async function createSlot(name: string, opts?: { skipWarmup?: boolean }): Promis
  *     走子时早已过了"首次激活"窗口 → 全部正常。
  *
  * 结论：死轨专打「首次激活」。与其当声不可检测地丢，不如在装载时
- * 用**静音试播**把首次激活烧掉：
- *   setVolume(0) → playAsync（真实申请焦点+init AudioTrack）
- *   → ~80ms → setPositionAsync(0) → setVolume(1) 复原。
- * 用户全程无感知（0 音量）；此后实例的每次 playAsync 都不再是"首次"。
+ * 用**静音试播**把首次激活烧掉。
+ *
+ * ⚠️【v8.1 静音窗口修正】最初实现只静音 80ms 后就恢复音量并 seek 回 0——
+ * 但 go/eat/goerror 素材长 275~344ms，**剩余部分会完整出声**（用户进对局
+ * 时能听到一串走子音）。
+ *
+ * 修法（既不出声、也不拖慢预载）：静音播 80ms 完成激活后，**直接 seek 到
+ * 素材末尾**——ExoPlayer 立即进入 ENDED，剩余音频不会再被渲染。
+ *
+ * ⚠️⚠️ 关键顺序（真机语义，2026-10-18 修正）：**不要 seek 回 0**。
+ * ExoPlayer 在 STATE_ENDED 下只要 playWhenReady=true，seek 回 0 就会
+ * **立即重新开始播放**——原实现"末尾 seek(0) 再恢复音量"恰好把整段声音
+ * 放了出来（这正是用户反馈"好像没有静音预热"的原因）。
+ * 所以预热后**停在 ENDED**、音量恢复为 1，由真正播放时的
+ * startSlot（setPositionAsync(0) + playAsync）负责从头起播：
+ *   setVolume(0) → playAsync → 80ms（激活窗口）→ setPositionAsync(时长)
+ *   [立即 ENDED、无声] → setVolume(1) → 留在 ENDED
+ * 单个实例开销 ≈ 80ms + 2 次原生往返，10 个实例串行 ≈ 1.2s。
+ *
+ * 对既定策略的影响：**不破坏 v5 焦点不变式**——
+ * `requiresAudioFocus()`（SimpleExoPlayerData.java:255）只看
+ * playWhenReady && !mIsMuted，setVolume(0) 不改变这两个标志，
+ * 焦点在预热时申请一次后整局持有；也全程不碰 pauseAsync。
  */
 async function warmupSlot(slot: Slot, name: string): Promise<void> {
   try {
     await slot.sound.setVolumeAsync(0);
     await slot.sound.playAsync();
-    await sleep(WARMUP_PLAY_MS);
-    // 复位：不 pauseAsync（焦点不变式），直接 seek 回开头 + 音量复原。
-    // 若素材在试播中播完（极短素材），seek 离开 ENDED 让下次可播。
-    await slot.sound.setPositionAsync(0);
+    // 静音播一小段：AudioTrack init + AudioPolicy 激活都发生在这一段里
+    // （真机死轨的"首次激活失败"就是在这里被烧掉的）。
+    await sleep(WARMUP_ACTIVATE_MS);
+    // 跳到素材末尾让播放立即结束（无声音）；时长为 0（读不到）时用 2s 兜底，
+    // ExoPlayer 会把超出的 seek 钳到 duration，同样立即 ENDED。
+    const endPos = slot.durationMs > 0 ? slot.durationMs : WARMUP_END_FALLBACK_MS;
+    await slot.sound.setPositionAsync(endPos);
+    // 恢复音量：此刻播放器处于 ENDED，不会出声。
+    // ⚠️ 这里**不能**再 seek 回 0 —— ENDED + playWhenReady=true 下 seek
+    // 回到开头会立即重新播放（声音就漏出来了）。
     await slot.sound.setVolumeAsync(1);
   } catch (e) {
     // 预热失败不阻塞装载：真机上焦点申请总归能成功（req=3 实测），

@@ -163,6 +163,10 @@ class FakeSound {
   requestedVolume = 1;
   playWhenReady = false;
   positionMs = 0;
+  /** 【v8.1】最近一次 seek 的位置（时间驱动播放头的基准）。 */
+  basePos = 0;
+  /** 【v8.1】本次 play 的起始时刻（时间驱动播放头基准）。 */
+  playStartedAt: number | null = null;
   loaded = true;
   durationMs = 300;
   calls: Array<{ op: string; at: number; volume: number }> = [];
@@ -224,7 +228,12 @@ class FakeSound {
   /** setPositionAsync 只带 positionMillis，**不碰 mShouldPlay**（build/AV.js:188） */
   async setPositionAsync(pos: number): Promise<unknown> {
     this.record(`setPosition:${pos}`);
-    this.positionMs = pos;
+    // ExoPlayer 会把越界 seek 钳到 [0, duration]：这是 warmup "跳到末尾
+    // 立即 ENDED" 能成立的前提。
+    this.basePos = Math.min(Math.max(0, pos), this.durationMs);
+    this.positionMs = this.basePos;
+    // 播放中 seek：时钟从新位置重新起算。
+    this.playStartedAt = this.playWhenReady ? Date.now() : null;
     this.finishSetStatus();
     return this.status();
   }
@@ -260,12 +269,10 @@ class FakeSound {
       this.updateVolumeMuteAndDuck();
       this.playWhenReady = true;
       this.record('play');
-      // 起播后播放头推进（真机：混音器开始消费 Server 前进）。
-      // 死轨不走到这里——播放头恒 0，200ms 自检据此判死。
-      this.positionMs = Math.min(this.durationMs, Math.max(1, Date.now() % this.durationMs || 1));
-      // 让 position 超过自检阈值（20ms），表达"活过"；
-      // 若素材比阈值短，用 didJustFinish 表达"播完了"（同样是活过）。
-      this.positionMs = this.durationMs <= 20 ? this.durationMs : Math.max(this.positionMs, 25);
+      // 【v8.1】播放头按真实时钟推进（ExoPlayer 语义）：status() 里按
+      // playStartedAt 计算当前 position，到达 duration 即 didJustFinish。
+      // 死轨不走到这里——播放头恒 0，双时点自检据此判死。
+      this.playStartedAt = Date.now();
     } catch (e) {
       this.record('playRejected');
       this.finishSetStatus();
@@ -291,13 +298,24 @@ class FakeSound {
   status() {
     // 【v8 真机修正】expo-av 的 isPlaying ≡ playWhenReady（build/AV.js），
     // 真机死轨的 playWhenReady 是 true —— 判活只能靠 positionMillis/didJustFinish。
+    // 【v8.1】播放头 = seek 基准 + 播放中经过的时钟（ExoPlayer 语义）：
+    //   · seek 到 duration ⇒ 立即 didJustFinish（warmup 的"跳到末尾"据此无声）；
+    //   · 正常播放到 duration ⇒ didJustFinish（避免轮询死循环）。
+    let pos = this.basePos;
+    let finished = false;
+    if (this.playWhenReady && !this.isDeadTrack) {
+      const started = this.playStartedAt ?? Date.now();
+      pos = Math.min(this.basePos + (Date.now() - started), this.durationMs);
+      finished = pos >= this.durationMs;
+    }
+    this.positionMs = pos;
     return {
       isLoaded: this.loaded,
-      positionMillis: this.positionMs,
+      positionMillis: pos,
       durationMillis: this.durationMs,
       volume: 1,
-      isPlaying: this.playWhenReady && this.positionMs < this.durationMs,
-      didJustFinish: this.playWhenReady && this.positionMs >= this.durationMs,
+      isPlaying: this.playWhenReady && !finished,
+      didJustFinish: finished,
     };
   }
 
@@ -872,6 +890,40 @@ describe('【v8】真机死轨形态：playAsync 成功但播放头不推进，�
     expect(latePlays.length).toBe(0);
 
     // 收尾：终止在途流
+    await sm.unloadAllSounds();
+    await new Promise((r) => setTimeout(r, 700));
+  }, 30000);
+
+  /**
+   * 【v8.1 回归】用户 2026-10-18 反馈"好像没有静音预热"暴露的真 bug：
+   * 初版预热只静音 80ms 就恢复音量并 seek 回 0 —— 而 ExoPlayer 在 ENDED
+   * 且 playWhenReady=true 时 seek 回开头会**立即重新播放**，于是
+   * go/eat/goerror（275~344ms）的剩余部分整段出声。
+   * 修正后：预热 = 静音播 80ms → seek 到末尾（ENDED、无声）→ 恢复音量，
+   * **不回位**；回位交给真正播放时的 startSlot。
+   * 本用例钉死"预载完成后不得有任何可闻 play"。
+   */
+  it('预热激活必须全程静音：预载后不得出现任何可闻的 play', async () => {
+    const sm = await loadSoundManager();
+    await sm.preloadSounds();
+
+    // 预载期间所有 play 都必须是 0 音量（setVolume(0) 之后才 playAsync）
+    const audible = sounds.filter((s) => s.audibleAt() !== null);
+    expect(audible).toHaveLength(0);
+
+    // 预热结束必须恢复请求音量 1（否则后续真实播放会一直是静音）
+    for (const s of sounds) expect(s.requestedVolume).toBe(1);
+
+    // 预热不得使用 pauseAsync（v5 焦点不变式：pause 会放弃焦点）
+    const pauses = sounds.flatMap((s) => s.calls.filter((c) => c.op === 'pause'));
+    expect(pauses).toHaveLength(0);
+
+    // 预热后真实播放必须能出声（seek(0)+playAsync 在 startSlot 完成）
+    await sm.playSound('go');
+    const goAudible = sounds.filter((s) => s.name === 'go' && s.audibleAt() !== null);
+    expect(goAudible.length).toBeGreaterThanOrEqual(1);
+
+    // 收尾
     await sm.unloadAllSounds();
     await new Promise((r) => setTimeout(r, 700));
   }, 30000);
