@@ -282,15 +282,34 @@ var DATA_BYTES = null;
  *   · Worker 脚本降到几十 KB，解析几乎不花时间；
  *   · 完全省掉 base64 解码与中间字符串。
  *
- * 页面侧（WebView）仍沿用内联 base64 的 html：原生 WebView 以 inline HTML 承载时
- * 没有可用的同源 origin，fetch 兄弟资源会被跨源/CORS 挡住，内联是唯一稳妥选择。
- * 两条路径共用同一份 UCI 逻辑（见 UCI_CORE），行为保持一致。
+ * 【Worker 与页面共用的取字节实现】
+ * 页面侧（WebView）承载在 file://（不透明源）下，fetch 的 credentials 语义
+ * 在该环境下没有可靠契约，所以取字节一律"fetch 为主、XHR 兜底"，详见下方
+ * HTML_BODY 侧同名函数的完整说明。本 Worker 只在 Web 端以 http(s) 运行。
  */
 function fetchBytes(url) {
-  return fetch(url, { credentials: 'same-origin' }).then(function (res) {
-    if (!res.ok) throw new Error('HTTP ' + res.status + ' for ' + url);
-    return res.arrayBuffer();
-  });
+  return fetch(url)
+    .then(function (res) {
+      if (!res.ok) throw new Error('HTTP ' + res.status + ' for ' + url);
+      return res.arrayBuffer();
+    })
+    .catch(function (err) {
+      return new Promise(function (resolve, reject) {
+        var xhr = new XMLHttpRequest();
+        xhr.open('GET', url, true);
+        xhr.responseType = 'arraybuffer';
+        xhr.onload = function () {
+          if (xhr.response && xhr.response.byteLength) resolve(xhr.response);
+          else reject(new Error('XHR returned no bytes for ' + url +
+            ' (fetch: ' + (err && err.message ? err.message : err) + ')'));
+        };
+        xhr.onerror = function () {
+          reject(new Error('XHR failed for ' + url +
+            ' (fetch: ' + (err && err.message ? err.message : err) + ')'));
+        };
+        try { xhr.send(); } catch (e) { reject(e); }
+      });
+    });
 }
 
 /** 并行拉取 wasm 与 nnue；任一失败都让 bootstrap 失败（由上层退避重试） */
@@ -442,9 +461,13 @@ const HTML_BODY = `<!DOCTYPE html>
  *   OOM 杀掉渲染进程。现在改为与 Worker 同构的「小页面 + fetch 两个二进制」，
  *   页面本身降到 ~200KB 量级，行为与 Web 端完全一致。
  *
- *   ⚠️ 前提是本页有一个**可用的同源 origin**：原生端它由 file:// 加载，
- *   fetch 的相对地址会解析到同目录的文件。若拿不到 URL（bootstrap 没带），
- *   会显式报 error 而不是静默挂起。
+ *   ⚠️ 【2026-10 真机修复】本页在原生端由 file:// 加载，origin 是 **null**
+ *   （opaque origin），不是可用的同源 origin。此前 fetchBytes 用
+ *   fetch(url, {credentials:'same-origin'}) 取二进制，在 opaque origin 下
+ *   被 Chromium 判为跨源并拒绝，wasm/nnue 永远拉不到 —— 引擎启动必然失败。
+ *   现已按协议分派：file:// 走 XHR（见 fetchBytes），http(s) 走 fetch。
+ *
+ *   若拿不到 URL（bootstrap 没带），会显式报 error 而不是静默挂起。
  *
  * 协议与 pikafish_worker.bin 完全一致。
  *
@@ -465,12 +488,47 @@ var DATA_SIZE = ${dataBuf.length};
 var WASM_BYTES = null;
 var DATA_BYTES = null;
 
-/** 拉取一个二进制资源（同源 file:// 或 http:// 均可） */
+/**
+ * 拉取一个二进制资源。
+ *
+ * 【2026-10 真机修复 · 回归根因】
+ * 引擎页曾为"减小体积"把 wasm/nnue 改成运行时 fetch 取。原生端页面由
+ * file:// 承载（origin 为 file://，在 Chromium 里是不透明源），**fetch 在
+ * 不透明源下的行为没有可靠契约**：credentials:'same-origin' 直接不可用，
+ * 而带不带 credentials 又因 WebView 版本而异 —— 结果 wasm/nnue 取不到，
+ * bootstrap 失败，UI 永远停在"引擎启动中"。
+ *
+ * 修法不是赌某一条路可用，而是**两条路互为兜底**：
+ *   先试 fetch（http(s) 与多数 WebView 的正常路径），失败/拿不到字节再走 XHR
+ *   （file:// 下唯一稳定可用的通道）。任一条成功即返回，两条都失败才 reject。
+ * 这样无论设备上 fetch 与 XHR 各自是否被允许，引擎都能启动。
+ * 注意不要再给 fetch 传 credentials:'same-origin'——不透明源下它是无效甚至有害的。
+ */
 function fetchBytes(url) {
-  return fetch(url, { credentials: 'same-origin' }).then(function (res) {
-    if (!res.ok) throw new Error('HTTP ' + res.status + ' for ' + url);
-    return res.arrayBuffer();
-  });
+  return fetch(url)
+    .then(function (res) {
+      if (!res.ok) throw new Error('HTTP ' + res.status + ' for ' + url);
+      return res.arrayBuffer();
+    })
+    .catch(function (err) {
+      // 落到这里可能是网络错，也可能是 file:// 下 fetch 被拒；都用 XHR 再试一次。
+      return new Promise(function (resolve, reject) {
+        var xhr = new XMLHttpRequest();
+        xhr.open('GET', url, true);
+        xhr.responseType = 'arraybuffer';
+        xhr.onload = function () {
+          // file:// 下 status 恒为 0，不能用 res.ok 判成败，只看有没有字节。
+          if (xhr.response && xhr.response.byteLength) resolve(xhr.response);
+          else reject(new Error('XHR returned no bytes for ' + url +
+            ' (fetch: ' + (err && err.message ? err.message : err) + ')'));
+        };
+        xhr.onerror = function () {
+          reject(new Error('XHR failed for ' + url +
+            ' (fetch: ' + (err && err.message ? err.message : err) + ')'));
+        };
+        try { xhr.send(); } catch (e) { reject(e); }
+      });
+    });
 }
 
 /** 并行拉取 wasm 与 nnue；任一失败都让 bootstrap 失败（由上层退避重试） */

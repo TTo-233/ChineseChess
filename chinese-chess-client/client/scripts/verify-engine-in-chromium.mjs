@@ -44,7 +44,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import http from 'node:http';
 import { spawn } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const clientRoot = path.resolve(here, '..');
@@ -69,6 +69,11 @@ const SPECS = {
       { key: 'wasm', file: 'pikafish_wasm.wasm' },
       { key: 'nnue', file: 'pikafish_nnue.nnue' },
     ],
+    /**
+     * 本引擎靠 fetch 自行取二进制 → 必须额外用 file:// 跑一遍（真机条件）。
+     * 少了这一条，"opaque origin 下 fetch 被拒" 这个真机致命故障在闸门里测不出来。
+     */
+    needsExternalBinaries: true,
     /** 等待页面自发的那条消息 */
     expect: 'ready',
     expectTimeoutMs: 60000,
@@ -144,6 +149,21 @@ async function verifyOne(spec, bin) {
 
   const userDataDir = fs.mkdtempSync(path.join(process.env.TEMP || '/tmp', 'engine-cdp-'));
   const port = 9700 + Math.floor(Math.random() * 400);
+  /**
+   * ⚠️ file:// 场景必须放开本地文件访问，否则 Chrome 直接拦掉页面脚本
+   * （表现是 __msgs 全空、"未收到 host-loaded"）。Android WebView 的
+   * WebSettings 默认就是 allowFileAccess + allowFileAccessFromFileURLs +
+   * allowUniversalAccessFromFileURLs（见 webViewHost.tsx），所以这里给 Chrome
+   * 开同样的权限才等价于真机。不开的话这个场景就变成"测了个寂寞"。
+   */
+  const fileFlags =
+    spec.transport === 'file'
+      ? [
+          '--allow-file-access-from-files',
+          '--disable-web-security',
+          '--allow-running-insecure-content',
+        ]
+      : [];
   const proc = spawn(
     bin,
     [
@@ -153,6 +173,7 @@ async function verifyOne(spec, bin) {
       '--no-first-run',
       '--no-default-browser-check',
       '--disable-gpu',
+      ...fileFlags,
       'about:blank',
     ],
     { stdio: 'ignore' }
@@ -267,6 +288,19 @@ async function verifyOne(spec, bin) {
      *    页面会在 bootstrap 阶段报 "HTTP 404"，那时我们会立刻看到红灯，
      *    而不是像以前那样"内联 base64 所以永远绿"。
      */
+    /**
+     * 页面 + 二进制的承载方式。
+     *
+     * 【2026-10 新增 file:// 模式】这是**真机的真实条件**。原生 WebView 用
+     * `{uri: file://…/pikafish.page}` 加载，origin 为 null（opaque origin）。
+     * 此前本脚本一律用 http:// 提供资源，于是"fetch 在 opaque origin 下被
+     * 判跨源拒绝"这个真机致命故障在这里**永远测不出来**（假绿灯），
+     * 结果引擎改成 fetch 取二进制后，真机 100% 起不来而闸门全绿。
+     *
+     * 因此额外跑一遍 file://：二进制按真实产物路径以 file:// 传入 bootstrap，
+     * 页面也从 file:// 加载。若取字节的实现在 opaque origin 下不成立，这里立刻红。
+     */
+    const fileMode = spec.transport === 'file';
     const binPaths = {};
     for (const b of spec.binaries || []) {
       const p = path.join(ENGINE_DIR, b.file);
@@ -276,9 +310,31 @@ async function verifyOne(spec, bin) {
       binPaths[b.key] = p;
     }
 
-    const srv = http.createServer((req, res) => {
+    let srv = null;
+    let httpPort = 0;
+    let pageUrl;
+    if (fileMode) {
+      /**
+       * 与真机等价的关键两点：
+       *
+       * 1) **页面也必须来自 file://**。原生 WebView 用 loadUrl(file://…) 加载，
+       *    页面 origin 是 file://，取二进制用的是 file→file 的 XHR。
+       *    曾试过 data:text/html —— 那是不透明 origin 且**根本无法访问 file:**，
+       *    会把"XHR 能否取到字节"这个真问题替换成一个更早的假失败。
+       *
+       * 2) 但 .page 扩展名会被 Chrome 当纯文本渲染（<pre>，0 个 <script>，脚本
+       *    根本不执行 —— 这正是本闸门此前"永远绿"的隐藏原因）。
+       *    所以把页面内容复制成 .html 再用 file:// 加载：origin 仍是 file://，
+       *    脚本会执行，且二进制仍走绝对 file:// 路径。
+       */
+      const stageDir = fs.mkdtempSync(path.join(process.env.TEMP || '/tmp', 'engine-file-'));
+      const staged = path.join(stageDir, 'engine.html');
+      fs.writeFileSync(staged, html, 'utf8');
+      pageUrl = pathToFileURL(staged).href;
+    } else {
+      srv = http.createServer((req, res) => {
       const reqPath = decodeURIComponent((req.url || '/').split('?')[0]);
-      // 命中任意一个二进制产物：按原始字节返回（wasm 用 application/wasm）
+      // 命中任意一个二进制产物：按原始字节返回（wasm 用 application/octet-stream）
       for (const [key, filePath] of Object.entries(binPaths)) {
         if (reqPath === '/' + key) {
           const buf = fs.readFileSync(filePath);
@@ -295,18 +351,27 @@ async function verifyOne(spec, bin) {
       res.end(html);
     });
     await new Promise((r) => srv.listen(0, '127.0.0.1', r));
-    const httpPort = srv.address().port;
+    httpPort = srv.address().port;
+    pageUrl = `http://127.0.0.1:${httpPort}/engine.html`;
+    }
 
-    // 与真机一致：bootstrap 带上二进制 URL（原生是 file://，这里是 http://）
+    // bootstrap 带上的二进制 URL：file:// 用真实路径，http:// 用本地 server
     const bootstrapMsg =
       typeof spec.bootstrap === 'function'
-        ? spec.bootstrap({
-            wasm: `http://127.0.0.1:${httpPort}/wasm`,
-            nnue: `http://127.0.0.1:${httpPort}/nnue`,
-          })
+        ? spec.bootstrap(
+            fileMode
+              ? {
+                  wasm: pathToFileURL(binPaths.wasm).href,
+                  nnue: pathToFileURL(binPaths.nnue).href,
+                }
+              : {
+                  wasm: `http://127.0.0.1:${httpPort}/wasm`,
+                  nnue: `http://127.0.0.1:${httpPort}/nnue`,
+                }
+          )
         : spec.bootstrap;
 
-    await send('Page.navigate', { url: `http://127.0.0.1:${httpPort}/engine.html` }, sessionId);
+    await send('Page.navigate', { url: pageUrl }, sessionId);
     await new Promise((r) => setTimeout(r, 1000));
 
     const evalJs = async (expression) => {
@@ -378,6 +443,11 @@ async function verifyOne(spec, bin) {
     return { banner, detail: spec.describe(msg) };
   } finally {
     cleanup();
+    try {
+      srv?.close();
+    } catch {
+      /* 忽略 */
+    }
     // ⚠️ Chrome 的子进程可能仍持有 stdio，Node 事件循环不会自然退出 → 脚本"卡住"。
     // 验证结果已经拿到，直接结束进程是最简单的收尾。
     process.exitCode = 0;
@@ -399,12 +469,31 @@ async function main() {
   }
 
   let failed = 0;
+  /**
+   * 每个引擎跑哪些承载方式。
+   * `http` 一律跑；`file` 只对**需要自己取二进制**的引擎跑（pikafish）。
+   * 揭棋的 wasm 是内联 base64 的，不发外部请求，file:// 与 http:// 等价，
+   * 不必重复跑。
+   */
+  const runs = [];
   for (const [key, spec] of Object.entries(targets)) {
     if (!spec) {
       console.error(`[verify-engine-chromium] 未知引擎: ${key}`);
       failed += 1;
       continue;
     }
+    runs.push({ key, spec, transport: 'http', label: spec.label });
+    if (spec.needsExternalBinaries) {
+      runs.push({
+        key,
+        spec,
+        transport: 'file',
+        label: `${spec.label}（file:// 真机条件）`,
+      });
+    }
+  }
+
+  for (const { key, spec, transport, label } of runs) {
     const sizeMiB = (() => {
       try {
         return (fs.statSync(path.join(ENGINE_DIR, spec.file)).size / 1048576).toFixed(2);
@@ -412,9 +501,9 @@ async function main() {
         return '?';
       }
     })();
-    process.stdout.write(`[verify-engine-chromium] ${spec.label}（${spec.file} ${sizeMiB} MiB）… `);
+    process.stdout.write(`[verify-engine-chromium] ${label}（${spec.file} ${sizeMiB} MiB）… `);
     try {
-      const { banner, detail } = await verifyOne(spec, bin);
+      const { banner, detail } = await verifyOne({ ...spec, transport }, bin);
       console.log(`通过\n    ${detail}`);
       if (banner) console.log(`    ${banner}`);
     } catch (err) {
