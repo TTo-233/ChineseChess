@@ -2,7 +2,7 @@
  * 生成自包含引擎宿主（两个产物，共享同一份 UCI 逻辑）
  *
  *   assets/engines/pikafish_worker.bin → Web 端 Dedicated Worker（classic worker）
- *   assets/engines/pikafish.page        → Android/iOS WebView 离线页
+ *   assets/engines/pikafish.html       → Android/iOS WebView 离线页
  *
  * ⚠️ worker 脚本用 **.bin** 后缀（而不是 .js）：.js 属于 Metro 的 sourceExts，
  *    会被 Babel/JSX 管线转译，那两段 5.5MB 的 base64 会被逐字符处理——
@@ -12,14 +12,23 @@
  *
  * ⚠️ 产物文件名的 **stem 必须彼此不同**（2026-10 Android 构建阻塞修复）：
  *    这些产物会被 Metro 打进 Android `res/raw/`，而 AAPT 以
- *    「**去掉最后一个扩展名**的相对路径」作资源名，
- *    `pikafish.page` 与 `pikafish.wasm` 会压成同一个
- *    raw/assets_engines_pikafish → Duplicate resources，
- *    构建在 mergeReleaseResources 失败（实测：Run gradlew 跑了近 6 分钟后报错）。
+ *    「**去掉最后一个扩展名**的相对路径」作资源名，stem 相同的两个文件会压成
+ *    同一个 raw 资源 → Duplicate resources，构建在 mergeReleaseResources 失败
+ *    （实测：Run gradlew 跑了近 6 分钟后报错）。
  *    ⚠️ 改扩展名**没用**（被剥离的是最后一个点之后的任意后缀），
  *       必须改扩展名之前的那一段。故命名统一为
- *       pikafish_worker.bin / pikafish_wasm.wasm / pikafish_nnue.nnue / pikafish.page。
+ *       pikafish_worker.bin / pikafish_wasm.wasm / pikafish_nnue.nnue / pikafish.html。
  *    该约束由 client/scripts/verify-asset-resource-names.mjs 常态校验。
+ *
+ * ⚠️⚠️ 原生端离线页**必须叫 .html，绝不能回退到 .page**（2026-10 真机实锤）：
+ *    expo-asset 把 res/raw 资源复制进应用 cache 时**原样保留扩展名**，
+ *    WebView 以 `file://…/ExponentAsset-<hash>.<ext>` 导航时**按扩展名**决定
+ *    Content-Type：`.page` 无注册 MIME → text/plain → 整页进 <pre>、
+ *    0 个 <script> 执行 → host-loaded 永不到来 → 引擎必然启动超时。
+ *    （PTP-AN10 真机 CDP 实测 contentType==='text/plain'、scriptCount===0。）
+ *    当年改 .page 是因为旧产物 pikafish.html 与 pikafish.wasm 同 stem 撞资源名；
+ *    现产物 stem 已唯一（pikafish / pikafish_wasm / pikafish_nnue / pikafish_worker），
+ *    .html 不再撞名，而 .page 的渲染坑是真实的——两害相权，回 .html。
  *
  * ============================================================================
  * 【为什么在构建期把 UCI 逻辑内联进产物，而不是写 TS 让 Metro 打包】
@@ -73,23 +82,27 @@ const OUT_DIR = path.join(clientRoot, 'assets', 'engines');
  * AAPT 以「**去掉最后一个扩展名**的相对路径」生成 raw 资源名，于是
  *   pikafish_wasm.wasm  → raw/assets_engines_pikafish_wasm
  *   pikafish_nnue.nnue  → raw/assets_engines_pikafish_nnue
- *   pikafish.page       → raw/assets_engines_pikafish
+ *   pikafish.html       → raw/assets_engines_pikafish
  *   pikafish_worker.bin → raw/assets_engines_pikafish_worker
  *
  * ⚠️ 关键：**改扩展名无效**（被剥离的是"最后一个点之后的任意后缀"，
  *    与后缀是什么无关）。必须改 stem。
+ *    （曾因此把页面命名成 pikafish.page——但 expo-asset 复制进 cache 会保留
+ *    .page 扩展名，WebView 按 text/plain 渲染、脚本不执行，见文件头长注释。
+ *    现在 wasm/nnue 已改名 pikafish_wasm/pikafish_nnue，stem 互异，页面安全回 .html。）
  *
  * 该约束由 client/scripts/verify-asset-resource-names.mjs 常态校验（已进 pnpm -w validate），
  * 因此新增引擎产物时它会立刻拦下，而不是让你等一次 6 分钟的 Gradle 构建。
  */
 const WORKER_OUT = path.join(OUT_DIR, 'pikafish_worker.bin');
 /**
- * 原生端离线页（内联了 wasm + NNUE 的 base64，单文件自包含）。
+ * 原生端离线页（小页面 + 运行时 fetch 两个二进制，见 HTML_BODY 说明）。
  *
- * 由屏幕外 WebView 加载，`.page` 后缀仅为与常规 HTML 资源区分（需在
- * metro.config.js 的 assetExts 登记）。对 WebView 完全透明——它按内容解析。
+ * ⚠️ 扩展名必须是 .html：原生端经 expo-asset 落成 file:// 缓存文件后，
+ * WebView 按扩展名决定 Content-Type（.page → text/plain → 脚本不执行）。
+ * 详见文件头「必须叫 .html」的长注释。
  */
-const HTML_OUT = path.join(OUT_DIR, 'pikafish.page');
+const HTML_OUT = path.join(OUT_DIR, 'pikafish.html');
 /** Web 端 Worker 直接 fetch 的二进制（不再 base64 内联，见下方性能说明） */
 const WASM_OUT = path.join(OUT_DIR, 'pikafish_wasm.wasm');
 const NNUE_OUT = path.join(OUT_DIR, 'pikafish_nnue.nnue');
@@ -248,7 +261,7 @@ const WORKER_BODY = `/* eslint-disable */
  * pikafish.wasm / pikafish.nnue，可在无 require/__dirname/fs 的环境运行。
  * Pikafish 引擎为 GPL-3.0，权重受其独立许可约束；本项目仅内部娱乐使用。
  *
- * 协议（与 pikafish.page 基本一致，差别只在 bootstrap 带 URL）：
+ * 协议（与 pikafish.html 基本一致，差别只在 bootstrap 带 URL）：
  *   in : {type:'bootstrap',wasmUrl,nnueUrl}
  *        {type:'search',seq,commands,randomPick} {type:'stop'} {type:'dispose'}
  *   out: {type:'host-loaded'} {type:'ready',banner,options} {type:'result',seq,result,fatal?}
@@ -651,13 +664,15 @@ fs.mkdirSync(OUT_DIR, { recursive: true });
 /**
  * 清理历史遗留的旧命名产物。
  *
- * ⚠️ 这一步不是"顺手删"，而是构建能否通过的**前提**：
- * 旧名 `pikafish.html` 若留在 assets/engines/ 里，Metro 仍会把它打进
- * res/raw/，资源名与 `pikafish.wasm` / `pikafish.nnue` 撞名，
- * Android 构建又会以 Duplicate resources 失败——而生成脚本本身"看起来是绿的"。
+ * ⚠️ 这一步不是"顺手删"，而是防止旧文件继续被打进 res/raw：
+ *   · `pikafish.wasm` / `pikafish.nnue` / `pikafish.worker.bin` —— 与现行产物
+ *     同 stem 撞 AAPT 资源名 → Duplicate resources，Gradle 构建失败；
+ *   · `pikafish.page` —— 2026-10 真机故障的旧名：expo-asset 复制进 cache 保留
+ *     .page 扩展名，WebView 按 text/plain 渲染、脚本不执行（见文件头说明）。
+ *   不清理的话新产物即使生成了，旧的坑文件也还在包里。
  */
 for (const stale of [
-  'pikafish.html',
+  'pikafish.page',
   'pikafish.wasm',
   'pikafish.nnue',
   'pikafish.worker.bin',

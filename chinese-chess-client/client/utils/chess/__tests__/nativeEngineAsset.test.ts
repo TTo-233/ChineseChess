@@ -60,12 +60,13 @@ describe('原生引擎资源：可导航性判据（打包态根因）', () => {
   );
 
   it('WebView 真正能导航的形态必须判为「可导航」', () => {
-    // 修复后 expo-asset 交出来的 file:// 缓存 URI
-    expect(isNavigableUri('file:///data/user/0/com.x/cache/ExponentAsset-abc.page')).toBe(true);
+    // 修复后 expo-asset 交出来的 file:// 缓存 URI（扩展名必须是 .html，
+    // WebView 按扩展名定 Content-Type——.page 曾导致 text/plain 渲染、脚本不执行）
+    expect(isNavigableUri('file:///data/user/0/com.x/cache/ExponentAsset-abc.html')).toBe(true);
     // 开发态 Metro 的 http 形态
-    expect(isNavigableUri('http://localhost:8081/assets/engines/pikafish.page')).toBe(true);
+    expect(isNavigableUri('http://localhost:8081/assets/engines/pikafish.html')).toBe(true);
     // https
-    expect(isNavigableUri('https://example.com/a.page')).toBe(true);
+    expect(isNavigableUri('https://example.com/a.html')).toBe(true);
     // content:// 与 android.resource:// 也是合法 scheme
     expect(isNavigableUri('content://com.x/raw/engines_pikafish')).toBe(true);
     expect(isNavigableUri('android.resource://com.x/raw/engines_pikafish')).toBe(true);
@@ -77,21 +78,21 @@ describe('原生引擎资源：可导航性判据（打包态根因）', () => {
   });
 
   it('前导空白的合法 URL 仍应可导航（判据要容忍 trim）', () => {
-    expect(isNavigableUri('  file:///a.page  ')).toBe(true);
+    expect(isNavigableUri('  file:///a.html  ')).toBe(true);
   });
 
   /**
-   * 关键回归：`.page` 这类"看起来像文件"的后缀不能被误判成 scheme。
+   * 关键回归：`.html` 这类"看起来像文件"的后缀不能被误判成 scheme。
    *
    * 判据用 `<scheme>:<...>`，而不是"有没有点"。若哪天有人把它写成
-   * "只要不是 http 就当路径"之类的启发式，这条例子里 'a.page:b' 这种
+   * "只要不是 http 就当路径"之类的启发式，这条例子里 'a.html:b' 这种
    * 会被错判 —— 这里把边界钉死。
    */
   it('单字符 scheme 合法；不含冒号的一律不可导航', () => {
     expect(isNavigableUri('x:opaque')).toBe(true);
     expect(isNavigableUri('engines.pikafish')).toBe(false);
-    expect(isNavigableUri('./engines/pikafish.page')).toBe(false);
-    expect(isNavigableUri('../pikafish.page')).toBe(false);
+    expect(isNavigableUri('./engines/pikafish.html')).toBe(false);
+    expect(isNavigableUri('../pikafish.html')).toBe(false);
   });
 });
 

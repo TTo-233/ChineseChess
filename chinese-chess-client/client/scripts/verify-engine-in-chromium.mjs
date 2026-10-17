@@ -53,7 +53,7 @@ const ENGINE_DIR = path.join(clientRoot, 'assets', 'engines');
 /** 逐个引擎的验证规格 */
 const SPECS = {
   pikafish: {
-    file: 'pikafish.page',
+    file: 'pikafish.html',
     label: '皮卡鱼（象棋）',
     /**
      * ⚠️ bootstrap 必须带 wasmUrl/nnueUrl（2026-10 真机修复后页面改为 fetch 二进制，
@@ -91,7 +91,7 @@ const SPECS = {
     describe: (msg) => `bestmove=${msg.result.uci} depth=${msg.result.depth} ${msg.result.timeMs}ms`,
   },
   jieqi: {
-    file: 'jieqi.page',
+    file: 'jieqi.html',
     label: '揭棋引擎',
     bootstrap: {
       type: 'session',
@@ -292,7 +292,7 @@ async function verifyOne(spec, bin) {
      * 页面 + 二进制的承载方式。
      *
      * 【2026-10 新增 file:// 模式】这是**真机的真实条件**。原生 WebView 用
-     * `{uri: file://…/pikafish.page}` 加载，origin 为 null（opaque origin）。
+     * `{uri: file://…/pikafish.html}` 加载，origin 为 null（opaque origin）。
      * 此前本脚本一律用 http:// 提供资源，于是"fetch 在 opaque origin 下被
      * 判跨源拒绝"这个真机致命故障在这里**永远测不出来**（假绿灯），
      * 结果引擎改成 fetch 取二进制后，真机 100% 起不来而闸门全绿。
@@ -322,10 +322,13 @@ async function verifyOne(spec, bin) {
        *    曾试过 data:text/html —— 那是不透明 origin 且**根本无法访问 file:**，
        *    会把"XHR 能否取到字节"这个真问题替换成一个更早的假失败。
        *
-       * 2) 但 .page 扩展名会被 Chrome 当纯文本渲染（<pre>，0 个 <script>，脚本
-       *    根本不执行 —— 这正是本闸门此前"永远绿"的隐藏原因）。
-       *    所以把页面内容复制成 .html 再用 file:// 加载：origin 仍是 file://，
-       *    脚本会执行，且二进制仍走绝对 file:// 路径。
+       * 2) 历史教训（已在产物侧根治）：产物曾命名 .page，Chrome/WebView 会把它
+       *    当纯文本渲染（<pre>，0 个 <script>，脚本根本不执行）。真机上的
+       *    expo-asset 恰恰**原样保留扩展名**，于是真机 WebView 拿到的就是
+       *    file://…/ExponentAsset-<hash>.page —— text/plain、脚本不执行、
+       *    host-loaded 永不到来（真机 CDP 实测 contentType==='text/plain'、
+       *    scriptCount===0）。产物已回 .html；本场景保留，正是守住
+       *    "file:// + 真实扩展名"这一层。探针侧仍复制成 engine.html 加载。
        */
       const stageDir = fs.mkdtempSync(path.join(process.env.TEMP || '/tmp', 'engine-file-'));
       const staged = path.join(stageDir, 'engine.html');

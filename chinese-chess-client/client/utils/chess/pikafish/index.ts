@@ -53,13 +53,16 @@ function requireWorkerAsset(): unknown {
 }
 
 /**
- * ⚠️ 扩展名是 `.page` 而不是 `.html`（2026-10 Android 构建阻塞修复）。
- * Metro 会把这些产物打进 Android `res/raw/`，AAPT 以「去扩展名的路径」作资源名，
- * 同名不同扩展名会压成 Duplicate resources，让 mergeReleaseResources 失败。
- * 详见 metro.config.js 的说明。
+ * ⚠️ 扩展名必须是 `.html`（2026-10 真机实锤修复，勿回退）：
+ * 原生端经 expo-asset 落成 `file://…/ExponentAsset-<hash>.<ext>` 缓存文件后，
+ * WebView **按扩展名**决定 Content-Type——`.html` 得 text/html 且脚本执行；
+ * 自造扩展名（曾用 .page）得 text/plain、整页进 <pre>、0 个脚本执行，
+ * host-loaded 永不到来，引擎必然启动超时（PTP-AN10 CDP 实测）。
+ * AAPT 资源名唯一性看 stem（pikafish 与 pikafish_wasm 等互异），.html 不再撞名。
+ * 详见 metro.config.js 与 gen-pikafish-host.mjs 的说明。
  */
 function requireHtmlAsset(): unknown {
-  return require('../../../assets/engines/pikafish.page');
+  return require('../../../assets/engines/pikafish.html');
 }
 
 /** Web 端 Worker 直接 fetch 的二进制（不再 base64 内联，见生成脚本说明） */
@@ -160,13 +163,13 @@ export type { EngineHostSource } from './engineTransport';
 export async function getEngineHostSource(): Promise<EngineHostSource> {
   const asset = requireHtmlAsset();
 
-  // bundler 把 .page 当文本模块导出时，字符串本身就是 HTML 源码（不是 URL）。
+  // bundler 把 .html 当文本模块导出时，字符串本身就是 HTML 源码（不是 URL）。
   if (typeof asset === 'string' && asset.trimStart().startsWith('<')) {
     return { html: asset };
   }
 
   // 原生：资源 id → file:// 本地缓存 URI（WebView 可导航）
-  return { uri: await resolveNativeAssetUri(asset, 'pikafish.page', 'page') };
+  return { uri: await resolveNativeAssetUri(asset, 'pikafish.html', 'html') };
 }
 
 /** 是否需要挂载屏幕外引擎宿主（仅原生端；Web 走 Worker） */

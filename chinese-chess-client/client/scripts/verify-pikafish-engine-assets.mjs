@@ -31,7 +31,7 @@ const repoRoot = path.resolve(clientRoot, '..', '..');
 const engineDir = path.join(clientRoot, 'assets', 'engines');
 
 const WORKER = path.join(engineDir, 'pikafish_worker.bin');
-const HTML = path.join(engineDir, 'pikafish.page');
+const HTML = path.join(engineDir, 'pikafish.html');
 const WASM = path.join(engineDir, 'pikafish_wasm.wasm');
 const NNUE = path.join(engineDir, 'pikafish_nnue.nnue');
 
@@ -74,7 +74,10 @@ const REQUIRED_MARKERS = [
  *     ⚠️ 但标记级判据的覆盖范围只有文件前 ~3%，loader 主体在盲区里 ——
  *     真正的强判据是文件末尾的 verifyEmbedsLoader（逐字符包含源 loader 全文），
  *     它才能抓住截断/等长破坏/旧 loader 产物。
- *   · pikafish.page —— 仍是大文件（内联 base64，供原生 WebView），保留下限校验。
+ *   · pikafish.html —— 同样是"小页面 + fetch"（原生 WebView 承载，与 Worker 同构）。
+ *     ⚠️ 2026-10 真机实锤：该页面经 expo-asset 落成 file:// 缓存文件，扩展名被
+ *     原样保留、WebView 按扩展名定 Content-Type——必须保持 .html（text/html），
+ *     换成 .page 等自造扩展名会以 text/plain 渲染、脚本不执行（引擎必挂）。
  */
 function checkFile(file, extraMarkers = [], minSize = 0) {
   if (!fs.existsSync(file)) {
@@ -164,7 +167,7 @@ const html = checkFile(
 if (html) {
   if (html.stat.size > 1024 * 1024) {
     errors.push(
-      `pikafish.page 体积异常（${html.stat.size} B > 1MiB）：应当是「小页面 + fetch 二进制」，` +
+      `pikafish.html 体积异常（${html.stat.size} B > 1MiB）：应当是「小页面 + fetch 二进制」，` +
         `若达到 MiB 量级说明又退回内联 base64，真机内存/解析风险回归。` +
         `请重新执行 node client/scripts/gen-pikafish-host.mjs`
     );
@@ -172,7 +175,7 @@ if (html) {
   for (const marker of ['var DATA_B64', 'var WASM_B64']) {
     if (html.text.includes(marker)) {
       errors.push(
-        `pikafish.page 仍内联二进制（${marker}）：原生端应改为 fetch 独立 wasm/nnue 资源。` +
+        `pikafish.html 仍内联二进制（${marker}）：原生端应改为 fetch 独立 wasm/nnue 资源。` +
           `请重新执行 node client/scripts/gen-pikafish-host.mjs`
       );
     }
@@ -230,7 +233,7 @@ if (worker && /var DATA_B64\s*=/.test(worker.text)) {
 }
 if (html && /var DATA_B64\s*=/.test(html.text)) {
   errors.push(
-    'pikafish.page 仍内联 DATA_B64（旧版产物）。' +
+    'pikafish.html 仍内联 DATA_B64（旧版产物）。' +
       '请重新执行 node client/scripts/gen-pikafish-host.mjs'
   );
 }
@@ -287,7 +290,7 @@ function verifyEmbedsLoader(result, label) {
 }
 
 verifyEmbedsLoader(worker, 'pikafish_worker.bin');
-verifyEmbedsLoader(html, 'pikafish.page');
+verifyEmbedsLoader(html, 'pikafish.html');
 
 if (errors.length > 0) {
   console.error('verify-pikafish-engine-assets: 引擎产物校验失败：');
@@ -300,4 +303,4 @@ console.log('verify-pikafish-engine-assets: 引擎产物校验通过 ✓');
 if (worker) console.log(`  pikafish_worker.bin ${worker.stat.size} B（小：靠 fetch 拉二进制）`);
 if (wasmStat) console.log(`  pikafish_wasm.wasm      ${wasmStat.size} B`);
 if (nnueStat) console.log(`  pikafish_nnue.nnue      ${nnueStat.size} B`);
-if (html) console.log(`  pikafish.page      ${html.stat.size} B（原生端：小页面 + fetch 二进制）`);
+if (html) console.log(`  pikafish.html      ${html.stat.size} B（原生端：小页面 + fetch 二进制）`);

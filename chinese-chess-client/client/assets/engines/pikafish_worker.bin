@@ -10,7 +10,7 @@
  * pikafish.wasm / pikafish.nnue，可在无 require/__dirname/fs 的环境运行。
  * Pikafish 引擎为 GPL-3.0，权重受其独立许可约束；本项目仅内部娱乐使用。
  *
- * 协议（与 pikafish.page 基本一致，差别只在 bootstrap 带 URL）：
+ * 协议（与 pikafish.html 基本一致，差别只在 bootstrap 带 URL）：
  *   in : {type:'bootstrap',wasmUrl,nnueUrl}
  *        {type:'search',seq,commands,randomPick} {type:'stop'} {type:'dispose'}
  *   out: {type:'host-loaded'} {type:'ready',banner,options} {type:'result',seq,result,fatal?}

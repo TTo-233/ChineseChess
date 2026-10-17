@@ -1,14 +1,78 @@
 # 客户端本地皮卡鱼离线集成
 
-## 【真机二次定位】引擎在打包 APP 里依然起不来：真正根因（2026-10 定案）
+## 【真机三次定位】expo-asset 保留扩展名 + WebView 按扩展名定 Content-Type（2026-10 定案）
 
 ### 一句话结论
 
-上一轮修复把「Android 裸资源名无法被 WebView 导航」这个**症状**处理对了，
-但它依赖的 `expo-asset` **根本没有被装进 APP** —— 于是新写的转换函数
-一进真机就抛 `MODULE_NOT_FOUND`，两个引擎一次都没起来过。
+前两轮修好「资源怎么读」之后，最后一环栽在**文件扩展名**上：
+产物命名成 `.page`，而 expo-asset 把它复制进应用 cache 时**原样保留扩展名**，
+WebView 以 `file://…/ExponentAsset-<hash>.page` 导航时**按扩展名**决定
+Content-Type —— `.page` 无注册 MIME → `text/plain` → 整页 HTML 源码进
+`<pre>`、**0 个 `<script>` 执行** → `host-loaded` 永不到来 → 45s 启动超时 →
+退避重试 → 永久降级「皮卡鱼启动中 / 基础AI」。两个引擎（pikafish + jieqi）同灭。
 
-**最值得记住的教训：手写的 `declare module` 能骗过 tsc 和单测，却骗不过 Metro 与设备。**
+### 证据链（全部来自 PTP-AN10 真机，非推理）
+
+修复前后各取一轮 CDP（`adb forward tcp:7777 localabstract:webview_devtools_remote_<pid>`
++ DevTools `/json` + `Runtime.evaluate`）：
+
+| 指标 | 修复前（.page） | 修复后（.html） |
+|---|---|---|
+| 页面 URL | `file://…/ExponentAsset-…​.page` | `file://…/ExponentAsset-…​.html` |
+| `document.contentType` | `text/plain` | **`text/html`** |
+| `scriptCount` | **0**（脚本从未执行） | **1** |
+| `<title>` | 文件名（没被解析） | `Pikafish Host` / `Jieqi Host` |
+| 引擎结果 | 启动超时 45000ms 退避重试 | **bestmove=h2e2 depth=6 15ms（真机实搜）**；揭棋 `banner=Pikafish 2026-10-09` |
+
+配套证据：
+* 设备 `run-as` 直读 cache：`cache/ExponentAsset-*.page` —— expo-asset 复制时**不改扩展名**；
+* dev build 真机 logcat 被系统抑制（仅 4 行），RN JS 日志走 Metro 通道 ——
+  那条「本地引擎启动失败（第 1/6 次），2000ms 后重试: 引擎启动超时（45000ms）」
+  就是从 Metro 日志拿到的第一手故障记录。
+
+### 为什么前两轮都没抓到它
+
+| 轮次 | 修了什么 | 为什么漏掉扩展名 |
+|---|---|---|
+| 1c7a841 | 裸资源名 → expo-asset file:// 通道 | file:// 通道**打通了**，但 `.page` 在 file:// 下渲染成了 text/plain |
+| 0f31a2c | fetch/XHR 双通道取二进制 | Chromium 探针已实测过「.page 会被当纯文本」，但只把它当**探针脚本的注意事项**（复制成 .html 再加载），没意识到真机 expo-asset 缓存文件同样带 .page、处于同一坑中 |
+
+结构性盲区依旧成立：`verify-engine-in-chromium.mjs` 的 file:// 场景把页面
+**复制成 engine.html 再加载**——等于替真机把扩展名的坑填掉了，所以闸门全绿。
+真机 CDP（`webview_devtools_remote_<pid>`）是唯一能看到「真实加载形态」的手段。
+
+### 当年为什么用 .page，现在为什么能回 .html
+
+* `.page` 的由来：旧产物 `pikafish.html` 与 `pikafish.wasm` **同 stem**（pikafish），
+  AAPT 资源名 = 去掉最后一个扩展名的路径 → 撞成 `raw/assets_engines_pikafish`
+  → Duplicate resources，Gradle 构建失败。
+* 但撞不撞名**只看 stem，与扩展名无关**；后来二进制已改名
+  `pikafish_wasm.wasm` / `pikafish_nnue.nnue` / `pikafish_worker.bin`（jieqi 同构），
+  stem 互异，页面用回 `.html` 不会撞名（`verify-asset-resource-names.mjs` 常态校验）。
+
+### 修复
+
+1. 产物改名：`pikafish.page` → **`pikafish.html`**、`jieqi.page` → **`jieqi.html`**
+   （gen-pikafish-host.mjs / gen-jieqi-host.mjs，stale 清理同步更新）；
+2. 运行时 require 与缓存键同步（`pikafish/index.ts`、`pikafish/jieqiHost.ts`）；
+3. `metro.config.js`：`.page` MIME 表项删除（`.html` 本就是 Metro 默认 assetExt），
+   dev 中间件显式登记 `text/html`；
+4. 三个 verify 脚本与单测的文件名/断言同步；
+5. 教训写进各文件注释：**给 WebView 导航的文件，扩展名必须是 WebView 认识的**——
+   自造扩展名在 res/raw 阶段无害，到 file:// 导航这一步就是致命伤。
+
+### 真机验证状态
+
+以上修复已在 PTP-AN10 真机（development build + Metro + adb reverse）端到端复验：
+两个引擎 WebView 均 `contentType=text/html`、脚本执行、
+皮卡鱼真机实搜出 `bestmove=h2e2`（depth 6, 15ms）、揭棋会话完整跑出 banner 与 bestmove。
+打包态（release APK）行为与 dev build 在这一环上同构（同一 expo-asset 缓存路径），
+但**发布前仍应在打包态做一次冒烟**——这是本文档反复出现的那条原则：
+自动化验证覆盖不到的形态，只能靠实机确认。
+
+---
+
+## 【真机二次定位】expo-asset 缺失：打包 APP 里引擎依然起不来（2026-10，已被上节接续）
 
 ### 证据链（全部来自 adb 抓取的真机安装包，非推测）
 
@@ -25,7 +89,7 @@
 > 这一点用 `resources.arsc` 的字符串池反查确认（该表字符串是 UTF-8，
 > 一开始误按 UTF-16 搜索而误判为"资源不在包里"，这个坑值得记一笔）。
 
-### 为什么上一版能一路绿灯
+### 为什么那一版能一路绿灯
 
 那一版为了让它「类型上可用」，给 `expo-asset` 补了一份 `declare module` shim。
 结果是把这个**运行时依赖缺失**从编译期错误，降级成了运行期才炸、
@@ -37,7 +101,7 @@ tsc 全绿  +  869 单测全绿  +  Chromium 探针全绿  +  构建成功
               真机：引擎永远「启动中」
 ```
 
-### 修复
+### 二次定位的修复
 
 1. `expo-asset` 升为 **client 的直接依赖**（`~12.0.12`），原生模块随 prebuild 进 dex；
 2. **删除** `declarations.d.ts` 里的 `declare module 'expo-asset'` shim，

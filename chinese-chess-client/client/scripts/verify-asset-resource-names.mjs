@@ -34,7 +34,12 @@
  * 已知的历史坑（已修复，改名时勿回退）：
  *   pikafish.html / pikafish.wasm / pikafish.nnue  → 三者曾全叫 raw/assets_engines_pikafish
  *   jieqi.html   / jieqi.wasm                       → 二者曾全叫 raw/assets_engines_jieqi
- * 现统一改用 .page / .wasm / .nnue / .bin 四种互不相同的扩展名。
+ * 现靠**唯一 stem**（pikafish / pikafish_wasm / pikafish_nnue / pikafish_worker，jieqi 同构）规避。
+ *
+ * ⚠️ 另一个方向的真实坑（2026-10 真机实锤）：页面产物**必须保持 .html**，不要为
+ *   规避本文件的问题改用 .page 之类自造扩展名——expo-asset 复制进 cache 保留扩展名，
+ *   WebView 按扩展名定 Content-Type，.page 会以 text/plain 渲染、脚本不执行，
+ *   引擎必然启动超时（stem 唯一即可，扩展名用标准的 .html 两头都安全）。
  */
 
 import fs from 'node:fs';
@@ -119,7 +124,9 @@ if (conflicts.length > 0) {
       '      因此**扩展名不同、但去掉扩展名后同路径**的文件会互相覆盖\n' +
       '      （Duplicate resources），构建在 :app:mergeReleaseResources 失败。\n' +
       '\n修复：让文件名在**扩展名之前**就彼此不同（改 stem，不是改扩展名）。\n' +
-      '      例如 jieqi.page + jieqi.wasm → jieqi_offline.page + jieqi.wasm。'
+      '      例如 jieqi.html + jieqi.wasm → jieqi.html + jieqi_wasm.wasm。\n' +
+      '      ⚠️ 不要为规避本冲突改用 .page 之类的自造扩展名：expo-asset 保留\n' +
+      '      扩展名，WebView 对 .page 按 text/plain 渲染、脚本不执行（真机实锤）。'
   );
   process.exit(1);
 }

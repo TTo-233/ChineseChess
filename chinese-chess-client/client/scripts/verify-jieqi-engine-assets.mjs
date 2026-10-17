@@ -5,8 +5,12 @@
  * 防止「改了引擎源却忘了重新生成产物」这类静默漂移。
  *
  * 与 verify-pikafish-engine-assets.mjs 的分工：
- *   那个管象棋（pikafish_worker.bin / pikafish_wasm.wasm / pikafish_nnue.nnue / pikafish.page）
- *   这个管揭棋（jieqi_worker.bin / jieqi_wasm.wasm / jieqi.page）
+ *   那个管象棋（pikafish_worker.bin / pikafish_wasm.wasm / pikafish_nnue.nnue / pikafish.html）
+ *   这个管揭棋（jieqi_worker.bin / jieqi_wasm.wasm / jieqi.html）
+ *
+ * ⚠️ 离线页必须保持 .html 扩展名（2026-10 真机实锤）：expo-asset 复制进 cache
+ *    保留扩展名，WebView 按扩展名定 Content-Type——.html 得 text/html 且脚本执行；
+ *    .page 等自造扩展名得 text/plain、整页进 <pre>、0 个脚本执行，引擎必挂。
  *
  * 用法：node client/scripts/verify-jieqi-engine-assets.mjs
  */
@@ -35,7 +39,7 @@ const SRC_CORE = path.join(SRC_DIR, 'worker-core.js');
 
 const OUT_WORKER = path.join(ASSET_DIR, 'jieqi_worker.bin');
 const OUT_WASM = path.join(ASSET_DIR, 'jieqi_wasm.wasm');
-const OUT_HTML = path.join(ASSET_DIR, 'jieqi.page');
+const OUT_HTML = path.join(ASSET_DIR, 'jieqi.html');
 
 const errors = [];
 const warns = [];
@@ -145,7 +149,7 @@ if (errors.length === 0) {
   }
 
   // ==========================================================================
-  // 7. jieqi.page —— 原生 WebView 的自包含离线页（Hermes 跑不了 wasm，必须有）
+  // 7. jieqi.html —— 原生 WebView 的自包含离线页（Hermes 跑不了 wasm，必须有）
   //
   // 与 worker.bin 的关键差异：**内联 wasm base64**。原生 WebView 以 inline HTML
   // 承载时没有可用同源 origin，fetch 兄弟资源会被跨源/CORS 挡住，内联是唯一稳妥选择。
@@ -153,7 +157,7 @@ if (errors.length === 0) {
   let htmlStat = null;
   if (!fs.existsSync(OUT_HTML)) {
     errors.push(
-      `缺少产物 assets/engines/jieqi.page（原生端引擎页）。请执行：node client/scripts/gen-jieqi-host.mjs`
+      `缺少产物 assets/engines/jieqi.html（原生端引擎页）。请执行：node client/scripts/gen-jieqi-host.mjs`
     );
   } else {
     htmlStat = fs.statSync(OUT_HTML);
@@ -165,7 +169,7 @@ if (errors.length === 0) {
     //     取 400KB —— 低于此说明 wasm base64 没被内联。
     if (htmlStat.size < 400 * 1024) {
       errors.push(
-        `assets/engines/jieqi.page 体积异常（${htmlStat.size} B），疑似未内联 wasm base64`
+        `assets/engines/jieqi.html 体积异常（${htmlStat.size} B），疑似未内联 wasm base64`
       );
     }
 
@@ -180,7 +184,7 @@ if (errors.length === 0) {
     ]) {
       if (!html.includes(marker)) {
         errors.push(
-          `assets/engines/jieqi.page 缺少关键标记 ${JSON.stringify(marker)}（产物可能被截断或改写）`
+          `assets/engines/jieqi.html 缺少关键标记 ${JSON.stringify(marker)}（产物可能被截断或改写）`
         );
       }
     }
@@ -199,7 +203,7 @@ if (errors.length === 0) {
       'lines: out.lines',
     ]) {
       if (!html.includes(marker)) {
-        errors.push(`assets/engines/jieqi.page 缺少协议关键字 ${JSON.stringify(marker)}`);
+        errors.push(`assets/engines/jieqi.html 缺少协议关键字 ${JSON.stringify(marker)}`);
       }
     }
 
@@ -215,7 +219,7 @@ if (errors.length === 0) {
     ]) {
       if (!html.includes(marker)) {
         errors.push(
-          `assets/engines/jieqi.page 缺少注入点标记 ${JSON.stringify(marker)}` +
+          `assets/engines/jieqi.html 缺少注入点标记 ${JSON.stringify(marker)}` +
             `（jieqi glue 无 instantiateWasm 钩子，内联字节依赖 locateFile + fetch 接管）`
         );
       }
@@ -225,7 +229,7 @@ if (errors.length === 0) {
     //      设了之后 UCI loop 会看到 EOF 直接退出、一条命令都不执行。
     if (/noInitialRun\s*:\s*true/.test(html)) {
       errors.push(
-        `assets/engines/jieqi.page 显式设置了 noInitialRun —— glue 将不会调用 ` +
+        `assets/engines/jieqi.html 显式设置了 noInitialRun —— glue 将不会调用 ` +
           `callMain()，UCI::loop() 读 stdin 立刻见 EOF，引擎一条命令都不执行。`
       );
     }
@@ -233,7 +237,7 @@ if (errors.length === 0) {
     // 7.4c stdin 必须能表达 EOF（返回 null），否则 UCI::loop() 永不退出、整个会话挂死。
     if (!/stdinPos\s*>=\s*stdinText\.length\s*\)\s*return null/.test(html)) {
       errors.push(
-        `assets/engines/jieqi.page 的 stdin 未返回 null 表示 EOF —— ` +
+        `assets/engines/jieqi.html 的 stdin 未返回 null 表示 EOF —— ` +
           `UCI::loop() 会永久阻塞，会话永远收不到 done。`
       );
     }
@@ -242,11 +246,11 @@ if (errors.length === 0) {
     //     这是最强的一道判据：任何截断/等长替换/用旧 glue 生成的过期产物都会被抓住。
     if (!html.includes(glue)) {
       errors.push(
-        `assets/engines/jieqi.page 未完整内嵌 jieqi.js glue（逐字符包含校验失败）。` +
+        `assets/engines/jieqi.html 未完整内嵌 jieqi.js glue（逐字符包含校验失败）。` +
           `请重新执行：node client/scripts/gen-jieqi-host.mjs`
       );
     } else {
-      console.log(`  jieqi.page 完整内嵌 glue: ${glue.length} 字符（逐字符一致）`);
+      console.log(`  jieqi.html 完整内嵌 glue: ${glue.length} 字符（逐字符一致）`);
     }
 
     // 7.6 内嵌的 wasm base64 必须与仓库原件**逐字节一致**（解码回来比 sha256）。
@@ -254,7 +258,7 @@ if (errors.length === 0) {
     const m = /var WASM_B64 = '([A-Za-z0-9+/=]+)'/.exec(html);
     if (!m || !m[1]) {
       errors.push(
-        `assets/engines/jieqi.page 找不到 WASM_B64（内联 wasm base64）。` +
+        `assets/engines/jieqi.html 找不到 WASM_B64（内联 wasm base64）。` +
           `请重新执行：node client/scripts/gen-jieqi-host.mjs`
       );
     } else {
@@ -263,17 +267,17 @@ if (errors.length === 0) {
       const ah = sha256(embedded);
       if (eh !== ah) {
         errors.push(
-          `assets/engines/jieqi.page 内嵌 wasm 与仓库原件不一致（可能被转译破坏）：\n` +
+          `assets/engines/jieqi.html 内嵌 wasm 与仓库原件不一致（可能被转译破坏）：\n` +
             `    原件 sha256 ${eh}\n    产物 sha256 ${ah}`
         );
       } else {
-        console.log(`  jieqi.page 内嵌 wasm 逐字节一致: ${ah} (${wasm.length} B)`);
+        console.log(`  jieqi.html 内嵌 wasm 逐字节一致: ${ah} (${wasm.length} B)`);
       }
     }
 
     // 7.7 许可证声明（GPLv3 项目，产物内须保留）
     if (!/GPLv3|GPL-3\.0/i.test(html)) {
-      warns.push(`assets/engines/jieqi.page 未包含 GPLv3 许可证声明（GPL 合规要求保留）`);
+      warns.push(`assets/engines/jieqi.html 未包含 GPLv3 许可证声明（GPL 合规要求保留）`);
     }
   }
 }
@@ -296,4 +300,4 @@ const h = fs.statSync(OUT_HTML).size;
 console.log('verify-jieqi-engine-assets: 校验通过 ✓');
 console.log(`  jieqi_worker.bin ${w} B`);
 console.log(`  jieqi_wasm.wasm       ${wasm} B`);
-console.log(`  jieqi.page       ${h} B (${(h / 1048576).toFixed(2)} MiB, 原生 WebView 内联)`);
+console.log(`  jieqi.html       ${h} B (${(h / 1048576).toFixed(2)} MiB, 原生 WebView 内联)`);

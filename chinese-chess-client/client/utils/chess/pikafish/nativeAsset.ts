@@ -8,7 +8,7 @@
  * 在真机上从未真正跑起来；而 Web 端一切正常。
  *
  * 根因（已从 React Native 源码逐行核实，不是推测）：
- *   `require('assets/engines/pikafish.page')` 在原生端返回**数字资源 id**，
+ *   `require('assets/engines/pikafish.html')` 在原生端返回**数字资源 id**，
  *   交给 `Image.resolveAssetSource(id)` 后，RN 会走 AssetSourceResolver
  *   的 defaultAsset()：
  *
@@ -70,6 +70,25 @@
  * 而那份 `declare module` shim 已删除——让 tsc 重新对这个包负责。
  *
  * ============================================================================
+ * 【2026-10 三次定位：expo-asset 保留扩展名 + WebView 按扩展名定 Content-Type】
+ *
+ * 换成 file:// 之后引擎仍起不来（真机 logcat：启动超时 45000ms 退避重试）。
+ * CDP 连进真机 WebView 实测（PTP-AN10）：
+ *   · 页面 URL 是 file://…/cache/ExponentAsset-<hash>.page —— **扩展名原样保留**；
+ *   · document.contentType === 'text/plain'；
+ *   · document.querySelectorAll('script').length === 0，正文是 <pre> 包着的 HTML 源码。
+ * 即：expo-asset 复制资源进 cache 时**不改扩展名**，而 WebView（Chromium）导航
+ * file:// 时**按扩展名**决定 Content-Type——`.page` 无注册 MIME → text/plain →
+ * 页面脚本根本不执行 → host-loaded 永不到来 → 45s 启动超时。
+ *
+ * 修复：引擎页产物改名回 **.html**（gen-pikafish-host.mjs / gen-jieqi-host.mjs）。
+ * `.html` 在 WebView 的 file:// 下按 text/html 渲染，脚本正常执行。
+ * 当年弃用 .html 是因为旧产物与 pikafish.wasm 同 stem 撞 AAPT 资源名；
+ * 现 wasm/nnue/worker 已各自改名（pikafish_wasm/…），stem 互异，可安全回 .html。
+ * 教训：**给 WebView 导航的文件，扩展名必须是 WebView 认识的**——
+ * 自造扩展名在 res/raw 阶段无害，到 file:// 导航这一步就成了致命伤。
+ *
+ * ============================================================================
  * 【为什么不用 expo-file-system 自己读字节】
  *
  * 直觉上"自己读文件再内联 {html}"更可控，但在这台设备上不可行：
@@ -116,7 +135,7 @@ export function isNavigableUri(uri: string): boolean {
  * 把 Metro 资源 require 的结果解析成 WebView 可加载的 URI（异步）。
  *
  * @param asset `require(...)` 的返回值（数字 id / 字符串 / {uri}）
- * @param type  资源类型后缀，仅用于原生缓存文件名（如 'page'）
+ * @param type  资源类型后缀，仅用于日志/缓存键（如 'html'；缓存文件名由 expo-asset 决定）
  */
 async function resolveViaExpoAsset(asset: number, type: string): Promise<string> {
   // expo-asset 现在是 client 的**直接依赖**（见 package.json），

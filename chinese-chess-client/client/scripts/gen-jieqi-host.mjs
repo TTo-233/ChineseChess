@@ -3,13 +3,13 @@
  *
  *   assets/engines/jieqi_worker.bin → Web 端 Dedicated Worker（classic worker）
  *   assets/engines/jieqi_wasm.wasm  → Web 端 Worker 经同源 URL fetch 的 wasm
- *   assets/engines/jieqi.page        → Android/iOS WebView 离线自包含页
+ *   assets/engines/jieqi.html       → Android/iOS WebView 离线自包含页
  *
  * ============================================================================
  * 【为什么原生端必须另做一个 HTML 产物，而不是复用 Worker 产物】
  *
  * Hermes 不支持 WebAssembly，原生端跑不了 Worker 里的引擎。先例是皮卡鱼：
- * assets/engines/pikafish.page 把 loader + base64 内联的 wasm/nnue 全塞进一个离线页，
+ * assets/engines/pikafish.html 把 loader + base64 内联的 wasm/nnue 全塞进一个离线页，
  * 由屏幕外 WebView 以 inline HTML 加载（详见 gen-pikafish-host.mjs）。
  * 揭棋此前**只有** Worker 产物，于是原生端根本没有 AI 可用 —— 本脚本补上这一环。
  *
@@ -27,7 +27,7 @@
  * 详见 utils/chess/pikafish/jieqiHost.ts 顶部的架构约束说明。
  *
  * ⚠️ 因此 HTML 侧**必须可重复调用**：每次 session 都重新实例化一个 glue 实例，
- *    没有可复用的常驻实例（这一点与 pikafish.page 的长驻引擎不同）。
+ *    没有可复用的常驻实例（这一点与 pikafish.html 的长驻引擎不同）。
  *
  * ============================================================================
  * 【worker 产物后缀必须是 .bin（不是 .js）】
@@ -38,11 +38,13 @@
  *
  * ⚠️ 产物文件名的 **stem 必须彼此不同**（2026-10 Android 构建阻塞修复）：
  *    本目录产物会被 Metro 一起打进 Android `res/raw/`，而 AAPT 以
- *    「**去掉最后一个扩展名**的相对路径」作资源名，
- *    `jieqi.page` 与 `jieqi.wasm` 会压成同一个 raw/assets_engines_jieqi
- *    → Duplicate resources，构建在 mergeReleaseResources 失败（实测过）。
+ *    「**去掉最后一个扩展名**的相对路径」作资源名，stem 相同的两个文件会压成
+ *    同一个 raw 资源 → Duplicate resources，构建在 mergeReleaseResources 失败
+ *    （实测过）。
  *    ⚠️ 改扩展名**没用**（被剥离的是最后一个点之后的任意后缀），
- *       必须改扩展名之前的那一段。故命名统一为 jieqi_worker.bin / jieqi_wasm.wasm / jieqi.page。
+ *       必须改扩展名之前的那一段。故命名统一为 jieqi_worker.bin / jieqi_wasm.wasm / jieqi.html。
+ *    （页面曾因此命名成 jieqi.page——但 expo-asset 复制进 cache 保留 .page 扩展名，
+ *    WebView 按 text/plain 渲染、脚本不执行，见 HTML_OUT 的说明，已回 .html。）
  *    该约束由 client/scripts/verify-asset-resource-names.mjs 常态校验。
  *
  * ============================================================================
@@ -54,8 +56,8 @@
  *   data: 响应被物化为文本而报 "expected magic word 00 61 73 6d, found \"Asse\""。
  *   这正是 glue 原生支持的路径（fetch + instantiateStreaming），运行时传 URL 进来。
  *
- * · jieqi.page —— wasm **内联 base64**。原生 WebView 以 inline HTML 承载时没有可用的
- *   同源 origin，fetch 兄弟资源会被跨源/CORS 挡住，内联是唯一稳妥选择。
+ * · jieqi.html —— wasm **内联 base64**。原生 WebView 以 file:// 缓存文件承载时
+ *   没有可用的同源 origin，fetch 兄弟资源会被跨源/CORS 挡住，内联是唯一稳妥选择。
  *   （与 gen-pikafish-host.mjs 的 HTML 产物同一条理由。）
  *
  * ============================================================================
@@ -124,12 +126,14 @@ const OUT_DIR = path.join(clientRoot, 'assets', 'engines');
  *
  * AAPT 以「**去掉最后一个扩展名**的相对路径」生成 raw 资源名，于是
  *   jieqi_wasm.wasm  → raw/assets_engines_jieqi_wasm
- *   jieqi.page       → raw/assets_engines_jieqi
+ *   jieqi.html       → raw/assets_engines_jieqi
  *   jieqi_worker.bin → raw/assets_engines_jieqi_worker
  *
  * ⚠️ 关键：**改扩展名无效**。被剥离的是"最后一个点之后的任意后缀"，
- *    与后缀是什么无关——所以 `jieqi.html` 改成 `jieqi.page` 照样撞名
- *    （这一点先被假设验证过一轮，是错的）。必须改 stem。
+ *    与后缀是什么无关——当年 `jieqi.wasm` 与页面同 stem（jieqi）才是撞名根源，
+ *    改 wasm 的 stem（jieqi_wasm）才是正解，页面扩展名与此无关。
+ *    （页面一度改成 jieqi.page 规避，结果踩上 expo-asset 保留扩展名 +
+ *    WebView 按扩展名定 Content-Type 的坑，见 HTML_OUT 说明，已回 .html。）
  *
  * 该约束由 client/scripts/verify-asset-resource-names.mjs 常态校验（已进 pnpm -w validate）。
  */
@@ -137,10 +141,15 @@ const WORKER_OUT = path.join(OUT_DIR, 'jieqi_worker.bin');
 /**
  * 原生端离线页（wasm 以 base64 内联，单文件自包含）。
  *
- * `.page` 只是为了与常规 HTML 资源区分，需在 metro.config.js 的 assetExts
- * 登记后按原字节透传。对 WebView 完全透明——它按内容解析，不看后缀。
+ * ⚠️ 扩展名必须是 .html，绝不能用 .page（2026-10 真机实锤）：
+ * expo-asset 把 res/raw 资源复制进应用 cache 时**原样保留扩展名**，而 WebView
+ * 以 `file://…/ExponentAsset-<hash>.<ext>` 导航时**按扩展名**决定 Content-Type：
+ * `.page` 无注册 MIME → text/plain → 整页进 <pre>、0 个 <script> 执行 →
+ * host-loaded 永不到来 → 揭棋永远「基础AI」。（PTP-AN10 真机 CDP 实测。）
+ * 曾用 .page 是因为旧产物 jieqi.wasm 与页面同 stem（jieqi）撞 AAPT 资源名；
+ * 现 wasm 已改名 jieqi_wasm.wasm，stem 互异，页面安全回 .html。
  */
-const HTML_OUT = path.join(OUT_DIR, 'jieqi.page');
+const HTML_OUT = path.join(OUT_DIR, 'jieqi.html');
 const WASM_OUT = path.join(OUT_DIR, 'jieqi_wasm.wasm');
 
 const gluePath = path.join(SRC_DIR, 'jieqi.js');
@@ -458,11 +467,13 @@ fs.mkdirSync(OUT_DIR, { recursive: true });
 /**
  * 清理历史遗留的旧命名产物。
  *
- * ⚠️ 旧名 `jieqi.html` 若留在 assets/engines/ 里，Metro 仍会把它打进 res/raw/，
- * 资源名与 `jieqi.wasm` 撞名 → Duplicate resources，Android 构建失败，
- * 而本脚本本身"看起来是绿的"。不删就等于没改名。
+ * ⚠️ 旧文件若留在 assets/engines/ 里会继续被打进 res/raw：
+ *   · `jieqi.wasm` / `jieqi.worker.bin` —— 与现行产物同 stem 撞 AAPT 资源名
+ *     → Duplicate resources，Gradle 构建失败；
+ *   · `jieqi.page` —— 2026-10 真机故障的旧名：expo-asset 复制进 cache 保留
+ *     .page 扩展名，WebView 按 text/plain 渲染、脚本不执行（见 HTML_OUT 说明）。
  */
-for (const stale of ['jieqi.html', 'jieqi.wasm', 'jieqi.worker.bin']) {
+for (const stale of ['jieqi.page', 'jieqi.wasm', 'jieqi.worker.bin']) {
   const stalePath = path.join(OUT_DIR, stale);
   if (fs.existsSync(stalePath)) {
     fs.rmSync(stalePath);
@@ -481,7 +492,7 @@ console.log(`  ${path.relative(clientRoot, WORKER_OUT)}  ${ws} B`);
 console.log(`  ${path.relative(clientRoot, HTML_OUT)}  ${hs} B (${(hs / 1048576).toFixed(2)} MiB)  <- WebView (inlined)`);
 console.log(`  ${path.relative(clientRoot, WASM_OUT)}  ${wasm.length} B (sha256 ${wasmSha.slice(0, 16)}...)`);
 console.log('  model: one-shot batch UCI session (see jieqiHost.ts)');
-console.log('  NOTE: worker.bin serves wasm as a separate same-origin asset; jieqi.page inlines it.');
+console.log('  NOTE: worker.bin serves wasm as a separate same-origin asset; jieqi.html inlines it.');
 if (glueHasInstantiateWasmHook) {
   console.log('  NOTE: glue now exposes instantiateWasm — the fetch hook is still correct but redundant.');
 }

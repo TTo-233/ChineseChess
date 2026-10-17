@@ -205,14 +205,16 @@ export type { EngineHostSource };
 /**
  * 惰性 require 揭棋离线页（理由同上面的静态字符串要求）
  *
- * ⚠️ 扩展名是 `.page` 而不是 `.html`（2026-10 Android 构建阻塞修复）：
- * Metro 会把这些产物打进 Android `res/raw/`，AAPT 以「去扩展名的路径」作资源名，
- * `jieqi.html` 与 `jieqi_wasm.wasm` 会压成同一个 raw/assets_engines_jieqi
- * → Duplicate resources，构建在 mergeReleaseResources 失败（实测过）。
+ * ⚠️ 扩展名必须是 `.html`（2026-10 真机实锤修复，勿回退）：
+ * 原生端经 expo-asset 落成 `file://…/ExponentAsset-<hash>.<ext>` 缓存文件后，
+ * WebView **按扩展名**决定 Content-Type——`.html` 得 text/html 且脚本执行；
+ * 自造扩展名（曾用 .page）得 text/plain、整页进 <pre>、0 个脚本执行，
+ * host-loaded 永不到来，揭棋永远「基础AI」（PTP-AN10 CDP 实测）。
+ * AAPT 资源名唯一性看 stem（jieqi 与 jieqi_wasm/jieqi_worker 互异），.html 不再撞名。
  */
 function requireHtmlAsset(): unknown {
   // eslint-disable-next-line @typescript-eslint/no-var-requires
-  return require('../../../assets/engines/jieqi.page');
+  return require('../../../assets/engines/jieqi.html');
 }
 
 /**
@@ -232,7 +234,7 @@ export async function getJieqiHostSource(): Promise<EngineHostSource> {
   if (typeof asset === 'string' && asset.trimStart().startsWith('<')) {
     return { html: asset };
   }
-  return { uri: await resolveNativeAssetUri(asset, 'jieqi.page', 'page') };
+  return { uri: await resolveNativeAssetUri(asset, 'jieqi.html', 'html') };
 }
 
 /**
