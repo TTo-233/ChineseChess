@@ -34,3 +34,11 @@ pikafish.html       -text
 # verify-jieqi-engine-assets 会断言产物内**逐字包含** worker-core 源码，故两者必须字节稳定。
 jieqi.js            -text
 jieqi.worker.bin    -text
+
+# ⚠️ jieqi.html 曾漏标，导致它被上面通配的 `* text=auto eol=lf` 归一化：
+#    该产物把 glue 内联进页面，而 glue 继承自上游 jieqi.js 的 CRLF 行尾；
+#    入库时这 2 个 CRLF 被压成 LF，可 jieqi.js 是 -text、保持 CRLF，
+#    于是 verify-jieqi-engine-assets 的「html 逐字符包含 glue」断言必然失败——
+#    pnpm -w validate 在全新克隆上直接 exit 1（本次拉取 5f5be11 后即复现）。
+#    jieqi.html 与 jieqi.js / jieqi.worker.bin 同属「字节稳定」产物，必须一并 -text。
+jieqi.html          -text
