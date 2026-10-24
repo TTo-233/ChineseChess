@@ -43,13 +43,36 @@ export default ({ config }: ConfigContext): ExpoConfig => {
       "expo-web-browser",
 
       // ⬇️ 新增：expo-build-properties（开启混淆 + 资源压缩，减小 APK 体积）
+      //
+      // ⚠️【2026-10-24 实机闪退修复】release 混淆从未在真机验证过（10-17/18 的真机复验
+      //    全部走 development build + Metro，见 CLIENT-PIKAFISH-OFFLINE.md），首次带
+      //    ProGuard 的 release 包出现「进入在线对局房间即闪退」。lanBattle 是全应用唯一
+      //    在挂载首帧建立原生 WebSocket（okhttp3）的页面（大厅仅 fetch、PVE 无 WS），
+      //    与崩溃时机吻合；而 RN 默认 proguard 规则对 okhttp 只有 -dontwarn、没有 keep。
+      //    因此这里追加保守 keep：okhttp/okio（WS 通道）与 expo 模块反射注册面。
+      //    enableShrinkResources 同步关闭：res/raw 下的引擎 wasm/nnue/html 与 RN 静态
+      //    资源靠运行时 getIdentifier 动态查找，resource shrinker 存在误删风险，
+      //    体积收益（几百 KB）不值得赌。minify 保留（崩溃面对 keep 规则兜住后收益仍在）。
       [
         "expo-build-properties",
         {
           "android": {
             "enableProguardInReleaseBuilds": true,
-            "enableShrinkResources": true,
-            "useLegacyPackaging": false
+            "enableShrinkResources": false,
+            "useLegacyPackaging": false,
+            "extraProguardRules": [
+              // —— 在线对局 WebSocket（lanBattle 首帧建连）——
+              "-keep class okhttp3.** { *; }",
+              "-keep interface okhttp3.** { *; }",
+              "-keep class okio.** { *; }",
+              "-dontwarn okhttp3.**",
+              "-dontwarn okio.**",
+              // —— RN WebSocket 模块与桥接面（反射/DoNotStrip 之外的兜底）——
+              "-keep class com.facebook.react.modules.websocket.** { *; }",
+              // —— expo 模块（Kotlin 反射注册，keeps 规则之外的显式兜底）——
+              "-keep class expo.modules.** { *; }",
+              "-keep class com.reactnativecommunity.webview.** { *; }"
+            ].join("\n")
           }
         }
       ],
